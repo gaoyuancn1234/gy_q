@@ -1,0 +1,36 @@
+# 核心依赖
+numpy>=1.20.0
+pandas>=1.3.0
+scipy>=1.7.0
+
+# 数据源
+akshare>=1.10.0          # A股和港股数据（免费）
+# tushare>=1.2.80        # A股数据（需要积分）
+# baostock>=0.8.8        # A股数据（免费）
+
+# A股交易
+# easytrader>=0.22.0     # A股券商接口
+# xtquant                # 迅投QMT量化接口
+
+# 港股交易
+# futu-api>=6.0.0        # 富途证券API
+# longbridge>=1.0.0      # 长桥证券API
+# ib_insync>=0.9.0       # 盈透证券API
+
+# 数据库
+# pymysql>=1.0.0         # MySQL连接（可选）
+
+# 可视化
+# matplotlib>=3.4.0
+# plotly>=5.0.0
+# pyecharts>=1.9.0
+
+# Web服务（可选）
+# flask>=2.0.0
+# flask-cors>=3.0.0
+# websocket-client>=1.0.0
+
+# 其他工具
+python-dateutil>=2.8.0
+pytz>=2021.1
+requests>=2.25.0
