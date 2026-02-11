@@ -716,6 +716,8 @@ class SmartBot:
         self.tmp_store = TempFileStore()
         self.tmp_store.cleanup_disk()  # 启动时清理残留
         self.processed_msg_ids: set = set()  # 内存降级用（Redis 不可用时）
+        self._ws_disconnect_count = 0  # WebSocket 断连统计
+        self._ws_disconnect_alerted = False  # 是否已发送断连告警
 
     def send_text(self, text: str, session: 'UserSession' = None):
         """发送文本消息"""
@@ -1057,10 +1059,16 @@ class SmartBot:
 请从以下6个级别中选择最合适的：
 1 = 极简问答（闲聊、打招呼、简单问答，如"你好"、"在吗"、"XX是什么"）
 2 = 简单任务（查看状态、简单查询、一句话能答的问题）
-3 = 脚本任务（画图、运行脚本、小修改、写个简单函数）
-4 = 中等任务（添加功能、中等编码、调试问题、数据分析）
-5 = 复杂分析（多文件修改、系统调试、深度分析、写报告）
-6 = 大型任务（重构系统、架构改造、从零开发、全面改造）"""
+3 = 脚本任务（画简单图、运行脚本、小修改、写个简单函数）
+4 = 中等任务（添加功能、中等编码、调试问题）
+5 = 复杂分析（爬取数据、数据分析+画图、多文件修改、系统调试、深度分析、写报告、房价/股票等预测分析）
+6 = 大型任务（重构系统、架构改造、从零开发、全面改造、大规模爬虫+分析）
+
+【重要提示】涉及以下关键词的任务通常至少是级别5：
+- 爬取/抓取/采集数据
+- 分析+画图/可视化
+- 预测/建模/训练
+- XX市/XX区/XX行业+分析"""
 
             json_schema = json.dumps({
                 "type": "object",
@@ -1074,6 +1082,7 @@ class SmartBot:
             cmd = [
                 '/usr/local/bin/claude', '--print', '--dangerously-skip-permissions',
                 '--output-format', 'json',
+                '--model', 'haiku',
                 '--json-schema', json_schema,
                 '-p', prompt
             ]
@@ -1084,10 +1093,11 @@ class SmartBot:
 
             if output:
                 data = json.loads(output)
-                # --output-format json 返回的结构中，result 字段包含实际内容
-                if isinstance(data, dict) and "result" in data:
+                # --json-schema 的结构化输出在 structured_output 字段
+                if isinstance(data, dict) and "structured_output" in data:
+                    result_data = data["structured_output"]
+                elif isinstance(data, dict) and "result" in data:
                     result_text = data["result"]
-                    # result 可能是字符串形式的 JSON，也可能直接是结构化的
                     if isinstance(result_text, str):
                         result_data = json.loads(result_text)
                     else:
@@ -1111,16 +1121,29 @@ class SmartBot:
         except Exception as e:
             print(f"[复杂度评估] 异常: {e}，使用 fallback")
 
-        # ── Fallback: 极简规则兜底 ──
-        text_len = len(user_input)
-        if text_len < 10:
-            return (TIMEOUT_QUICK, "快速问答(1分钟) (fallback: 极短输入)")
-        elif text_len < 50:
-            return (TIMEOUT_SIMPLE, "简单任务(2分钟) (fallback: 短输入)")
-        elif text_len < 150:
-            return (TIMEOUT_SCRIPT, "脚本任务(5分钟) (fallback: 中等输入)")
-        else:
-            return (TIMEOUT_MEDIUM, "中等任务(10分钟) (fallback: 长输入)")
+        # ── Fallback: 关键词规则兜底（不依赖输入长度） ──
+        text_lower = user_input.lower()
+        # 高复杂度关键词检测
+        heavy_keywords = ['分析', '预测', '爬取', '抓取', '采集', '画图', '可视化',
+                          '训练', '建模', '回测', '报告', '房价', '股票', '行情',
+                          '排序', '排名', '对比', '趋势', '策略', '优化']
+        # 极简问答关键词（纯闲聊，不需要执行任何操作）
+        trivial_keywords = ['你好', '在吗', '谢谢', '感谢', '没事了', '好的',
+                            '知道了', '明白了', '收到', 'hi', 'hello', '嗯']
+        hit_count = sum(1 for kw in heavy_keywords if kw in text_lower)
+
+        if hit_count >= 2:
+            return (TIMEOUT_ANALYSIS, "分析任务(30分钟) (fallback: 多关键词命中)")
+        elif hit_count == 1:
+            return (TIMEOUT_MEDIUM, "中等任务(10分钟) (fallback: 关键词命中)")
+
+        # 纯闲聊/简单回应 → 快速
+        text_stripped = user_input.strip()
+        if any(text_stripped == kw or text_stripped.startswith(kw) for kw in trivial_keywords):
+            return (TIMEOUT_QUICK, "快速问答(1分钟) (fallback: 闲聊)")
+
+        # 其他情况统一给脚本级超时（5分钟），因为无法从长度判断复杂度
+        return (TIMEOUT_SCRIPT, "脚本任务(5分钟) (fallback: 默认)")
 
     def call_claude(self, user_input: str, session: 'UserSession' = None, image_path: str = None) -> str:
         """调用 Claude - 让 Claude 直接执行操作，动态超时"""
@@ -1178,8 +1201,12 @@ class SmartBot:
                 stdout, stderr = proc.communicate(timeout=timeout)
                 output = stdout.strip() or stderr.strip() or "无响应"
             except subprocess.TimeoutExpired:
-                proc.kill()
-                return f"⏰ 任务超时({timeout}秒)，任务类型: {complexity_desc}"
+                # 不杀进程，启动后台线程继续等待结果
+                print(f"[超时] {timeout}秒已到，任务转入后台继续执行")
+                if session:
+                    session.current_process = None
+                self._wait_bg_result(proc, session, complexity_desc)
+                return f"⏳ 任务较复杂（{complexity_desc}），已转入后台继续执行，完成后会自动发送结果。"
             finally:
                 if session:
                     session.current_process = None
@@ -1189,6 +1216,29 @@ class SmartBot:
             if session:
                 session.current_process = None
             return f"调用失败: {e}"
+
+    def _wait_bg_result(self, proc: subprocess.Popen, session: 'UserSession', complexity_desc: str):
+        """后台线程等待超时任务完成，完成后主动推送结果给用户"""
+        def _wait():
+            try:
+                # 最多再等30分钟
+                stdout, stderr = proc.communicate(timeout=1800)
+                output = stdout.strip() or stderr.strip()
+                if output:
+                    print(f"[后台任务完成] {len(output)} 字符")
+                    session.last_result = output[:500]
+                    self.process_response(output, session)
+                else:
+                    self.send_text("后台任务已完成，但没有产生输出。", session)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                self.send_text("后台任务执行超过30分钟，已终止。", session)
+            except Exception as e:
+                print(f"[后台任务异常] {e}")
+                self.send_text(f"后台任务执行出错: {e}", session)
+
+        t = threading.Thread(target=_wait, daemon=True)
+        t.start()
 
     def evaluate_and_save_memory(self, user_text: str, assistant_response: str, session: 'UserSession' = None):
         """异步调用 Claude CLI agent 评估对话是否值得记忆，并浓缩存入长期记忆"""
@@ -1342,11 +1392,127 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             else:
                 print(f"[图片不存在] {img_path}")
 
-    def handle_quick_commands(self, text: str, session: 'UserSession' = None) -> bool:
+    def _handle_ml_signal(self, session: 'UserSession' = None):
+        """生成 ML 信号并推送"""
+        try:
+            sys.path.insert(0, str(BOT_DIR))
+            from factor_lab.signal_generator import SignalGenerator
+            from portfolio.live_portfolio import (
+                load_live_holdings, get_current_prices as get_live_prices,
+                generate_live_instructions, get_portfolio_summary,
+            )
+
+            sg = SignalGenerator()
+            signal = sg.get_signal()
+            if 'error' in signal:
+                self.send_text(f"❌ ML 信号错误: {signal['error']}", session)
+                return
+
+            holdings = load_live_holdings()
+            all_instruments = list(set(
+                list(holdings.get('positions', {}).keys()) + signal['target_stocks']
+            ))
+            prices = get_live_prices(all_instruments)
+            if not prices:
+                self.send_text("❌ 获取价格失败，请稍后重试", session)
+                return
+
+            message = generate_live_instructions(signal, holdings, prices)
+
+            # 模型新鲜度
+            freshness = sg.check_model_freshness()
+            if freshness['is_stale']:
+                message += f"\n\n⚠️ {freshness['message']}"
+
+            self.send_markdown(message, title="ML调仓信号", session=session)
+        except Exception as e:
+            self.send_text(f"❌ 信号生成异常: {e}", session)
+            import traceback
+            traceback.print_exc()
+
+    def _handle_screenshot_trades(self, text: str, image_path: str, session: 'UserSession' = None):
+        """截图解析持仓更新
+
+        用户发送成交截图 + "已执行/成交/已买入/已卖出" → Claude 解析 → 确认卡片 → apply_trades
+        """
+        try:
+            # 调用 Claude CLI 解析截图
+            prompt = f"""分析这张股票交易成交截图，提取所有成交记录。
+
+用户说: {text}
+
+请仔细识别截图中的每笔成交，输出 JSON 格式:
+{{"trades": [
+    {{"action": "buy", "code": "SH600036", "shares": 200, "price": 38.50, "name": "招商银行"}},
+    {{"action": "sell", "code": "SH601166", "shares": 300, "price": 16.80, "name": "兴业银行"}}
+]}}
+
+规则:
+1. code 用 Qlib 格式: 沪市 SH + 6位数字, 深市 SZ + 6位数字
+2. action: buy=买入, sell=卖出
+3. shares: 成交数量 (股)
+4. price: 成交均价
+5. 只输出 JSON，不要其他文字"""
+
+            cmd = [
+                '/usr/local/bin/claude', '--print', '--dangerously-skip-permissions',
+                '-p', f"请先用 Read 工具查看图片 {image_path}，然后:\n\n{prompt}"
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60, cwd=str(WORK_DIR)
+            )
+            output = result.stdout.strip()
+
+            # 提取 JSON
+            json_match = re.search(r'\{.*\}', output, re.DOTALL)
+            if not json_match:
+                self.send_text("❌ 无法从截图中解析成交记录，请确认图片清晰", session)
+                return
+
+            data = json.loads(json_match.group())
+            trades = data.get('trades', [])
+            if not trades:
+                self.send_text("未识别到成交记录", session)
+                return
+
+            # 构建确认内容
+            lines = ["识别到以下成交记录:\n"]
+            for t in trades:
+                action_str = "买入" if t['action'] == 'buy' else "卖出"
+                name = t.get('name', t['code'])
+                lines.append(f"• {action_str} {name} {t['shares']}股 ×{t['price']}")
+
+            action_id = f"TRADE_{int(time.time())}"
+            session.add_pending_action(action_id, 'apply_trades', {'trades': trades})
+            self.send_confirm_card(
+                "📸 确认成交记录",
+                "\n".join(lines),
+                action_id,
+                session
+            )
+        except json.JSONDecodeError:
+            self.send_text("❌ 解析成交记录失败，请重新发送截图", session)
+        except subprocess.TimeoutExpired:
+            self.send_text("⏳ 截图解析超时，请重试", session)
+        except Exception as e:
+            self.send_text(f"❌ 截图处理异常: {e}", session)
+
+    def handle_quick_commands(self, text: str, session: 'UserSession' = None, image_path: str = None) -> bool:
         """处理快捷命令，返回是否已处理"""
         # 帮助
         if text in ['帮助', 'help', '?']:
-            self.send_text("📖 命令:\n• 信号/调仓 - 生成信号\n• 持仓 - 查看持仓\n• 资金10万 - 设置资金\n• 历史文件 - 查看历史图片/文件", session)
+            self.send_text(
+                "📖 命令:\n"
+                "• 信号/调仓 - ML调仓信号\n"
+                "• 持仓 - 查看实盘持仓\n"
+                "• 监控 - 盘中监控状态\n"
+                "• 重训 - 季度模型重训\n"
+                "• 资金10万 - 设置资金\n"
+                "• 历史文件 - 查看历史图片/文件\n"
+                "• 反思 - 查看每日自我反思记录\n"
+                "• 发截图+「已执行」- 更新持仓",
+                session
+            )
             return True
 
         # 历史文件列表
@@ -1367,40 +1533,122 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 self.send_text("\n".join(lines), session)
             return True
 
-        # 持仓查询（无需确认）
-        if text in ['持仓', '仓位', 'positions']:
+        # 盘中监控状态
+        if text in ['监控', 'monitor']:
             try:
-                result = subprocess.run(
-                    ['python', 'portfolio/trade_executor.py', '--action', 'holdings'],
-                    cwd=str(WORK_DIR), capture_output=True, text=True, timeout=30
-                )
-                self.send_text(result.stdout if result.returncode == 0 else f"失败: {result.stderr}", session)
+                state_file = BOT_DIR / "monitor" / "monitor_state.json"
+                if not state_file.exists():
+                    self.send_text("📡 盘中监控: 今日未启动\n(launchd 每天 9:25 自动启动)", session)
+                else:
+                    with open(state_file, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                    from datetime import date as _date
+                    today = _date.today().isoformat()
+                    if state.get('date') != today:
+                        self.send_text("📡 盘中监控: 今日未启动\n(launchd 每天 9:25 自动启动)", session)
+                    else:
+                        alerted = state.get('alerted_today', {})
+                        lines = [
+                            "📡 盘中监控状态",
+                            "",
+                            f"启动时间: {state.get('started_at', '?')}",
+                            f"检查次数: {state.get('check_count', 0)}",
+                            f"最近检查: {state.get('last_check', '?')}",
+                            f"已触发告警: {len(alerted)} 条",
+                        ]
+                        if alerted:
+                            lines.append("")
+                            for key in alerted:
+                                lines.append(f"  • {key}")
+                        self.send_text("\n".join(lines), session)
             except Exception as e:
-                self.send_text(f"错误: {e}", session)
+                self.send_text(f"❌ 监控状态查询失败: {e}", session)
             return True
 
-        # 生成信号（需要确认）
-        if text in ['信号', '调仓', 'signal']:
-            holdings_file = WORK_DIR / "portfolio" / "holdings.json"
+        # 反思记录查看
+        if text in ['反思', 'reflect', '反思记录']:
             try:
-                h = json.loads(holdings_file.read_text())
-                if not h.get('total_capital'):
-                    self.send_text("❓ 还没设置总资金。请告诉我你的总资金是多少？\n例如：`资金10万` 或 `总资金100000`", session)
-                    return True
-            except:
-                self.send_text("❓ 还没设置总资金。请告诉我你的总资金是多少？\n例如：`资金10万` 或 `总资金100000`", session)
-                return True
+                reflect_dir = BOT_DIR / "reflections"
+                index_file = reflect_dir / "index.json"
+                if not index_file.exists():
+                    self.send_text("📝 暂无反思记录\n(每晚 23:30 自动执行)", session)
+                else:
+                    with open(index_file, 'r', encoding='utf-8') as f:
+                        index = json.load(f)
+                    if not index:
+                        self.send_text("📝 暂无反思记录", session)
+                    else:
+                        # 显示最近5条
+                        recent = sorted(index.items(), reverse=True)[:5]
+                        lines = ["📝 最近反思记录", ""]
+                        for dt, info in recent:
+                            score = info.get('score', 0)
+                            summary = info.get('summary', '')
+                            fixes = info.get('auto_fixes_count', 0)
+                            score_bar = '★' * score + '☆' * (10 - score)
+                            lines.append(f"**{dt}** {score_bar}")
+                            lines.append(f"  {summary}")
+                            if fixes > 0:
+                                lines.append(f"  🔧 自动修复: {fixes} 项")
+                            lines.append("")
+                        avg_score = sum(v.get('score', 0) for v in index.values()) / len(index) if index else 0
+                        lines.append(f"平均评分: {avg_score:.1f}/10 (共 {len(index)} 天)")
+                        self.send_markdown("\n".join(lines), session=session)
+            except Exception as e:
+                self.send_text(f"❌ 反思记录查询失败: {e}", session)
+            return True
 
-            action_id = f"SIG_{int(time.time())}"
+        # 持仓查询 — ML 实盘持仓
+        if text in ['持仓', '仓位', 'positions']:
+            try:
+                from portfolio.live_portfolio import (
+                    load_live_holdings, get_current_prices as get_live_prices,
+                    get_portfolio_summary,
+                )
+                holdings = load_live_holdings()
+                positions = holdings.get('positions', {})
+                if positions:
+                    prices = get_live_prices(list(positions.keys()))
+                else:
+                    prices = {}
+                summary = get_portfolio_summary(holdings, prices)
+                self.send_markdown(summary, session=session)
+            except Exception as e:
+                self.send_text(f"❌ 持仓查询失败: {e}", session)
+            return True
+
+        # 生成 ML 信号
+        if text in ['信号', '调仓', 'signal']:
+            self.send_text("⏳ 正在生成 ML 信号...", session)
+            threading.Thread(
+                target=self._handle_ml_signal,
+                args=(session,),
+                daemon=True
+            ).start()
+            return True
+
+        # 季度重训
+        if text in ['重训', 'retrain']:
+            action_id = f"RETRAIN_{int(time.time())}"
             session.add_pending_action(action_id, 'execute_command', {
-                "command": "python portfolio/trade_executor.py --action signal"
+                "command": "python trading_framework/retrain_pipeline.py"
             })
             self.send_confirm_card(
-                "⚡ 生成调仓信号",
-                "执行命令生成本周调仓指令\n\n```bash\npython portfolio/trade_executor.py --action signal\n```",
+                "🔄 季度模型重训",
+                "将执行完整重训 pipeline:\n1. 刷新 BaoStock 数据 (~3min)\n2. 扩展 rolling 预测 (~2min)\n3. 重算信号质量\n4. 验证\n\n预计耗时 5-8 分钟",
                 action_id,
                 session
             )
+            return True
+
+        # 截图 + 成交确认
+        if image_path and any(kw in text for kw in ['已执行', '成交', '已买入', '已卖出', '已买', '已卖']):
+            self.send_text("⏳ 正在解析成交截图...", session)
+            threading.Thread(
+                target=self._handle_screenshot_trades,
+                args=(text, image_path, session),
+                daemon=True
+            ).start()
             return True
 
         # 设置资金
@@ -1410,6 +1658,14 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             unit = capital_match.group(2)
             if unit == '万':
                 amount *= 10000
+
+            # 同时更新 live_holdings 和 holdings
+            from portfolio.live_portfolio import load_live_holdings, save_live_holdings
+            live_h = load_live_holdings()
+            live_h['initial_capital'] = amount
+            live_h['cash'] = amount
+            live_h['positions'] = {}
+            save_live_holdings(live_h)
 
             holdings_data = {
                 "total_capital": amount,
@@ -1505,6 +1761,15 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             except Exception as e:
                 self.send_text(f"❌ 修改失败: {e}", session)
 
+        elif action_type == 'apply_trades':
+            try:
+                from portfolio.live_portfolio import apply_trades
+                trades = data.get('trades', [])
+                result = apply_trades(trades)
+                self.send_text(f"✅ 持仓已更新:\n{result}", session)
+            except Exception as e:
+                self.send_text(f"❌ 持仓更新失败: {e}", session)
+
         elif action_type == 'send_image':
             path = data.get('path', '')
             self.send_image(path, session)
@@ -1583,7 +1848,7 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             session.current_task = text[:30]
 
             # 快捷命令
-            if self.handle_quick_commands(text, session):
+            if self.handle_quick_commands(text, session, image_path=image_path):
                 return
 
             # 给消息加"收到"表情
@@ -1793,6 +2058,34 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             print(f"[卡片处理错误] {e}")
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": str(e)[:50]}})
 
+    def _send_disconnect_alert(self, count: int):
+        """WebSocket 连续断连超阈值时，通过飞书告警通知"""
+        try:
+            app_id = APPS[0]["app_id"]
+            app_secret = APPS[0]["app_secret"]
+            user_id = os.environ.get("FEISHU_USER_OPEN_ID", "")
+            if not user_id:
+                print(f"[WS告警] 连续断连 {count} 次，但无 FEISHU_USER_OPEN_ID 无法推送")
+                return
+
+            client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
+            msg = f"🔴 Smart Bot WebSocket 连续断连 {count} 次\n\n请检查网络连接或飞书服务状态。\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            req = CreateMessageRequest.builder() \
+                .receive_id_type("open_id") \
+                .request_body(CreateMessageRequestBody.builder()
+                    .receive_id(user_id)
+                    .msg_type("text")
+                    .content(json.dumps({"text": msg}))
+                    .build()) \
+                .build()
+            resp = client.im.v1.message.create(req)
+            if resp.success():
+                print(f"[WS告警] 断连告警已发送")
+            else:
+                print(f"[WS告警] 发送失败: {resp.code}")
+        except Exception as e:
+            print(f"[WS告警] 告警推送异常: {e}")
+
     def run(self):
         """启动机器人（多 App 并行）"""
         print("=" * 50)
@@ -1843,8 +2136,11 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
 
         print()
         print("✓ 启动成功")
-        print("  • 发送「信号」生成调仓")
-        print("  • 发送「帮助」查看命令")
+        print("  • 发送「信号」生成ML调仓信号")
+        print("  • 发送「持仓」查看实盘持仓")
+        print("  • 发送「重训」季度模型重训")
+        print("  • 发截图+「已执行」更新持仓")
+        print("  • 发送「帮助」查看全部命令")
         print("  • 操作需点击【允许】确认")
         print()
         print("等待消息...")
@@ -1853,15 +2149,40 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
         # 使用 SDK 模块级缓存的 event loop（SDK 内部 _connect/_ping 都用这个 loop）
         from lark_oapi.ws.client import loop as sdk_loop
 
-        async def _run_all():
-            # 建立所有连接（_connect 内部会在 sdk_loop 上创建 _receive_message_loop 任务）
-            await asyncio.gather(*[ws._connect() for ws in ws_clients])
-            # 启动各自的 ping 心跳
-            for ws in ws_clients:
-                sdk_loop.create_task(ws._ping_loop())
-            # 保持 event loop 永久运行
+        async def _connect_with_retry(ws_client, app_id: str):
+            """带断连统计的连接包装"""
             while True:
-                await asyncio.sleep(3600)
+                try:
+                    await ws_client._connect()
+                    # 连接成功，重置计数
+                    if self._ws_disconnect_count > 0:
+                        print(f"[WS] App {app_id} 重连成功 (此前断连 {self._ws_disconnect_count} 次)")
+                    self._ws_disconnect_count = 0
+                    self._ws_disconnect_alerted = False
+                    sdk_loop.create_task(ws_client._ping_loop())
+                    # 连接建立后等待，直到连接断开
+                    while True:
+                        await asyncio.sleep(30)
+                except Exception as e:
+                    self._ws_disconnect_count += 1
+                    print(f"[WS] App {app_id} 断连 #{self._ws_disconnect_count}: {e}")
+
+                    # 连续断连超过3次，发送告警
+                    if self._ws_disconnect_count >= 3 and not self._ws_disconnect_alerted:
+                        self._ws_disconnect_alerted = True
+                        self._send_disconnect_alert(self._ws_disconnect_count)
+
+                    # 指数退避重连: 5s, 10s, 20s, ... 最大 300s
+                    backoff = min(5 * (2 ** (self._ws_disconnect_count - 1)), 300)
+                    print(f"[WS] {backoff}s 后重连...")
+                    await asyncio.sleep(backoff)
+
+        async def _run_all():
+            # 带重连逻辑并发启动所有 App
+            tasks = []
+            for ws_client, app in zip(ws_clients, APPS):
+                tasks.append(_connect_with_retry(ws_client, app["app_id"]))
+            await asyncio.gather(*tasks)
 
         try:
             sdk_loop.run_until_complete(_run_all())
