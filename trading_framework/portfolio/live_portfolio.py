@@ -228,6 +228,37 @@ def init_live_portfolio(capital: float = 100000) -> dict:
     return holdings
 
 
+def add_capital(holdings: dict, amount: float) -> dict:
+    """追加资金 — 只增加 cash 和 initial_capital，不动持仓
+
+    下次调仓日由 calculate_affordable_allocation() 自动分配。
+
+    Args:
+        holdings: live_holdings 数据
+        amount: 追加金额 (元)
+
+    Returns:
+        更新后的 holdings
+    """
+    holdings['cash'] = holdings.get('cash', 0) + amount
+    holdings['initial_capital'] = holdings.get('initial_capital', 0) + amount
+    save_live_holdings(holdings)
+    return holdings
+
+
+def clear_positions(holdings: dict) -> dict:
+    """清空所有持仓 — positions 清零，cash 重置为 initial_capital
+
+    Returns:
+        更新后的 holdings
+    """
+    holdings['positions'] = {}
+    holdings['cash'] = holdings.get('initial_capital', 100000)
+    holdings['pending_orders'] = {"sells": [], "buys": {}}
+    save_live_holdings(holdings)
+    return holdings
+
+
 def apply_trades(parsed_trades: list, holdings: dict = None) -> str:
     """应用截图解析后的成交记录
 
@@ -307,6 +338,26 @@ def apply_trades(parsed_trades: list, holdings: dict = None) -> str:
     return "\n".join(results) if results else "无有效交易"
 
 
+# ============ 模型版本 ============
+
+def get_model_version() -> str:
+    """从 signal_config.yaml 读取模型版本号，如 M01-LGB-D3v3r-v2602"""
+    config_file = PROJECT_DIR / "config" / "signal_config.yaml"
+    try:
+        import yaml
+        with open(config_file, 'r') as f:
+            cfg = yaml.safe_load(f)
+        tag = cfg.get('model_tag', 'M01')
+        retrain = cfg.get('last_retrain', '')  # '2026-02'
+        if retrain:
+            parts = retrain.split('-')
+            ver = parts[0][2:] + parts[1] if len(parts) == 2 else retrain.replace('-', '')
+            return f"{tag}-v{ver}"
+        return tag
+    except Exception:
+        return "M01"
+
+
 # ============ 指令生成 ============
 
 def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> str:
@@ -333,9 +384,11 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
     to_hold = current_set & target_set
     to_buy_codes = [c for c in signal['target_stocks'] if c not in current_set]
 
+    model_ver = get_model_version()
     lines = [
         "━━━━━━━━━━━━━━━━━━━",
         f"📊 ML调仓信号 ({today})",
+        f"模型: {model_ver}",
         "",
         f"信号状态: {regime} | TopK: {topk} | 质量: {quality:.2f}" if quality else f"信号状态: {regime} | TopK: {topk}",
     ]
@@ -516,8 +569,10 @@ def get_daily_report(holdings: dict, prices: dict) -> str:
         f"{a['name']}({a['loss_pct']:.1%})" for a in alerts
     )
 
+    model_ver = get_model_version()
     report = (
-        f"📈 持仓日报 ({today})\n\n"
+        f"📈 持仓日报 ({today})\n"
+        f"模型: {model_ver}\n\n"
         f"总资产: {total:,.0f} ({sign}{total_pnl:.1f}%) | 现金: {cash:,.0f}\n"
         f"持仓: {len(positions)}只 | 市值: {total_market:,.0f}\n\n"
         f"⚠️ 止损预警: {alert_text}"

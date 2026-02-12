@@ -86,7 +86,7 @@ def get_current_prices():
     benchmark = loader.get_index_data('sh.000300', start_date, end_date)
 
     if data is None:
-        return None, None
+        return None, None, None, None
 
     latest_date = data['date'].max()
     prices = {}
@@ -111,7 +111,7 @@ def calculate_rs(stock_data, benchmark, date, lookback=15):
 
 
 def get_top12_signals(data, benchmark, latest_date):
-    """获取Top12信号"""
+    """获取Top12信号（RS策略）"""
     all_rs = []
     for code in data['code'].unique():
         sd = data[data['code'] == code]
@@ -123,6 +123,72 @@ def get_top12_signals(data, benchmark, latest_date):
     return [s['code'] for s in all_rs[:12]]
 
 
+def get_top_signals():
+    """获取调仓信号（根据 STRATEGY_TYPE 自动分发）
+
+    Returns:
+        tuple: (signal_list, latest_date, prices)
+            - signal_list: 股票代码列表 (Qlib 格式 for ml, BaoStock 格式 for rs)
+            - latest_date: 最新日期
+            - prices: 当前价格字典
+    """
+    from config.settings import STRATEGY_TYPE
+
+    if STRATEGY_TYPE == 'ml':
+        # ML 实盘信号 (不需要 qlib.init)
+        from factor_lab.signal_generator import SignalGenerator
+        from portfolio.live_portfolio import get_current_prices as get_live_prices
+
+        sg = SignalGenerator()
+        signal = sg.get_signal()
+        if 'error' in signal:
+            print(f"ML 信号错误: {signal['error']}")
+            return None, None, None
+
+        target_stocks = signal['target_stocks']
+        latest_date = datetime.strptime(signal['date'], '%Y-%m-%d')
+
+        # 获取价格
+        prices = get_live_prices(target_stocks)
+        return target_stocks, latest_date, prices
+
+    elif STRATEGY_TYPE == 'qlib':
+        from qlib_engine.engine import QlibEngine
+        from config.settings import QLIB_CONFIG, TOP_K
+
+        engine = QlibEngine(QLIB_CONFIG)
+        signals = engine.get_top_signals(TOP_K)
+
+        # 获取 Qlib 信号股票的当前价格
+        from datetime import timedelta
+        loader = DataLoader(cache_dir='./cache')
+        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        end_date = datetime.now().strftime('%Y-%m-%d')
+
+        # 合并 Qlib 信号股票 + 现有持仓股票，确保都能获取价格
+        all_codes = list(set(signals) | set(STOCK_POOL))
+        data = loader.get_all_data(all_codes, start_date, end_date)
+        if data is None:
+            return None, None, None
+
+        latest_date = data['date'].max()
+        prices = {}
+        for code in data['code'].unique():
+            code_data = data[(data['code'] == code) & (data['date'] == latest_date)]
+            if len(code_data) > 0:
+                prices[code] = code_data['close'].iloc[0]
+
+        return signals, latest_date, prices
+    else:
+        # RS 策略（现有逻辑）
+        result = get_current_prices()
+        if result[0] is None:
+            return None, None, None
+        prices, latest_date, data, benchmark = result
+        signals = get_top12_signals(data, benchmark, latest_date)
+        return signals, latest_date, prices
+
+
 def generate_trade_instructions():
     """生成调仓指令"""
     holdings = load_holdings()
@@ -131,14 +197,12 @@ def generate_trade_instructions():
         return "❌ 错误: 请先设置总资金\n运行: python trade_executor.py --init <资金>"
 
     print("获取市场数据...")
-    result = get_current_prices()
-    if result[0] is None:
+    signals, latest_date, prices = get_top_signals()
+    if signals is None:
         return "❌ 错误: 无法获取市场数据"
 
-    prices, latest_date, data, benchmark = result
-
     # 获取新的Top12
-    new_top12 = get_top12_signals(data, benchmark, latest_date)
+    new_top12 = signals
 
     # 当前持仓
     current_positions = set(holdings['positions'].keys())
@@ -151,7 +215,7 @@ def generate_trade_instructions():
 
     # 计算每只股票目标金额
     total_capital = holdings['total_capital']
-    target_per_stock = total_capital / 12
+    target_per_stock = total_capital / len(new_top12) if new_top12 else total_capital
 
     # 生成指令
     lines = []

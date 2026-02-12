@@ -4,6 +4,53 @@
 回测：近6个月滚动3个月年化 > 6%
 """
 
+# ============ 策略引擎 ============
+# 'rs' = 相对强度轮动, 'qlib' = Qlib ML模型, 'ml' = ML信号(实盘)
+STRATEGY_TYPE = 'ml'
+
+# ============ ML 实盘配置 (STRATEGY_TYPE='ml' 时生效) ============
+ML_CONFIG = {
+    'signal_config': 'config/signal_config.yaml',
+    'live_capital': 100000,
+}
+
+# ============ 因子实验室配置 ============
+# 因子预设: 'alpha158', 'alpha158_ext', 'alpha158_val', 'full'
+HANDLER_PRESET = 'alpha158'
+
+# Tushare Pro Token (估值/北向资金等数据源)
+# 优先从环境变量 TUSHARE_TOKEN 读取，或在 .env 中设置
+TUSHARE_TOKEN = ''
+
+# ============ Qlib 配置（STRATEGY_TYPE='qlib' 时生效）============
+QLIB_CONFIG = {
+    'provider_uri': '~/.qlib/qlib_data/cn_data_bs',
+    'instruments': 'csi300',
+    'train_start': '2019-01-01',
+    'train_end': '2024-06-30',
+    'valid_start': '2024-07-01',
+    'valid_end': '2024-12-31',
+    'test_start': '2025-01-01',
+    'test_end': '2026-02-05',
+    'model': 'lightgbm',
+    'handler': 'Alpha158',
+    'topk': 12,
+    'n_drop': 3,
+    'model_params': {
+        'learning_rate': 0.01,
+        'num_leaves': 64,
+        'num_boost_round': 500,
+        'early_stopping_rounds': 80,
+    },
+    # 滚动训练配置
+    'rolling': {
+        'enabled': True,
+        'train_window_years': 4,    # 每次用多少年数据训练
+        'valid_months': 3,          # 验证集长度（月）
+        'retrain_months': 3,        # 每隔几个月重训一次
+    },
+}
+
 # ============ 股票池配置 ============
 # 股票池策略: 'static'=静态, 'dynamic'=动态获取
 STOCK_POOL_STRATEGY = 'dynamic'

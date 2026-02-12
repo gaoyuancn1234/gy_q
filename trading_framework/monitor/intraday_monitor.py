@@ -227,6 +227,24 @@ def format_alert_message(alerts: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _get_model_version() -> str:
+    """读取模型版本号"""
+    config_file = PROJECT_DIR / "config" / "signal_config.yaml"
+    try:
+        import yaml
+        with open(config_file, 'r') as f:
+            cfg = yaml.safe_load(f)
+        tag = cfg.get('model_tag', 'M01')
+        retrain = cfg.get('last_retrain', '')  # '2026-02'
+        if retrain:
+            parts = retrain.split('-')
+            ver = parts[0][2:] + parts[1] if len(parts) == 2 else retrain.replace('-', '')
+            return f"{tag}-v{ver}"
+        return tag
+    except Exception:
+        return "M01"
+
+
 def format_closing_summary(holdings: dict, prices: dict) -> str:
     """15:00 收盘总结"""
     positions = holdings.get('positions', {})
@@ -263,8 +281,10 @@ def format_closing_summary(holdings: dict, prices: dict) -> str:
     total_pnl = (total - initial) / initial
     sign = "+" if total_pnl >= 0 else ""
 
+    model_ver = _get_model_version()
     lines = [
         f"📊 收盘总结 ({datetime.now().strftime('%H:%M')})",
+        f"模型: {model_ver}",
         "",
         f"总资产: {total:,.0f} ({sign}{total_pnl:.1%})",
     ]

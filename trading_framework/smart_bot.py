@@ -1506,8 +1506,12 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 "• 信号/调仓 - ML调仓信号\n"
                 "• 持仓 - 查看实盘持仓\n"
                 "• 监控 - 盘中监控状态\n"
+                "• 挖掘 - 因子挖掘状态\n"
+                "• 影子 - 影子交易验证状态\n"
                 "• 重训 - 季度模型重训\n"
-                "• 资金10万 - 设置资金\n"
+                "• 追加5万 - 追加资金(下次调仓分配)\n"
+                "• 清仓 - 清空所有持仓\n"
+                "• 资金10万 - 设置初始资金(需先清仓)\n"
                 "• 历史文件 - 查看历史图片/文件\n"
                 "• 反思 - 查看每日自我反思记录\n"
                 "• 发截图+「已执行」- 更新持仓",
@@ -1598,6 +1602,52 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 self.send_text(f"❌ 反思记录查询失败: {e}", session)
             return True
 
+        # 因子挖掘状态
+        if text in ['挖掘', 'mining']:
+            try:
+                mining_index = BOT_DIR / "factor_lab" / "mining_results" / "index.json"
+                if not mining_index.exists():
+                    self.send_text("🔬 因子挖掘: 暂无运行记录\n(每周日 20:00 自动执行)", session)
+                else:
+                    with open(mining_index, 'r', encoding='utf-8') as f:
+                        index = json.load(f)
+                    if not index:
+                        self.send_text("🔬 因子挖掘: 暂无运行记录", session)
+                    else:
+                        total_runs = len(index)
+                        total_tested = sum(r.get("factors_tested", 0) for r in index.values())
+                        total_promising = sum(r.get("promising_count", 0) for r in index.values())
+                        total_beat = sum(1 for r in index.values() if r.get("beat_baseline"))
+                        recent = sorted(index.items(), key=lambda x: x[1].get("date", ""), reverse=True)[:5]
+                        lines = [
+                            "🔬 因子挖掘状态",
+                            "",
+                            f"总运行: {total_runs} 次 | 测试因子: {total_tested} | 有效: {total_promising} | 超越M01: {total_beat}",
+                            "",
+                            "最近运行:",
+                        ]
+                        for rid, info in recent:
+                            beat = "✅" if info.get("beat_baseline") else "  "
+                            lines.append(f"  {beat} {rid} ({info.get('date', '?')}): "
+                                         f"测试{info.get('factors_tested', 0)}, "
+                                         f"有效{info.get('promising_count', 0)}")
+                        self.send_text("\n".join(lines), session)
+            except Exception as e:
+                self.send_text(f"❌ 挖掘状态查询失败: {e}", session)
+            return True
+
+        # 影子交易状态
+        if text in ['影子', 'shadow']:
+            try:
+                sys.path.insert(0, str(BOT_DIR))
+                from shadow_manager import ShadowManager
+                sm = ShadowManager()
+                status = sm.get_status_text()
+                self.send_text(f"🧪 {status}", session)
+            except Exception as e:
+                self.send_text(f"❌ 影子验证查询失败: {e}", session)
+            return True
+
         # 持仓查询 — ML 实盘持仓
         if text in ['持仓', '仓位', 'positions']:
             try:
@@ -1651,7 +1701,53 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             ).start()
             return True
 
-        # 设置资金
+        # 清仓 / 清空持仓
+        if text in ['清仓', '清空持仓', '清空']:
+            from portfolio.live_portfolio import load_live_holdings
+            live_h = load_live_holdings()
+            n_pos = len(live_h.get('positions', {}))
+            cash = live_h.get('initial_capital', 100000)
+
+            action_id = f"CLR_{int(time.time())}"
+            session.add_pending_action(action_id, 'clear_positions', {})
+            if n_pos > 0:
+                self.send_confirm_card(
+                    "⚠️ 清空持仓",
+                    f"将清空 **{n_pos}** 只持仓，现金重置为 **{cash:,.0f}元**\n确认清仓？",
+                    action_id,
+                    session
+                )
+            else:
+                self.send_text("📋 当前已是空仓状态", session)
+            return True
+
+        # 追加资金
+        add_capital_match = re.search(r'(?:追加|增加)\s*(?:资金)?\s*(\d+(?:\.\d+)?)\s*([万元])?', text)
+        if add_capital_match:
+            amount = float(add_capital_match.group(1))
+            unit = add_capital_match.group(2)
+            if unit == '万':
+                amount *= 10000
+
+            from portfolio.live_portfolio import load_live_holdings
+            live_h = load_live_holdings()
+            old_cash = live_h.get('cash', 0)
+            old_capital = live_h.get('initial_capital', 0)
+
+            action_id = f"ADD_{int(time.time())}"
+            session.add_pending_action(action_id, 'add_capital', {'amount': amount})
+            self.send_confirm_card(
+                "💰 追加资金",
+                f"追加 **{amount:,.0f}元**\n"
+                f"现金: {old_cash:,.0f} → {old_cash + amount:,.0f}\n"
+                f"总资金: {old_capital:,.0f} → {old_capital + amount:,.0f}\n"
+                f"持仓不变，下次调仓日自动分配",
+                action_id,
+                session
+            )
+            return True
+
+        # 设置资金 (有持仓时拒绝)
         capital_match = re.search(r'(?:资金|总资金|本金)[是为]?\s*(\d+(?:\.\d+)?)\s*([万元])?', text)
         if capital_match:
             amount = float(capital_match.group(1))
@@ -1659,36 +1755,28 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             if unit == '万':
                 amount *= 10000
 
-            # 同时更新 live_holdings 和 holdings
-            from portfolio.live_portfolio import load_live_holdings, save_live_holdings
+            from portfolio.live_portfolio import load_live_holdings
             live_h = load_live_holdings()
-            live_h['initial_capital'] = amount
-            live_h['cash'] = amount
-            live_h['positions'] = {}
-            save_live_holdings(live_h)
 
-            holdings_data = {
-                "total_capital": amount,
-                "cash": amount,
-                "positions": {},
-                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
+            # 有持仓时拒绝，引导用"追加"或"清仓"
+            if live_h.get('positions'):
+                n_pos = len(live_h['positions'])
+                self.send_text(
+                    f"⚠️ 当前有 {n_pos} 只持仓，不能直接设置资金\n\n"
+                    f"请先选择:\n"
+                    f"• 发送「追加X万」— 追加资金，持仓不变\n"
+                    f"• 发送「清仓」— 清空持仓后再设置",
+                    session
+                )
+                return True
 
             action_id = f"CAP_{int(time.time())}"
-            session.add_pending_action(action_id, 'update_holdings', holdings_data)
+            session.add_pending_action(action_id, 'set_capital', {'amount': amount})
             self.send_confirm_card(
-                "📋 设置总资金",
-                f"设置总资金为 **{amount:,.0f}元**",
+                "📋 设置初始资金",
+                f"设置初始资金为 **{amount:,.0f}元**",
                 action_id,
                 session
-            )
-
-            # 保存到长期记忆
-            session.memory.add_long_term(
-                content=f"用户总资金: {amount}元",
-                summary=f"用户总资金 {amount:,.0f}元",
-                importance=0.95,
-                embedding=self.get_embedding(f"资金 {amount}")
             )
             return True
 
@@ -1718,6 +1806,44 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             cmd = data.get('command', '')
             if cmd:
                 self.execute_command(cmd, session)
+
+        elif action_type == 'clear_positions':
+            try:
+                from portfolio.live_portfolio import load_live_holdings, clear_positions
+                live_h = load_live_holdings()
+                clear_positions(live_h)
+                cash = live_h.get('cash', 0)
+                self.send_text(f"✅ 已清空持仓\n现金: {cash:,.0f}元", session)
+            except Exception as e:
+                self.send_text(f"❌ 清仓失败: {e}", session)
+
+        elif action_type == 'add_capital':
+            try:
+                from portfolio.live_portfolio import load_live_holdings, add_capital
+                amount = data.get('amount', 0)
+                live_h = load_live_holdings()
+                add_capital(live_h, amount)
+                self.send_text(
+                    f"✅ 已追加 {amount:,.0f}元\n"
+                    f"现金: {live_h['cash']:,.0f} | 总资金: {live_h['initial_capital']:,.0f}\n"
+                    f"下次调仓日自动分配",
+                    session
+                )
+            except Exception as e:
+                self.send_text(f"❌ 追加资金失败: {e}", session)
+
+        elif action_type == 'set_capital':
+            try:
+                from portfolio.live_portfolio import load_live_holdings, save_live_holdings
+                amount = data.get('amount', 0)
+                live_h = load_live_holdings()
+                live_h['initial_capital'] = amount
+                live_h['cash'] = amount
+                live_h['positions'] = {}
+                save_live_holdings(live_h)
+                self.send_text(f"✅ 初始资金已设置为 {amount:,.0f}元", session)
+            except Exception as e:
+                self.send_text(f"❌ 设置失败: {e}", session)
 
         elif action_type == 'update_holdings':
             try:

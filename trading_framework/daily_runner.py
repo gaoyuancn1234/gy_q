@@ -7,12 +7,20 @@ Cron/launchd: 工作日 18:00
     python daily_runner.py              # 正常运行
     python daily_runner.py --dry-run    # 只生成不推送
     python daily_runner.py --force      # 忽略交易日检查
+    python daily_runner.py --shadow-status             # 查看影子验证状态
+    python daily_runner.py --promote-shadow shadow_001  # 晋升 (自动创建反转影子)
+    python daily_runner.py --reject-shadow shadow_001   # 拒绝
+    python daily_runner.py --extend-shadow shadow_001 10  # 延长验证
+    python daily_runner.py --archive-shadow shadow_002  # 封存 (确认新模型更优)
+    python daily_runner.py --rollback-shadow shadow_002 # 回退到旧基线
 """
 import os
 import sys
 import json
 import time
+import shutil
 import logging
+import pickle
 from datetime import datetime, date
 from pathlib import Path
 
@@ -78,6 +86,267 @@ def refresh_daily_data() -> bool:
         return True
     except Exception as e:
         log.error(f"数据刷新失败: {e}")
+        return False
+
+
+# ============ 每日增量预测 ============
+
+def _update_daily_predictions() -> bool:
+    """检查并增量扩展当前 window 的预测
+
+    数据刷新后，调用 retrain_pipeline.extend_rolling_predictions()
+    在子进程中扩展预测到最新数据日期（避免 qlib.init 冲突）。
+
+    Returns:
+        True if predictions were updated
+    """
+    import pandas as pd
+    import subprocess
+
+    if not PRED_PKL.exists():
+        log.warning("无已有预测文件，跳过增量预测")
+        return False
+
+    try:
+        pred = pd.read_pickle(PRED_PKL)
+        pred_last = pred.index.get_level_values(0).max()
+
+        # 读取 test_end 配置
+        import yaml
+        config_path = PROJECT_DIR / "config" / "signal_config.yaml"
+        with open(config_path) as f:
+            sig_cfg = yaml.safe_load(f)
+        test_end = sig_cfg.get('test_end', '2026-06-30')
+
+        # 用子进程调用 extend_rolling_predictions (避免 qlib.init 冲突)
+        log.info(f"当前预测最新日期: {pred_last.strftime('%Y-%m-%d')}，检查增量预测...")
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'import multiprocessing; '
+             'multiprocessing.set_start_method("fork", force=True); '
+             'import sys; sys.path.insert(0, "."); '
+             f'from retrain_pipeline import extend_rolling_predictions; '
+             f'pred = extend_rolling_predictions("{test_end}"); '
+             f'last = pred.index.get_level_values(0).max().strftime("%Y-%m-%d"); '
+             f'print(f"RESULT:{{last}}:{{len(pred)}}")'],
+            capture_output=True, text=True, timeout=600,
+            cwd=str(PROJECT_DIR),
+        )
+
+        if result.returncode != 0:
+            stderr = result.stderr[-500:] if result.stderr else ''
+            if 'RecorderInitializationError' not in stderr:
+                log.error(f"增量预测子进程失败: {stderr}")
+            return False
+
+        output = result.stdout
+        if 'RESULT:' in output:
+            # 解析子进程输出
+            for line in output.split('\n'):
+                if line.startswith('RESULT:'):
+                    parts = line.split(':')
+                    new_last_str = parts[1]
+                    new_last = pd.Timestamp(new_last_str)
+                    if new_last > pred_last:
+                        log.info(f"增量预测完成: "
+                                 f"{pred_last.strftime('%Y-%m-%d')} → "
+                                 f"{new_last.strftime('%Y-%m-%d')}")
+                        return True
+                    else:
+                        log.info("预测已覆盖所有数据日期，无需更新")
+                        return False
+        elif '预测已是最新' in output:
+            log.info("预测已是最新，无需更新")
+            return False
+        else:
+            log.warning(f"增量预测输出异常: {output[-300:]}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        log.error("增量预测超时 (>10分钟)")
+        return False
+    except Exception as e:
+        log.error(f"增量预测失败: {e}", exc_info=True)
+        return False
+
+
+# ============ 自动重训 ============
+
+PRED_DIR = PROJECT_DIR / "factor_lab" / "results" / "rolling" / "predictions"
+PRED_PKL = PRED_DIR / "D_expand_3v_3r_alpha158_val_LightGBM.pkl"
+
+
+def _backup_predictions() -> 'pd.Series | None':
+    """备份当前 predictions.pkl，返回旧预测数据"""
+    if not PRED_PKL.exists():
+        return None
+    try:
+        import pandas as pd
+        old_pred = pd.read_pickle(PRED_PKL)
+        backup_name = f"{PRED_PKL.stem}.bak_{date.today().strftime('%Y%m%d')}{PRED_PKL.suffix}"
+        backup_path = PRED_PKL.parent / backup_name
+        shutil.copy2(PRED_PKL, backup_path)
+        log.info(f"预测备份: {backup_path.name}")
+        return old_pred
+    except Exception as e:
+        log.error(f"备份预测失败: {e}")
+        return None
+
+
+def _rollback_predictions(old_pred: 'pd.Series'):
+    """回退预测到备份版本"""
+    try:
+        old_pred.to_pickle(PRED_PKL)
+        log.info("预测已回退到备份版本")
+    except Exception as e:
+        log.error(f"回退预测失败: {e}")
+
+
+def _check_prediction_safety(old_pred: 'pd.Series', new_pred: 'pd.Series',
+                              topk: int = 20) -> tuple:
+    """对比最近30天共有日期的 TopK 重叠率
+
+    Returns:
+        (is_safe: bool, message: str)
+    """
+    import pandas as pd
+
+    old_dates = old_pred.index.get_level_values(0).unique()
+    new_dates = new_pred.index.get_level_values(0).unique()
+    common_dates = old_dates.intersection(new_dates).sort_values()
+
+    if len(common_dates) == 0:
+        return True, "无共有日期，跳过安全检查"
+
+    # 取最近30天共有日期
+    recent = common_dates[-30:]
+    overlaps = []
+
+    for dt in recent:
+        try:
+            old_day = old_pred.loc[dt].nlargest(topk).index.tolist()
+            new_day = new_pred.loc[dt].nlargest(topk).index.tolist()
+            overlap = len(set(old_day) & set(new_day)) / topk
+            overlaps.append(overlap)
+        except Exception:
+            continue
+
+    if not overlaps:
+        return True, "无法计算重叠率，跳过安全检查"
+
+    avg_overlap = sum(overlaps) / len(overlaps)
+    threshold = 0.5
+
+    if avg_overlap >= threshold:
+        return True, f"TopK重叠率: {avg_overlap:.0%} ≥ {threshold:.0%} → 安全"
+    else:
+        return False, f"TopK重叠率: {avg_overlap:.0%} < {threshold:.0%} → 突变"
+
+
+def _should_skip_auto_retrain() -> tuple:
+    """检查是否应跳过自动重训
+
+    跳过条件: 存在 active reverse_shadow (模型刚切换，等反转实验结束)
+
+    Returns:
+        (should_skip: bool, reason: str)
+    """
+    try:
+        from shadow_manager import ShadowManager
+        sm = ShadowManager()
+        for sid, cand in sm.registry.items():
+            if cand.get('status') == 'reverse_shadow':
+                elapsed = cand.get('elapsed_days', 0)
+                duration = cand.get('duration_days', 20)
+                return True, (f"跳过: 反转实验 {sid} 进行中 "
+                              f"({elapsed}/{duration}天)")
+        return False, ""
+    except Exception as e:
+        log.warning(f"反转实验检查失败: {e}")
+        return False, ""
+
+
+def _check_auto_retrain(dry_run: bool = False) -> bool:
+    """自动重训检查
+
+    触发条件: check_model_freshness().days_since > 60
+    (距 pred_end 超过2个月，提前1个月重训留缓冲)
+
+    Returns:
+        True if retrain was performed (success or rollback)
+    """
+    # 反转实验进行中 → 跳过自动重训
+    skip, reason = _should_skip_auto_retrain()
+    if skip:
+        log.info(f"自动重训: {reason}")
+        return False
+
+    try:
+        from factor_lab.signal_generator import SignalGenerator
+        sg = SignalGenerator()
+        freshness = sg.check_model_freshness()
+
+        if freshness['days_since'] <= 60:
+            log.info(f"模型新鲜度: {freshness['message']}，无需重训")
+            return False
+
+        log.info(f"模型需要重训: {freshness['message']}")
+
+        # 1. 备份旧预测
+        old_pred = _backup_predictions()
+
+        # 2. 执行重训
+        from dateutil.relativedelta import relativedelta
+        new_test_end = (date.today() + relativedelta(months=5)).strftime('%Y-%m-%d')
+        log.info(f"自动重训: 目标 test_end = {new_test_end}")
+
+        from retrain_pipeline import (
+            extend_rolling_predictions,
+            update_quality_score,
+            update_signal_config,
+        )
+
+        new_pred = extend_rolling_predictions(new_test_end)
+
+        # 3. 安全检查
+        safety_msg = '首次训练'
+        if old_pred is not None:
+            is_safe, safety_msg = _check_prediction_safety(old_pred, new_pred)
+            log.info(f"安全检查: {safety_msg}")
+
+            if not is_safe:
+                # 突变！回退
+                _rollback_predictions(old_pred)
+                alert = (
+                    f"⚠️ 自动重训: 预测突变，已回退\n"
+                    f"{safety_msg}\n"
+                    f"请手动检查: python retrain_pipeline.py"
+                )
+                log.warning(alert)
+                push_feishu(alert, dry_run)
+                return True
+
+        # 4. 安全，更新配置
+        update_quality_score(new_pred)
+        update_signal_config(new_test_end)
+
+        # 5. 获取新 window 信息
+        sg2 = SignalGenerator()
+        freshness2 = sg2.check_model_freshness()
+        window_num = freshness2.get('last_window', '?')
+
+        notify = (
+            f"🔄 自动重训完成\n"
+            f"新增 Window {window_num}\n"
+            f"{safety_msg}"
+        )
+        log.info(notify)
+        push_feishu(notify, dry_run)
+        return True
+
+    except Exception as e:
+        log.error(f"自动重训异常: {e}", exc_info=True)
+        push_feishu(f"❌ 自动重训异常: {e}\n请手动检查", dry_run)
         return False
 
 
@@ -178,7 +447,69 @@ def generate_and_push(dry_run: bool = False):
     if freshness['is_stale']:
         message += f"\n\n⚠️ {freshness['message']}\n发送「重训」执行季度重训"
 
+    # === Shadow Trading ===
+    shadow_brief = _run_shadow_updates(signal, prices, dry_run)
+    if shadow_brief:
+        message += f"\n\n{shadow_brief}"
+
     push_feishu(message, dry_run)
+
+
+def _run_shadow_updates(live_signal: dict, prices: dict,
+                        dry_run: bool) -> str:
+    """为所有 active shadow 生成信号并记录对比"""
+    try:
+        from shadow_manager import ShadowManager, calc_daily_returns
+        from factor_lab.signal_generator import SignalGenerator
+
+        sm = ShadowManager()
+        active = sm.get_active_candidates()
+        if not active:
+            return ""
+
+        log.info(f"Shadow 验证: {len(active)} 个活跃")
+        briefs = []
+
+        for sid, cand in active.items():
+            try:
+                config_path = cand.get('signal_config_path', '')
+                sg_shadow = SignalGenerator(config_path)
+                shadow_signal = sg_shadow.get_signal()
+
+                if 'error' in shadow_signal:
+                    log.warning(f"Shadow {sid} 信号生成失败: "
+                                f"{shadow_signal['error']}")
+                    continue
+
+                sm.update_daily(sid, live_signal, shadow_signal, prices)
+
+                perf = sm.get_performance(sid)
+                # elapsed_days 已在 update_daily 中 +1
+                elapsed = sm.registry.get(sid, {}).get('elapsed_days', 0)
+                duration = cand.get('duration_days', 20)
+                cum_ret = perf.get('cumulative_return', 0)
+                overlap = perf.get('avg_overlap', 0)
+
+                briefs.append(
+                    f"  {sid}: 重叠{overlap:.0%} "
+                    f"收益{cum_ret:+.1%} ({elapsed}/{duration}天)")
+            except Exception as e:
+                log.error(f"Shadow {sid} 更新失败: {e}")
+
+        # 检查到期
+        expired = sm.check_expired()
+        for sid in expired:
+            report = sm.get_expiry_report(sid)
+            if report:
+                push_feishu(f"📊 {report}", dry_run)
+                log.info(f"Shadow {sid} 已到期，发送对比报告")
+
+        if briefs:
+            return "🧪 影子验证:\n" + "\n".join(briefs)
+        return ""
+    except Exception as e:
+        log.error(f"Shadow 更新异常: {e}")
+        return ""
 
 
 # ============ 飞书推送 ============
@@ -228,12 +559,72 @@ def push_feishu(message: str, dry_run: bool = False):
 
 # ============ 主入口 ============
 
+def _handle_shadow_commands(args) -> bool:
+    """处理 shadow 相关 CLI 命令，返回 True 表示已处理"""
+    from shadow_manager import ShadowManager
+
+    if args.shadow_status:
+        sm = ShadowManager()
+        print(sm.get_status_text())
+        return True
+
+    if args.promote_shadow:
+        sm = ShadowManager()
+        sm.promote(args.promote_shadow)
+        print(f"请运行 python retrain_pipeline.py 完成切换")
+        return True
+
+    if args.reject_shadow:
+        sm = ShadowManager()
+        sm.reject(args.reject_shadow)
+        return True
+
+    if args.extend_shadow:
+        sid, extra = args.extend_shadow
+        sm = ShadowManager()
+        sm.extend(sid, int(extra))
+        return True
+
+    if args.archive_shadow:
+        sm = ShadowManager()
+        sm.archive(args.archive_shadow)
+        print(f"旧模型已封存，自动重训恢复正常")
+        return True
+
+    if args.rollback_shadow:
+        sm = ShadowManager()
+        sm.rollback(args.rollback_shadow)
+        print(f"已回退到旧基线，signal_config + predictions 已恢复")
+        return True
+
+    return False
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='每日信号推送')
     parser.add_argument('--dry-run', action='store_true', help='只生成不推送')
     parser.add_argument('--force', action='store_true', help='忽略交易日检查')
+    parser.add_argument('--shadow-status', action='store_true',
+                        help='查看影子验证状态')
+    parser.add_argument('--promote-shadow', type=str, metavar='ID',
+                        help='晋升 shadow (如 shadow_001)')
+    parser.add_argument('--reject-shadow', type=str, metavar='ID',
+                        help='拒绝 shadow (如 shadow_001)')
+    parser.add_argument('--extend-shadow', nargs=2, metavar=('ID', 'DAYS'),
+                        help='延长验证 (如 shadow_001 10)')
+    parser.add_argument('--archive-shadow', type=str, metavar='ID',
+                        help='封存反转 shadow (确认新模型更优)')
+    parser.add_argument('--rollback-shadow', type=str, metavar='ID',
+                        help='回退到旧基线 (反转实验证明旧模型更优)')
     args = parser.parse_args()
+
+    # Shadow 管理命令
+    if any([args.shadow_status, args.promote_shadow,
+            args.reject_shadow, args.extend_shadow,
+            args.archive_shadow, args.rollback_shadow]):
+        _handle_shadow_commands(args)
+        return
 
     log.info("=" * 50)
     log.info("Daily Runner 启动")
@@ -248,6 +639,12 @@ def main():
     if not refresh_daily_data():
         log.warning("数据刷新失败，将使用缓存数据继续")
 
+    # 增量预测: 利用已有模型扩展预测到最新数据日期
+    _update_daily_predictions()
+
+    # 自动重训检查 (距 pred_end > 60天则触发)
+    _check_auto_retrain(dry_run=args.dry_run)
+
     # 生成信号 + 推送
     generate_and_push(dry_run=args.dry_run)
 
@@ -255,4 +652,6 @@ def main():
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.set_start_method('fork', force=True)
     main()
