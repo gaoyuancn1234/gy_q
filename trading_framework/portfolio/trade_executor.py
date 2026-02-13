@@ -149,7 +149,7 @@ def get_top_signals():
         latest_date = datetime.strptime(signal['date'], '%Y-%m-%d')
 
         # 获取价格
-        prices = get_live_prices(target_stocks)
+        prices, _ = get_live_prices(target_stocks)
         return target_stocks, latest_date, prices
 
     elif STRATEGY_TYPE == 'qlib':

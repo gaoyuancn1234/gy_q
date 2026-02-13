@@ -76,11 +76,19 @@ def fetch_realtime_prices(instruments: list[str]) -> dict:
         req = Request(url)
         req.add_header('Referer', 'http://finance.sina.com.cn')
 
-        try:
-            with urlopen(req, timeout=10) as resp:
-                raw = resp.read().decode('gbk')
-        except (URLError, OSError) as e:
-            log.error(f"Sina API 请求失败: {e}")
+        raw = None
+        for attempt in range(2):
+            try:
+                with urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode('gbk')
+                break
+            except (URLError, OSError) as e:
+                if attempt == 0:
+                    log.warning(f"Sina API 请求失败 (重试中): {e}")
+                    time.sleep(2)
+                else:
+                    log.error(f"Sina API 请求失败 (已重试): {e}")
+        if raw is None:
             continue
 
         for line in raw.strip().split('\n'):

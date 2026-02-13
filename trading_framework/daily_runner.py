@@ -13,6 +13,10 @@ Cron/launchd: 工作日 18:00
     python daily_runner.py --extend-shadow shadow_001 10  # 延长验证
     python daily_runner.py --archive-shadow shadow_002  # 封存 (确认新模型更优)
     python daily_runner.py --rollback-shadow shadow_002 # 回退到旧基线
+    python daily_runner.py --experiment-status           # 查看实验盘状态
+    python daily_runner.py --create-sentiment-experiment # 创建情绪哨兵实验
+    python daily_runner.py --reject-experiment exp_001   # 终止实验
+    python daily_runner.py --extend-experiment exp_001 15 # 延长实验
 """
 import os
 import sys
@@ -352,7 +356,7 @@ def _check_auto_retrain(dry_run: bool = False) -> bool:
 
 # ============ 信号生成 + 推送 ============
 
-def generate_and_push(dry_run: bool = False):
+def generate_and_push(dry_run: bool = False, degraded: list = None):
     """生成信号 → 推送飞书"""
     from factor_lab.signal_generator import SignalGenerator
     from portfolio.live_portfolio import (
@@ -394,11 +398,16 @@ def generate_and_push(dry_run: bool = False):
     all_instruments = list(set(
         list(holdings.get('positions', {}).keys()) + signal['target_stocks']
     ))
-    prices = get_current_prices(all_instruments)
+    prices, from_cache = get_current_prices(all_instruments)
     if not prices:
         log.error("获取价格失败")
         push_feishu("❌ 获取实时价格失败，请检查 BaoStock 连接", dry_run)
         return
+    if from_cache:
+        log.warning("使用缓存价格 (BaoStock不可用)")
+        if degraded is None:
+            degraded = []
+        degraded.append("价格来自缓存(BaoStock不可用)")
 
     # 判断是否为调仓日 (每 5 个交易日)
     rebalance_every = 5
@@ -451,6 +460,15 @@ def generate_and_push(dry_run: bool = False):
     shadow_brief = _run_shadow_updates(signal, prices, dry_run)
     if shadow_brief:
         message += f"\n\n{shadow_brief}"
+
+    # === Experiment Updates ===
+    exp_brief = _run_experiment_updates(signal, prices, holdings, dry_run)
+    if exp_brief:
+        message += f"\n\n{exp_brief}"
+
+    # === 降级摘要 (告知用户哪些 API 失败了) ===
+    if degraded:
+        message += "\n\n⚠️ 降级运行: " + " | ".join(degraded)
 
     push_feishu(message, dry_run)
 
@@ -509,6 +527,117 @@ def _run_shadow_updates(live_signal: dict, prices: dict,
         return ""
     except Exception as e:
         log.error(f"Shadow 更新异常: {e}")
+        return ""
+
+
+def _run_experiment_updates(live_signal: dict, prices: dict,
+                            holdings: dict, dry_run: bool) -> str:
+    """为所有 active 实验盘生成信号并记录对比"""
+    try:
+        from experiment_manager import ExperimentManager
+        from news_sentinel import NewsSentinel
+        from portfolio.live_portfolio import get_stock_names
+
+        em = ExperimentManager()
+        active = em.get_active_experiments()
+        if not active:
+            return ""
+
+        log.info(f"实验盘: {len(active)} 个活跃")
+
+        # 1. 获取新闻数据 (所有实验共享一次)
+        sentinel = NewsSentinel()
+
+        # 宏观新闻
+        macro_news = sentinel.fetch_macro_news()
+
+        # 持仓列表 (用于宏观分析)
+        stock_names = get_stock_names()
+        holdings_list = []
+        for code in holdings.get('positions', {}):
+            holdings_list.append({
+                "code": code,
+                "name": stock_names.get(code, code),
+            })
+
+        # Claude 宏观分析
+        macro_analysis = sentinel.analyze_macro(macro_news, holdings_list)
+        log.info(f"宏观情绪: {macro_analysis.get('sentiment', 'N/A')}")
+
+        # 候选股个股新闻
+        candidate_codes = live_signal.get('target_stocks', [])[:30]
+        stock_news = sentinel.fetch_stock_news(candidate_codes)
+
+        # Claude 个股风险筛查
+        risks = sentinel.screen_stock_risks(stock_news, stock_names)
+        flagged = risks.get('flagged', [])
+        if flagged:
+            log.info(f"风险标记: {[f['code'] for f in flagged]}")
+
+        # 2. 对每个实验: 应用过滤 + 记录
+        briefs = []
+        for eid, exp in active.items():
+            try:
+                exp_type = exp.get('experiment_type', '')
+
+                if exp_type == 'sentiment':
+                    # 情绪哨兵: 应用宏观+风险过滤
+                    exp_signal = sentinel.apply_sentiment_filter(
+                        live_signal, macro_analysis, risks)
+                    extra = {
+                        'macro_sentiment': exp_signal.get(
+                            'macro_sentiment', ''),
+                        'filtered_stocks': exp_signal.get(
+                            'filtered_stocks', []),
+                        'replacement_stocks': exp_signal.get(
+                            'replacement_stocks', []),
+                        'topk_adjustment': exp_signal.get(
+                            'topk_adjustment', 0),
+                    }
+                else:
+                    # 其他类型: 暂时直接用基线信号
+                    exp_signal = live_signal
+                    extra = {}
+
+                em.update_daily(eid, live_signal, exp_signal, prices, extra)
+
+                # 生成复盘文本
+                review = em.get_daily_review(eid)
+                if review:
+                    briefs.append(review)
+            except Exception as e:
+                log.error(f"实验 {eid} 更新失败: {e}")
+
+        # 3. 检查到期
+        expired = em.check_expired()
+        for eid in expired:
+            report = em.get_expiry_report(eid)
+            if report:
+                push_feishu(f"📊 {report}", dry_run)
+                log.info(f"实验 {eid} 已到期，发送报告")
+
+        # 4. 组装推送文本
+        if not briefs and not macro_analysis:
+            return ""
+
+        parts = []
+        if briefs:
+            parts.append(
+                "━━━ 实验盘 (模拟,不影响实盘) ━━━\n"
+                + "\n".join(briefs))
+
+        macro_review = em.get_macro_review(
+            list(active.keys())[0]) if active else ""
+        if macro_review:
+            parts.append(f"📰 {macro_review}")
+
+        return "\n\n".join(parts)
+
+    except ImportError as e:
+        log.debug(f"实验盘模块未安装: {e}")
+        return ""
+    except Exception as e:
+        log.error(f"实验盘更新异常: {e}", exc_info=True)
         return ""
 
 
@@ -600,6 +729,46 @@ def _handle_shadow_commands(args) -> bool:
     return False
 
 
+def _handle_experiment_commands(args) -> bool:
+    """处理 experiment 相关 CLI 命令，返回 True 表示已处理"""
+    from experiment_manager import ExperimentManager
+
+    if args.experiment_status:
+        em = ExperimentManager()
+        print(em.get_status_text())
+        return True
+
+    if args.create_sentiment_experiment:
+        em = ExperimentManager()
+        eid = em.create_experiment(
+            name="情绪哨兵",
+            experiment_type="sentiment",
+            config={
+                "macro_topk_adjust": True,
+                "risk_filter": True,
+                "bearish_topk_delta": -4,
+                "bullish_topk_delta": 2,
+            },
+            reason="宏观情绪 + 个股风险过滤实验",
+            duration_days=30,
+        )
+        print(f"已创建实验 {eid}")
+        return True
+
+    if args.reject_experiment:
+        em = ExperimentManager()
+        em.reject(args.reject_experiment)
+        return True
+
+    if args.extend_experiment:
+        eid, extra = args.extend_experiment
+        em = ExperimentManager()
+        em.extend(eid, int(extra))
+        return True
+
+    return False
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='每日信号推送')
@@ -617,6 +786,15 @@ def main():
                         help='封存反转 shadow (确认新模型更优)')
     parser.add_argument('--rollback-shadow', type=str, metavar='ID',
                         help='回退到旧基线 (反转实验证明旧模型更优)')
+    # Experiment 管理命令
+    parser.add_argument('--experiment-status', action='store_true',
+                        help='查看实验盘状态')
+    parser.add_argument('--create-sentiment-experiment', action='store_true',
+                        help='创建情绪哨兵实验')
+    parser.add_argument('--reject-experiment', type=str, metavar='ID',
+                        help='终止实验 (如 exp_001)')
+    parser.add_argument('--extend-experiment', nargs=2, metavar=('ID', 'DAYS'),
+                        help='延长实验 (如 exp_001 15)')
     args = parser.parse_args()
 
     # Shadow 管理命令
@@ -626,29 +804,47 @@ def main():
         _handle_shadow_commands(args)
         return
 
+    # Experiment 管理命令
+    if any([args.experiment_status, args.create_sentiment_experiment,
+            args.reject_experiment, args.extend_experiment]):
+        _handle_experiment_commands(args)
+        return
+
     log.info("=" * 50)
     log.info("Daily Runner 启动")
     log.info("=" * 50)
 
-    # 交易日检查
-    if not args.force and not is_trading_day():
-        log.info("今天非交易日，跳过")
-        return
+    degraded = []  # 收集降级事件
 
-    # 刷新数据 (失败则用旧数据继续，但记录警告)
-    if not refresh_daily_data():
-        log.warning("数据刷新失败，将使用缓存数据继续")
+    try:
+        # 交易日检查
+        if not args.force and not is_trading_day():
+            log.info("今天非交易日，跳过")
+            return
 
-    # 增量预测: 利用已有模型扩展预测到最新数据日期
-    _update_daily_predictions()
+        # 刷新数据 (失败则用旧数据继续，但记录警告)
+        if not refresh_daily_data():
+            log.warning("数据刷新失败，将使用缓存数据继续")
+            degraded.append("BaoStock数据刷新失败(用缓存)")
 
-    # 自动重训检查 (距 pred_end > 60天则触发)
-    _check_auto_retrain(dry_run=args.dry_run)
+        # 增量预测: 利用已有模型扩展预测到最新数据日期
+        if not _update_daily_predictions() and degraded:
+            # 数据刷新失败且增量预测也没更新才告警
+            degraded.append("增量预测未更新")
 
-    # 生成信号 + 推送
-    generate_and_push(dry_run=args.dry_run)
+        # 自动重训检查 (距 pred_end > 60天则触发)
+        _check_auto_retrain(dry_run=args.dry_run)
 
-    log.info("Daily Runner 完成")
+        # 生成信号 + 推送 (传入降级信息)
+        generate_and_push(dry_run=args.dry_run, degraded=degraded)
+
+        log.info("Daily Runner 完成")
+    except Exception as e:
+        log.error(f"Daily Runner 异常退出: {e}", exc_info=True)
+        try:
+            push_feishu(f"❌ Daily Runner 异常退出:\n{e}", args.dry_run)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

@@ -215,7 +215,7 @@ TIMEOUT_QUICK = 60        # 极简问答: 1分钟
 TIMEOUT_SIMPLE = 120      # 简单问答: 2分钟
 TIMEOUT_SCRIPT = 300      # 简单脚本: 5分钟
 TIMEOUT_MEDIUM = 600      # 中等任务: 10分钟
-TIMEOUT_ANALYSIS = 1800   # 复杂分析: 30分钟
+TIMEOUT_ANALYSIS = 3600   # 复杂分析: 1小时
 TIMEOUT_COMPLEX = 3600    # 复杂代码任务: 1小时
 
 # ============================================================
@@ -1035,9 +1035,10 @@ class SmartBot:
 
         return "\n".join(parts)
 
-    def estimate_task_complexity(self, user_input: str) -> tuple:
+    def estimate_task_complexity(self, user_input: str, session: 'UserSession' = None) -> tuple:
         """
         调用 Claude CLI 智能体判断任务复杂度，返回 (超时秒数, 复杂度描述)
+        传入最近对话上下文，让 AI 理解追问/延续性指令的真实复杂度
         如果智能体调用失败，使用简单的 fallback 逻辑
         """
         # 超时级别映射
@@ -1046,14 +1047,32 @@ class SmartBot:
             2: (TIMEOUT_SIMPLE, "简单任务(2分钟)"),
             3: (TIMEOUT_SCRIPT, "脚本任务(5分钟)"),
             4: (TIMEOUT_MEDIUM, "中等任务(10分钟)"),
-            5: (TIMEOUT_ANALYSIS, "分析任务(30分钟)"),
+            5: (TIMEOUT_ANALYSIS, "分析任务(1小时)"),
             6: (TIMEOUT_COMPLEX, "复杂任务(1小时)"),
         }
 
-        try:
-            prompt = f"""你是一个任务复杂度评估智能体。分析用户发给AI助手的指令，判断AI完成该任务需要多少时间。
+        # 构建最近对话上下文（帮助理解追问类消息）
+        recent_context = ""
+        if session and session.memory:
+            recent = session.memory.get_recent_context(n=3)
+            if recent:
+                lines = []
+                for msg in recent[-4:]:
+                    role = "用户" if msg.role == "user" else "助手"
+                    lines.append(f"{role}: {msg.content[:150]}")
+                recent_context = "\n".join(lines)
 
-【用户指令】
+        try:
+            context_block = ""
+            if recent_context:
+                context_block = f"""
+【最近对话上下文】（用于理解当前指令是否是追问/延续）
+{recent_context}
+
+"""
+
+            prompt = f"""你是一个任务复杂度评估智能体。分析用户发给AI助手的指令，判断AI完成该任务需要多少时间。
+{context_block}【用户指令】
 {user_input[:500]}
 
 请从以下6个级别中选择最合适的：
@@ -1064,11 +1083,10 @@ class SmartBot:
 5 = 复杂分析（爬取数据、数据分析+画图、多文件修改、系统调试、深度分析、写报告、房价/股票等预测分析）
 6 = 大型任务（重构系统、架构改造、从零开发、全面改造、大规模爬虫+分析）
 
-【重要提示】涉及以下关键词的任务通常至少是级别5：
-- 爬取/抓取/采集数据
-- 分析+画图/可视化
-- 预测/建模/训练
-- XX市/XX区/XX行业+分析"""
+【重要提示】
+- 涉及爬取/抓取/采集数据、分析+画图/可视化、预测/建模/训练、XX市/XX区/XX行业+分析 通常至少级别5
+- 如果用户指令很短但上下文显示是对复杂任务的追问（如"你计划怎么修复"、"继续"、"执行吧"），要结合上下文判断真实复杂度，不要只看当前指令长度
+- 追问/延续性指令的复杂度应≥上一轮任务的复杂度"""
 
             json_schema = json.dumps({
                 "type": "object",
@@ -1149,8 +1167,8 @@ class SmartBot:
         """调用 Claude - 让 Claude 直接执行操作，动态超时"""
         context = self.build_context(user_input, session)
 
-        # 估算任务复杂度和超时时间
-        timeout, complexity_desc = self.estimate_task_complexity(user_input)
+        # 估算任务复杂度和超时时间（传入 session 以获取上下文）
+        timeout, complexity_desc = self.estimate_task_complexity(user_input, session)
         print(f"[超时设置] {complexity_desc} -> {timeout}秒")
 
         # 如果有上次结果，加入上下文
@@ -1211,6 +1229,12 @@ class SmartBot:
                 if session:
                     session.current_process = None
             print(f"[Claude输出长度] {len(output)} 字符")
+            # 前台也检测 API 错误，加醒目标记
+            api_error_keywords = ['403', 'forbidden', 'Failed to authenticate',
+                                  'API Error', '401', 'unauthorized']
+            if any(kw.lower() in output.lower() for kw in api_error_keywords):
+                print(f"[前台API错误] {output[:200]}")
+                return f"⚠️ Claude API 访问错误，需要你处理：\n\n{output}"
             return output
         except Exception as e:
             if session:
@@ -1219,6 +1243,14 @@ class SmartBot:
 
     def _wait_bg_result(self, proc: subprocess.Popen, session: 'UserSession', complexity_desc: str):
         """后台线程等待超时任务完成，完成后主动推送结果给用户"""
+        def _is_api_error(text: str) -> bool:
+            """检测是否为 API 认证/访问错误"""
+            error_indicators = ['403', 'forbidden', 'Request not allowed',
+                                'Failed to authenticate', 'API Error',
+                                '401', 'unauthorized', 'rate_limit']
+            text_lower = text.lower()
+            return any(indicator.lower() in text_lower for indicator in error_indicators)
+
         def _wait():
             try:
                 # 最多再等30分钟
@@ -1226,6 +1258,16 @@ class SmartBot:
                 output = stdout.strip() or stderr.strip()
                 if output:
                     print(f"[后台任务完成] {len(output)} 字符")
+                    # 检测 API 403 等错误，立即通知用户
+                    if _is_api_error(output):
+                        print(f"[后台任务API错误] {output[:200]}")
+                        self.send_text(
+                            f"⚠️ 后台任务遇到 API 访问错误，需要你处理：\n\n"
+                            f"{output[:500]}\n\n"
+                            f"（原始任务复杂度: {complexity_desc}）",
+                            session
+                        )
+                        return
                     session.last_result = output[:500]
                     self.process_response(output, session)
                 else:
@@ -1335,7 +1377,7 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
         # 根据命令复杂度设置超时
         timeout = TIMEOUT_SCRIPT  # 默认5分钟
         if 'python' in cmd and any(kw in cmd for kw in ['train', 'backtest', 'test']):
-            timeout = TIMEOUT_ANALYSIS  # 30分钟
+            timeout = TIMEOUT_ANALYSIS  # 1小时
         try:
             result = subprocess.run(
                 cmd, shell=True, cwd=str(WORK_DIR),
@@ -1412,7 +1454,7 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             all_instruments = list(set(
                 list(holdings.get('positions', {}).keys()) + signal['target_stocks']
             ))
-            prices = get_live_prices(all_instruments)
+            prices, _from_cache = get_live_prices(all_instruments)
             if not prices:
                 self.send_text("❌ 获取价格失败，请稍后重试", session)
                 return
@@ -1508,6 +1550,7 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 "• 监控 - 盘中监控状态\n"
                 "• 挖掘 - 因子挖掘状态\n"
                 "• 影子 - 影子交易验证状态\n"
+                "• 实验盘 - 实验盘状态\n"
                 "• 重训 - 季度模型重训\n"
                 "• 追加5万 - 追加资金(下次调仓分配)\n"
                 "• 清仓 - 清空所有持仓\n"
@@ -1648,6 +1691,18 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 self.send_text(f"❌ 影子验证查询失败: {e}", session)
             return True
 
+        # 实验盘状态
+        if text in ['实验盘', '实验', 'experiment']:
+            try:
+                sys.path.insert(0, str(BOT_DIR))
+                from experiment_manager import ExperimentManager
+                em = ExperimentManager()
+                status = em.get_status_text()
+                self.send_text(f"🔬 {status}", session)
+            except Exception as e:
+                self.send_text(f"❌ 实验盘查询失败: {e}", session)
+            return True
+
         # 持仓查询 — ML 实盘持仓
         if text in ['持仓', '仓位', 'positions']:
             try:
@@ -1658,7 +1713,7 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 holdings = load_live_holdings()
                 positions = holdings.get('positions', {})
                 if positions:
-                    prices = get_live_prices(list(positions.keys()))
+                    prices, _ = get_live_prices(list(positions.keys()))
                 else:
                     prices = {}
                 summary = get_portfolio_summary(holdings, prices)

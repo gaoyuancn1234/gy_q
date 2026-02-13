@@ -1,0 +1,11 @@
+qlib
+lark-oapi
+python-dotenv
+redis
+numpy
+faiss-cpu
+onnxruntime
+tokenizers
+huggingface_hub
+baostock
+lightgbm

@@ -82,20 +82,56 @@ def get_stock_names() -> dict:
 
 # ============ 价格获取 ============
 
-def get_current_prices(instruments: list) -> dict:
-    """获取指定股票的最新价格 (BaoStock)
+PRICE_CACHE_FILE = PROJECT_DIR / "portfolio" / "price_cache.json"
+
+
+def _save_price_cache(prices: dict):
+    """保存价格到本地缓存 (原子写入)"""
+    try:
+        cache = {
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'prices': prices,
+        }
+        tmp = PRICE_CACHE_FILE.with_suffix('.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(cache, f)
+        import os
+        os.replace(tmp, PRICE_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _load_price_cache(instruments: list) -> dict:
+    """从缓存加载价格 (仅当天有效)"""
+    if not PRICE_CACHE_FILE.exists():
+        return {}
+    try:
+        with open(PRICE_CACHE_FILE, 'r') as f:
+            cache = json.load(f)
+        cache_date = cache.get('date', '')[:10]
+        today = datetime.now().strftime('%Y-%m-%d')
+        if cache_date != today:
+            return {}
+        cached = cache.get('prices', {})
+        return {k: v for k, v in cached.items() if k in instruments}
+    except Exception:
+        return {}
+
+
+def get_current_prices(instruments: list) -> tuple:
+    """获取指定股票的最新价格 (BaoStock)，失败时降级到本地缓存
 
     Args:
         instruments: Qlib 格式代码列表 ['SH600036', ...]
 
     Returns:
-        {instrument: price} 字典
+        (prices_dict, from_cache) — prices_dict: {instrument: price}, from_cache: bool
     """
     with _bs_lock:
         try:
             lg = bs.login()
             if lg.error_code != '0':
-                return {}
+                raise ConnectionError(f"BaoStock 登录失败: {lg.error_msg}")
 
             end_date = datetime.now().strftime('%Y-%m-%d')
             start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
@@ -117,10 +153,15 @@ def get_current_prices(instruments: list) -> dict:
                 if rows:
                     prices[inst] = float(rows[-1][1])
 
-            return prices
+            if prices:
+                _save_price_cache(prices)
+            return prices, False
         except Exception as e:
-            print(f"[get_prices] 失败: {e}")
-            return {}
+            print(f"[get_prices] BaoStock 失败 ({type(e).__name__}): {e}, 尝试本地缓存...")
+            cached = _load_price_cache(instruments)
+            if cached:
+                print(f"[get_prices] 使用缓存价格 ({len(cached)}只)")
+            return cached, bool(cached)
         finally:
             try:
                 bs.logout()

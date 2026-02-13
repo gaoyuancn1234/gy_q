@@ -43,6 +43,12 @@ trading_framework/
 │   ├── configs/               # 独立 signal config
 │   ├── state/                 # 独立 predictions + rolling_info
 │   └── daily_log/             # 每日信号对比 + 汇总
+├── news_sentinel.py       # 情绪哨兵 (新闻获取+Claude分析+信号过滤)
+├── experiment_manager.py  # 实验盘管理器 (注册/生命周期/绩效)
+├── experiment/            # 实验盘数据
+│   ├── registry.json          # 实验注册表
+│   ├── news_cache/            # 新闻缓存 ({date}_macro.json 等)
+│   └── daily_log/             # 每日对比 + 汇总
 ├── factor_lab/            # 因子实验室
 │   ├── factor_miner.py        # 自动因子挖掘 (每周日20:00)
 │   ├── signal_generator.py    # ML信号生成器
@@ -104,12 +110,24 @@ promote → 旧基线自动创建反转影子 (status=reverse_shadow, 20天)
 - promote 会备份 live config → 更新 preset → 自动创建反转影子 → 需手动 retrain
 - 模型生命周期: active → promoted/rejected | reverse_shadow → archived/rejected
 
+### 实验盘 (情绪哨兵)
+```
+创建实验 → daily_runner 每日: 获取新闻 → Claude宏观分析 → 个股风险筛查 → 后处理信号 → 记录对比
+验证期到期 → 飞书推送对比报告 → 人工: reject / extend
+```
+- 与 shadow 区别: 实验盘使用**同一基础信号** + 后处理，不需要独立重训
+- 数据源: CCTV新闻联播(ak.news_cctv) + 财联社电报(ak.stock_info_global_cls) + 个股新闻(ak.stock_news_em)
+- 宏观情绪: bearish=-4 TopK / neutral=0 / bullish=+2 TopK
+- 个股过滤: 被调查/ST/诉讼/制裁/退市/违规/业绩暴雷 → 移除并递补
+- 生命周期: active → completed/rejected
+
 ### 飞书命令
 - `信号` - 生成ML调仓信号
 - `持仓` - 查看实盘持仓
 - `监控` - 盘中监控状态
 - `挖掘` - 因子挖掘状态
 - `影子` - 影子交易验证状态
+- `实验盘` - 实验盘状态
 - `重训` - 季度模型重训
 - `追加5万` - 追加资金(下次调仓日自动分配)
 - `清仓` - 清空所有持仓
@@ -152,4 +170,14 @@ python daily_runner.py --reject-shadow shadow_001    # 拒绝
 python daily_runner.py --extend-shadow shadow_001 10 # 延长验证
 python daily_runner.py --archive-shadow shadow_002   # 封存 (确认新模型更优)
 python daily_runner.py --rollback-shadow shadow_002  # 回退到旧基线
+
+# 实验盘管理
+python daily_runner.py --experiment-status               # 查看实验盘状态
+python daily_runner.py --create-sentiment-experiment      # 创建情绪哨兵实验
+python daily_runner.py --reject-experiment exp_001        # 终止实验
+python daily_runner.py --extend-experiment exp_001 15     # 延长实验
+
+# 情绪哨兵测试
+python news_sentinel.py --test-macro                     # 测试宏观新闻获取
+python news_sentinel.py --test-stocks SH600036 SH601318  # 测试个股新闻
 ```

@@ -1,0 +1,14 @@
+{
+  "shadow_001": {
+    "status": "active",
+    "created_date": "2026-02-13",
+    "source": "experiment_010:fundamental_factors",
+    "duration_days": 20,
+    "elapsed_days": 0,
+    "config_overrides": {
+      "preset": "alpha158_val"
+    },
+    "reason": "加入22个PE/PB/MV基本面因子 (188→210因子), 回测Sharpe 1.324→2.073 (+56.6%)",
+    "signal_config_path": "shadow/configs/shadow_001.yaml"
+  }
+}

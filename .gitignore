@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Environment and credentials
+.env
+.claude/
+
+# Qlib data and MLflow
+mlruns/
+catboost_info/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime state and cache
+trading_framework/monitor/monitor_state.json
+trading_framework/shadow/daily_log/
+trading_framework/shadow/state/
+trading_framework/experiment/news_cache/
+trading_framework/experiment/daily_log/
+trading_framework/experiment/prev_prices.json
+trading_framework/factor_lab/results/
+trading_framework/factor_lab/mining_results/
+trading_framework/factor_lab/paper_trading/
+trading_framework/benchmark_results/
+
+# Sensitive / runtime data
+trading_framework/portfolio/live_holdings.json
+trading_framework/reflections/
+
+# Qlib __pycache__ in quant_trading
+quant_trading/
+
+# Temporary root-level files (old scripts, charts, experiments)
+Users/
+archive/
+baba_stock_chart.png
+bitcoin_price_chart.png
+gold_price_chart.png
+gold_price_chart.py
+gold_price_week.png
+qlib_demo.py
+qlib_optimized.py
+qlib_optimized_v2.py
+run_backtest.py
+run_backtest_ml.py
+run_backtest_ml_v2.py
+run_backtest_transformer.py
+run_backtest_v2.py
+shanghai_house_price_prediction.png
+shanghai_house_price_prediction.py
+shanghai_house_price_report.txt
+shanghai_realestate_analysis.png
+shanghai_realestate_analysis.py
+shanghai_realestate_ranking.csv
+smart_bot.log
+test_*.py

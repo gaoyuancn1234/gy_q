@@ -1,0 +1,17 @@
+{
+  "exp_001": {
+    "status": "active",
+    "name": "情绪哨兵",
+    "experiment_type": "sentiment",
+    "created_date": "2026-02-12",
+    "duration_days": 30,
+    "elapsed_days": 1,
+    "config": {
+      "macro_topk_adjust": true,
+      "risk_filter": true,
+      "bearish_topk_delta": -4,
+      "bullish_topk_delta": 2
+    },
+    "reason": "宏观情绪 + 个股风险过滤实验"
+  }
+}
