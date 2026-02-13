@@ -6,6 +6,7 @@ Cron/launchd: 工作日 18:00
 用法:
     python daily_runner.py              # 正常运行
     python daily_runner.py --dry-run    # 只生成不推送
+    python daily_runner.py --morning-report  # 早间反思汇报
     python daily_runner.py --force      # 忽略交易日检查
     python daily_runner.py --shadow-status             # 查看影子验证状态
     python daily_runner.py --promote-shadow shadow_001  # 晋升 (自动创建反转影子)
@@ -365,6 +366,22 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         check_stop_loss, get_daily_report, get_stock_names,
     )
 
+    # 预检查: 预测缓存文件是否存在
+    if not PRED_PKL.exists():
+        # 尝试备用路径: 查找同目录下其他 pkl 文件
+        alt_pkls = list(PRED_DIR.glob("*.pkl")) if PRED_DIR.exists() else []
+        if alt_pkls:
+            alt_names = [p.name for p in alt_pkls[:5]]
+            msg = (f"❌ 预测缓存不存在: {PRED_PKL.name}\n"
+                   f"可用文件: {', '.join(alt_names)}\n"
+                   f"请检查 signal_config.yaml 配置或重新运行训练")
+        else:
+            msg = (f"❌ 预测缓存不存在: {PRED_PKL}\n"
+                   f"请先运行: python retrain_pipeline.py")
+        log.error(msg)
+        push_feishu(msg, dry_run)
+        return
+
     log.info("加载信号生成器...")
     sg = SignalGenerator()
 
@@ -641,6 +658,84 @@ def _run_experiment_updates(live_signal: dict, prices: dict,
         return ""
 
 
+# ============ 早间反思汇报 ============
+
+def morning_reflection_report(dry_run: bool = False):
+    """读取昨晚的反思结果，推送早间汇报"""
+    from datetime import timedelta
+    reflect_dir = PROJECT_DIR / "reflections"
+
+    # 查找最近一次反思 (昨天或前天)
+    reflection = None
+    reflect_date = None
+    for days_back in range(1, 4):
+        d = (date.today() - timedelta(days=days_back)).isoformat()
+        reflect_file = reflect_dir / f"{d}.json"
+        if reflect_file.exists():
+            try:
+                with open(reflect_file, 'r', encoding='utf-8') as f:
+                    reflection = json.load(f)
+                reflect_date = d
+                break
+            except Exception:
+                continue
+
+    if not reflection:
+        log.info("无最近反思记录，跳过晨报")
+        return
+
+    score = reflection.get('score', 0)
+    summary = reflection.get('summary', '无')
+    score_bar = '★' * score + '☆' * (10 - score)
+
+    parts = [
+        f"🌅 每日反思汇报 ({reflect_date})",
+        f"评分: {score_bar} ({score}/10)",
+        f"总结: {summary}",
+    ]
+
+    # 用户体验
+    ux = reflection.get('user_experience', {})
+    if ux:
+        highlights = ux.get('highlights', [])
+        issues = ux.get('issues', [])
+        if highlights:
+            parts.append(f"亮点: {', '.join(highlights[:3])}")
+        if issues:
+            parts.append(f"问题: {', '.join(issues[:3])}")
+
+    # 稳定性
+    stab = reflection.get('stability', {})
+    if stab:
+        errs = stab.get('errors_count', 0)
+        restarts = stab.get('restarts', 0)
+        if errs or restarts:
+            parts.append(f"稳定性: {errs} 错误, {restarts} 重启")
+
+    # 代码改进
+    improvements = reflection.get('code_improvements', [])
+    if improvements:
+        parts.append(f"代码改进建议: {len(improvements)} 项")
+        for imp in improvements[:3]:
+            parts.append(f"  - [{imp.get('priority', '?')}] {imp.get('description', '')}")
+
+    # 自动修复
+    auto_fixes = reflection.get('auto_fixes', [])
+    if auto_fixes and any(not f.get('error') for f in auto_fixes):
+        parts.append(f"自动修复: 已执行 {len(auto_fixes)} 项")
+
+    # Action items
+    actions = reflection.get('action_items', [])
+    if actions:
+        parts.append("今日待办:")
+        for item in actions[:5]:
+            parts.append(f"  · {item}")
+
+    message = "\n".join(parts)
+    push_feishu(message, dry_run)
+    log.info(f"反思晨报已推送: {reflect_date}, 评分 {score}/10")
+
+
 # ============ 飞书推送 ============
 
 def push_feishu(message: str, dry_run: bool = False):
@@ -774,6 +869,8 @@ def main():
     parser = argparse.ArgumentParser(description='每日信号推送')
     parser.add_argument('--dry-run', action='store_true', help='只生成不推送')
     parser.add_argument('--force', action='store_true', help='忽略交易日检查')
+    parser.add_argument('--morning-report', action='store_true',
+                        help='推送早间反思汇报')
     parser.add_argument('--shadow-status', action='store_true',
                         help='查看影子验证状态')
     parser.add_argument('--promote-shadow', type=str, metavar='ID',
@@ -810,6 +907,12 @@ def main():
         _handle_experiment_commands(args)
         return
 
+    # 早间反思汇报
+    if args.morning_report:
+        log.info("推送早间反思汇报...")
+        morning_reflection_report(dry_run=args.dry_run)
+        return
+
     log.info("=" * 50)
     log.info("Daily Runner 启动")
     log.info("=" * 50)
@@ -842,7 +945,13 @@ def main():
     except Exception as e:
         log.error(f"Daily Runner 异常退出: {e}", exc_info=True)
         try:
-            push_feishu(f"❌ Daily Runner 异常退出:\n{e}", args.dry_run)
+            import traceback
+            tb = traceback.format_exc()[-300:]
+            push_feishu(
+                f"❌ Daily Runner 异常退出:\n{e}\n\n"
+                f"请检查日志: logs/daily_runner.log\n{tb}",
+                dry_run=args.dry_run
+            )
         except Exception:
             pass
 

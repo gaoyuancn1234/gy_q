@@ -152,31 +152,36 @@ def collect_today_data() -> dict:
     return data
 
 
-def run_reflection(today_data: dict) -> dict:
-    """调用 Claude 进行自我反思，返回反思结果"""
-    prompt = f"""你是一个智能系统的自我反思模块。请根据今天的运行数据进行深度反思和优化建议。
+def _build_reflection_prompt(today_data: dict, compact: bool = False) -> str:
+    """构建反思 prompt，compact 模式下缩短内容以降低耗时"""
+    if compact:
+        conv_limit, log_limit, snippet_limit = 2000, 500, 15
+    else:
+        conv_limit, log_limit, snippet_limit = 5000, 1000, 30
+
+    return f"""你是一个智能系统的自我反思模块。请根据今天的运行数据进行深度反思和优化建议。
 
 ## 今日运行数据
 
 ### 日期: {today_data['date']}
 
 ### 对话统计
-{json.dumps(today_data['conversations'], ensure_ascii=False, indent=2)[:5000]}
+{json.dumps(today_data['conversations'], ensure_ascii=False, indent=2)[:conv_limit]}
 
 ### 机器人日志摘要
-{chr(10).join(today_data['bot_log_snippets'][:30])}
+{chr(10).join(today_data['bot_log_snippets'][:snippet_limit])}
 
 ### Daily Runner 日志
-{today_data['daily_runner_log'][:1000]}
+{today_data['daily_runner_log'][:log_limit]}
 
 ### 盘中监控日志
-{today_data['monitor_log'][:1000]}
+{today_data['monitor_log'][:log_limit]}
 
 ### Daemon 日志
 {today_data['daemon_log'][:500]}
 
 ### 实验盘日志
-{json.dumps(today_data.get('experiment_log', {}), ensure_ascii=False, indent=2)[:1000]}
+{json.dumps(today_data.get('experiment_log', {}), ensure_ascii=False, indent=2)[:log_limit]}
 
 ### 宏观分析
 {json.dumps(today_data.get('macro_analysis', {}), ensure_ascii=False, indent=2)[:500]}
@@ -239,49 +244,79 @@ def run_reflection(today_data: dict) -> dict:
 }}
 ```"""
 
-    try:
-        cmd = [
-            '/usr/local/bin/claude',
-            '--print',
-            '--dangerously-skip-permissions',
-            '--output-format', 'text',
-            '-p', prompt
-        ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True,
-            timeout=300,  # 5 分钟超时
-            cwd=str(WORK_DIR)
-        )
-        output = result.stdout.strip()
 
-        # 提取 JSON
-        json_match = re.search(r'\{[\s\S]*\}', output)
-        if json_match:
-            reflection = json.loads(json_match.group())
+def _call_claude_reflection(prompt: str, timeout: int) -> dict:
+    """单次调用 Claude 反思，返回解析后的 dict 或包含 error 的 dict"""
+    cmd = [
+        '/usr/local/bin/claude',
+        '--print',
+        '--dangerously-skip-permissions',
+        '--output-format', 'text',
+        '-p', prompt
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True, text=True,
+        timeout=timeout,
+        cwd=str(WORK_DIR)
+    )
+    output = result.stdout.strip()
+
+    json_match = re.search(r'\{[\s\S]*\}', output)
+    if json_match:
+        return json.loads(json_match.group())
+    else:
+        return {
+            "score": 0,
+            "summary": "反思输出解析失败",
+            "raw_output": output[:2000],
+            "error": "无法提取 JSON"
+        }
+
+
+def run_reflection(today_data: dict) -> dict:
+    """调用 Claude 进行自我反思，超时后用精简内容重试一次"""
+    max_attempts = 2
+    timeouts = [10800, 3600]  # 第一次 3 小时，重试 1 小时
+
+    for attempt in range(max_attempts):
+        compact = (attempt > 0)
+        prompt = _build_reflection_prompt(today_data, compact=compact)
+        timeout = timeouts[attempt]
+
+        try:
+            if attempt > 0:
+                print(f"  重试反思 (精简模式, 超时 {timeout // 60} 分钟)...")
+            reflection = _call_claude_reflection(prompt, timeout)
+            reflection["date"] = today_data["date"]
+            if "error" not in reflection or reflection.get("score", 0) > 0:
+                return reflection
+            # 解析失败但没超时，直接返回
             return reflection
-        else:
+        except subprocess.TimeoutExpired:
+            print(f"  反思超时 (第 {attempt + 1} 次, {timeout // 60} 分钟)")
+            if attempt < max_attempts - 1:
+                continue
             return {
                 "date": today_data['date'],
                 "score": 0,
-                "summary": "反思输出解析失败",
-                "raw_output": output[:2000],
-                "error": "无法提取 JSON"
+                "summary": "反思超时 (已重试)",
+                "error": f"Claude 调用超时 ({max_attempts} 次)"
             }
-    except subprocess.TimeoutExpired:
-        return {
-            "date": today_data['date'],
-            "score": 0,
-            "summary": "反思超时",
-            "error": "Claude 调用超时 (5分钟)"
-        }
-    except Exception as e:
-        return {
-            "date": today_data['date'],
-            "score": 0,
-            "summary": f"反思失败: {e}",
-            "error": str(e)
-        }
+        except Exception as e:
+            return {
+                "date": today_data['date'],
+                "score": 0,
+                "summary": f"反思失败: {e}",
+                "error": str(e)
+            }
+
+    return {
+        "date": today_data['date'],
+        "score": 0,
+        "summary": "反思失败",
+        "error": "未知错误"
+    }
 
 
 def apply_auto_fixes(reflection: dict) -> list:
@@ -324,7 +359,7 @@ def apply_auto_fixes(reflection: dict) -> list:
         result = subprocess.run(
             cmd,
             capture_output=True, text=True,
-            timeout=600,  # 10 分钟超时
+            timeout=1800,  # 30 分钟超时
             cwd=str(WORK_DIR)
         )
         output = result.stdout.strip()

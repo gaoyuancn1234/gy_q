@@ -1054,12 +1054,12 @@ class SmartBot:
         # 构建最近对话上下文（帮助理解追问类消息）
         recent_context = ""
         if session and session.memory:
-            recent = session.memory.get_recent_context(n=3)
+            recent = session.memory.get_recent_context(n=4)
             if recent:
                 lines = []
-                for msg in recent[-4:]:
+                for msg in recent[-8:]:
                     role = "用户" if msg.role == "user" else "助手"
-                    lines.append(f"{role}: {msg.content[:150]}")
+                    lines.append(f"{role}: {msg.content[:300]}")
                 recent_context = "\n".join(lines)
 
         try:
@@ -2304,6 +2304,7 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
 
             event_handler = lark.EventDispatcherHandler.builder("", "") \
                 .register_p2_im_message_receive_v1(on_msg) \
+                .register_p2_im_message_message_read_v1(lambda data: None) \
                 .register_p2_card_action_trigger(on_card) \
                 .build()
 
