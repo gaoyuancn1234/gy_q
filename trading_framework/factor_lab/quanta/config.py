@@ -51,7 +51,7 @@ BASE_FEATURES = ['$open', '$high', '$low', '$close', '$volume', '$amount', '$tur
 
 # --- Claude CLI 配置 ---
 CLAUDE_CLI = '/usr/local/bin/claude'
-CLAUDE_TIMEOUT = 300  # 秒
+CLAUDE_TIMEOUT = 600  # 秒 (一致性验证等复杂 prompt 可能需要较长时间)
 MAX_RETRY = 10         # LLM 调用最大重试次数 (论文 max_retry=30, 实际用 10)
 RETRY_WAIT = 5         # 重试等待秒数 (论文 retry_wait_seconds=15, 实际用 5)
 
