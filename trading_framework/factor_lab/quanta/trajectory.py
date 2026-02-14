@@ -9,6 +9,8 @@ v3 新增 Trace 系统 (对齐论文 core/proposal.py):
   DirectionTrace: 单个 direction 的轨迹历史
 """
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -75,9 +77,9 @@ class TraceEntry:
     def from_dict(cls, d: dict) -> 'TraceEntry':
         if not d:
             return cls()
-        fb_data = d.pop('feedback', None)
+        fb_data = d.get('feedback', None)
         known = {f.name for f in cls.__dataclass_fields__.values()}
-        entry = cls(**{k: v for k, v in d.items() if k in known})
+        entry = cls(**{k: v for k, v in d.items() if k in known and k != 'feedback'})
         if fb_data and isinstance(fb_data, dict):
             entry.feedback = HypothesisFeedback.from_dict(fb_data)
         return entry
@@ -195,7 +197,7 @@ class Trajectory:
     # Step 1: Factor
     factor_candidates: list[dict] = field(default_factory=list)  # [{name, expr, desc}]
     best_factor: Optional[dict] = None  # {name, expr, desc}
-    consistency_ok: bool = False
+    consistency_ok: Optional[bool] = None  # None=未检查, True/False=已验证
     constraint_ok: bool = False
     qlib_ok: bool = False
 
@@ -344,8 +346,7 @@ class TrajectoryPool:
                 str(k): v.to_dict() for k, v in self._direction_traces.items()
             },
         }
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False, default=_json_default)
+        _atomic_json_dump(path, data, indent=2, ensure_ascii=False, default=_json_default)
 
     def load(self, filename: str = "trajectories.json"):
         path = self.save_dir / filename
@@ -361,6 +362,22 @@ class TrajectoryPool:
         # 加载 direction traces
         for k, v in data.get("direction_traces", {}).items():
             self._direction_traces[int(k)] = DirectionTrace.from_dict(v)
+
+
+def _atomic_json_dump(path: Path, data, **kwargs):
+    """原子写入 JSON: 先写临时文件再 rename，防止中断导致文件损坏"""
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, **kwargs)
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _json_default(obj):

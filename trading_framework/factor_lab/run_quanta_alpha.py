@@ -49,9 +49,7 @@ from factor_lab.quanta.config import (
     TOPK, N_DROP, BACKTEST_ENABLED, HISTORY_LIMIT, MAX_REGEN_ATTEMPTS,
     TRAIN_START, TRAIN_END, VALID_START, VALID_END, TEST_START, TEST_END,
 )
-from factor_lab.quanta.trajectory import (
-    Trajectory, TrajectoryPool, TraceEntry, HypothesisFeedback,
-)
+from factor_lab.quanta.trajectory import Trajectory, TrajectoryPool
 from factor_lab.quanta.factor_pool import FactorPool
 from factor_lab.quanta import idea_agent, factor_agent, eval_agent, evolution
 
@@ -175,37 +173,10 @@ def _finalize_phase_a_traj(traj: Trajectory, pool: TrajectoryPool,
                            factor_pool: FactorPool,
                            direction_trace, no_backtest: bool):
     """Phase A 轨迹的 Step 5: Feedback + 因子池入池"""
-    traj.compute_reward()
-    pool.add(traj)
+    # 复用 evolution 的标准 finalize (compute_reward + LLM feedback + trace append)
+    evolution._finalize_trace(traj, pool, direction_trace, no_backtest)
 
-    # LLM 反馈
-    print(f"  [Step 5] Feedback (LLM)")
-    sota_entry = direction_trace.get_sota()
-    feedback = eval_agent.generate_llm_feedback(traj, sota_entry, direction_trace)
-    traj.llm_feedback = feedback.to_dict()
-    traj.claude_calls += 1
-
-    # 追加到 DirectionTrace
-    factor_name = traj.best_factor.get('name', '') if traj.best_factor else ''
-    factor_expr = traj.best_factor.get('expr', '') if traj.best_factor else ''
-
-    entry = TraceEntry(
-        hypothesis=traj.hypothesis,
-        factor_name=factor_name,
-        factor_expr=factor_expr,
-        ic=traj.ic,
-        icir=traj.icir,
-        rank_ic=traj.rank_ic,
-        backtest_metrics=traj.backtest_metrics or {},
-        feedback=feedback,
-        traj_id=traj.id,
-    )
-    direction_trace.append(entry)
-
-    decision_str = "ACCEPT (新 SOTA)" if feedback.decision else "REJECT"
-    print(f"  [Feedback] {decision_str} | {feedback.observations[:80]}")
-
-    # 因子池入池
+    # Phase A 额外步骤: 因子池入池
     if traj.best_factor and traj.failure_step == -1:
         admitted, reason = factor_pool.try_admit(
             name=traj.best_factor['name'],

@@ -147,7 +147,7 @@ def diagnose_failure(traj: Trajectory) -> tuple[int, str]:
     if not traj.factor_candidates:
         return 1, "未能生成任何候选因子表达式。请简化假说使其更容易转化为数学公式。"
 
-    if not traj.consistency_ok:
+    if traj.consistency_ok is False:  # None=未检查, 仅 False 时报告
         return 1, (
             f"因子表达式与假说不一致。请重新审视假说的核心逻辑，"
             f"确保表达式真正捕捉了假说描述的市场现象。"
