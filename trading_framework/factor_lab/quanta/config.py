@@ -96,7 +96,7 @@ TRACE_ENTRY_TMPL = """### 轮次 {round_idx}
 - IC={ic:.4f}, ICIR={icir:.4f}, RankIC={rank_ic:.4f}
 {backtest_line}
 - 反馈: {feedback_summary}
-- 决策: {"接受 (新 SOTA)" if decision else "拒绝"}"""
+- 决策: {decision_text}"""
 
 # --- 因子被拒后的再生反馈模板 (对齐论文 expression_duplication) ---
 REGEN_FEEDBACK_TMPL = """## 因子被拒原因

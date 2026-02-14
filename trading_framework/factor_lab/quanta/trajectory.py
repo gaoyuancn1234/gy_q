@@ -132,6 +132,7 @@ class DirectionTrace:
             fb_summary = entry.feedback.summary() if entry.feedback else "(无反馈)"
             decision = entry.feedback.decision if entry.feedback else False
 
+            decision_text = "接受 (新 SOTA)" if decision else "拒绝"
             block = TRACE_ENTRY_TMPL.format(
                 round_idx=entry.round_idx,
                 hypothesis=entry.hypothesis[:150],
@@ -142,7 +143,7 @@ class DirectionTrace:
                 rank_ic=entry.rank_ic,
                 backtest_line=bt_line,
                 feedback_summary=fb_summary,
-                decision=decision,
+                decision_text=decision_text,
             )
             blocks.append(block)
 
