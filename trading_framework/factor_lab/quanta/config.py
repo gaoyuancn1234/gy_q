@@ -126,7 +126,8 @@ QLIB_OPERATORS = """可用算子:
 - 截面: Rank(x,N) — 注意需要 window 参数 N
 - 运算: Abs(x), Log(x), Sign(x), Power(x,N), Div(x,y), Greater(x,y), Less(x,y), If(cond,x,y)
 - 统计: Corr(x,y,N), Cov(x,y,N) — 要求 x,y 日期范围一致 (同源字段)
-- 注意: Max/Min 是时序滚动的; 截面比较用 Greater(x,y)/Less(x,y)"""
+- 注意: Max/Min 是时序滚动的; 截面比较用 Greater(x,y)/Less(x,y)
+- 禁止: Mul, Add, Sub 不是 Qlib 算子! 乘法用 Div(a, Div(1, b)), 加法直接用 a + b, 减法用 a - b"""
 
 QLIB_CONSTRAINTS = """约束:
 1. 除零保护: 分母加 1e-8，如 Div(x, y + 1e-8)
