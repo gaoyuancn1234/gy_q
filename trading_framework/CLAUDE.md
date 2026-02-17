@@ -71,7 +71,6 @@ trading_framework/
 │   │   ├── eval_agent.py          # 评估 Agent
 │   │   └── ast_dedup.py           # AST 去重
 │   ├── mining_results/        # 挖掘结果
-│   ├── run_quanta_alpha.py    # QuantaAlpha 论文复现 (Exp 013)
 │   ├── run_rolling_benchmark.py   # rolling训练
 │   └── run_signal_decay_benchmark.py # 信号衰减分析
 ├── qlib_engine/

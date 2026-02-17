@@ -353,12 +353,9 @@ def run_rolling_single(preset: str, model_name: str,
         elapsed = time.time() - t0
 
         # 记录窗口信息
-        best_iter = None
-        if model_name == 'LightGBM':
-            best_iter = getattr(model.model, 'best_iteration', None)
-        elif model_name == 'XGBoost':
-            best_iter = getattr(model.model, 'best_iteration', None)
-        elif model_name == 'CatBoost':
+        # CatBoost uses 'best_iteration_', others use 'best_iteration'
+        best_iter = getattr(model.model, 'best_iteration', None)
+        if best_iter is None:
             best_iter = getattr(model.model, 'best_iteration_', None)
 
         detail = {

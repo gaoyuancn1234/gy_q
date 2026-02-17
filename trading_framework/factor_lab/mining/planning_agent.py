@@ -95,35 +95,21 @@ def plan_directions(context: str, n_directions: int = 5,
                 env=get_claude_env(),
             )
             output = result.stdout.strip()
-            if not output:
+            if output:
+                parsed = _parse_directions(output)
+                if parsed:
+                    return parsed[:n_directions]
+                print(f"  [planning] 解析失败 (attempt {attempt}/{MAX_RETRY})")
+            else:
                 print(f"  [planning] Claude 返回空输出 (attempt {attempt}/{MAX_RETRY})")
-                if attempt < MAX_RETRY:
-                    time.sleep(RETRY_WAIT)
-                    continue
-                return _fallback_directions(n_directions)
-
-            parsed = _parse_directions(output)
-            if parsed:
-                return parsed[:n_directions]
-
-            print(f"  [planning] 解析失败 (attempt {attempt}/{MAX_RETRY})")
-            if attempt < MAX_RETRY:
-                time.sleep(RETRY_WAIT)
-                continue
-            return _fallback_directions(n_directions)
 
         except subprocess.TimeoutExpired:
             print(f"  [planning] Claude CLI 超时 (attempt {attempt}/{MAX_RETRY})")
-            if attempt < MAX_RETRY:
-                time.sleep(RETRY_WAIT)
-                continue
-            return _fallback_directions(n_directions)
         except Exception as e:
             print(f"  [planning] Claude CLI 调用失败: {e} (attempt {attempt}/{MAX_RETRY})")
-            if attempt < MAX_RETRY:
-                time.sleep(RETRY_WAIT)
-                continue
-            return _fallback_directions(n_directions)
+
+        if attempt < MAX_RETRY:
+            time.sleep(RETRY_WAIT)
 
     return _fallback_directions(n_directions)
 

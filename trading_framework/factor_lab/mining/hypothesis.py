@@ -10,6 +10,10 @@ from pathlib import Path
 
 WORK_DIR = Path(__file__).resolve().parent.parent.parent.parent  # repo root
 
+from factor_lab.quanta.config import (
+    CLAUDE_CLI, CLAUDE_TIMEOUT, get_claude_env,
+)
+
 # 多样化种子方向 — cycle 轮转使用
 SEED_CATEGORIES = [
     {
@@ -119,7 +123,7 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
 
     try:
         cmd = [
-            '/usr/local/bin/claude',
+            CLAUDE_CLI,
             '--print',
             '--dangerously-skip-permissions',
             '--output-format', 'text',
@@ -128,52 +132,68 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
         result = subprocess.run(
             cmd,
             capture_output=True, text=True,
-            timeout=300,
+            timeout=CLAUDE_TIMEOUT,
             cwd=str(WORK_DIR),
+            env=get_claude_env(),
         )
         output = result.stdout.strip()
         return _parse_hypotheses(output)
 
     except subprocess.TimeoutExpired:
-        print("  [hypothesis] Claude CLI 超时 (300s)")
+        print(f"  [hypothesis] Claude CLI 超时 ({CLAUDE_TIMEOUT}s)")
         return []
     except Exception as e:
         print(f"  [hypothesis] Claude CLI 调用失败: {e}")
         return []
 
 
+def _parse_json_list(output: str) -> list | None:
+    """从 Claude 输出中提取 JSON 数组 (尝试多种格式)"""
+    for extract in [
+        lambda: json.loads(output),
+        lambda: json.loads(re.search(r'```(?:json)?\s*\n(\[[\s\S]*?\])\s*\n```', output).group(1)),
+        lambda: json.loads(re.search(r'\[[\s\S]*\]', output).group()),
+    ]:
+        try:
+            data = extract()
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            continue
+    return None
+
+
 def _parse_hypotheses(output: str) -> list[dict]:
-    """从 Claude 输出中提取 JSON 数组"""
-    # 尝试直接解析
-    try:
-        data = json.loads(output)
-        if isinstance(data, list):
-            return _validate_hypotheses(data)
-    except json.JSONDecodeError:
-        pass
-
-    # 尝试从 markdown code block 中提取
-    match = re.search(r'```(?:json)?\s*\n(\[[\s\S]*?\])\s*\n```', output)
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            if isinstance(data, list):
-                return _validate_hypotheses(data)
-        except json.JSONDecodeError:
-            pass
-
-    # 尝试提取最大的 JSON 数组
-    match = re.search(r'\[[\s\S]*\]', output)
-    if match:
-        try:
-            data = json.loads(match.group())
-            if isinstance(data, list):
-                return _validate_hypotheses(data)
-        except json.JSONDecodeError:
-            pass
-
+    """从 Claude 输出中提取并验证假说列表"""
+    data = _parse_json_list(output)
+    if data is not None:
+        return _validate_hypotheses(data)
     print(f"  [hypothesis] 无法解析 Claude 输出 (长度={len(output)})")
     return []
+
+
+def _call_claude_for_hypotheses(prompt: str, tag: str) -> list[dict]:
+    """调用 Claude CLI 生成假说 (共享逻辑)"""
+    try:
+        cmd = [
+            CLAUDE_CLI,
+            '--print',
+            '--dangerously-skip-permissions',
+            '--output-format', 'text',
+            '-p', prompt,
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=CLAUDE_TIMEOUT, cwd=str(WORK_DIR),
+            env=get_claude_env(),
+        )
+        return _parse_hypotheses(result.stdout.strip())
+    except subprocess.TimeoutExpired:
+        print(f"  {tag} Claude CLI 超时 ({CLAUDE_TIMEOUT}s)")
+        return []
+    except Exception as e:
+        print(f"  {tag} 调用失败: {e}")
+        return []
 
 
 def _validate_hypotheses(items: list) -> list[dict]:
@@ -275,25 +295,7 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
 ]
 ```"""
 
-    try:
-        cmd = [
-            '/usr/local/bin/claude',
-            '--print',
-            '--dangerously-skip-permissions',
-            '--output-format', 'text',
-            '-p', prompt,
-        ]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=300, cwd=str(WORK_DIR),
-        )
-        return _parse_hypotheses(result.stdout.strip())
-    except subprocess.TimeoutExpired:
-        print("  [mutation] Claude CLI 超时")
-        return []
-    except Exception as e:
-        print(f"  [mutation] 调用失败: {e}")
-        return []
+    return _call_claude_for_hypotheses(prompt, "[mutation]")
 
 
 # ---------------------------------------------------------------------------
@@ -367,22 +369,4 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
 ]
 ```"""
 
-    try:
-        cmd = [
-            '/usr/local/bin/claude',
-            '--print',
-            '--dangerously-skip-permissions',
-            '--output-format', 'text',
-            '-p', prompt,
-        ]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=300, cwd=str(WORK_DIR),
-        )
-        return _parse_hypotheses(result.stdout.strip())
-    except subprocess.TimeoutExpired:
-        print("  [crossover] Claude CLI 超时")
-        return []
-    except Exception as e:
-        print(f"  [crossover] 调用失败: {e}")
-        return []
+    return _call_claude_for_hypotheses(prompt, "[crossover]")

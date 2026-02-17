@@ -105,7 +105,7 @@ FACTOR_PRESETS = {
     "full_selected": {
         "description": "全因子去冗余后最优子集",
         "include_alpha158": True,
-        "extra_factors": lambda: _get_full_selected_exprs(),
+        "extra_factors": _get_full_selected_exprs,
     },
     "alpha158_val_mined": {
         "description": "alpha158_val + 挖掘因子",

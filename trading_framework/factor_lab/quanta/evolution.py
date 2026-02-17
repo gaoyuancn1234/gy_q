@@ -22,22 +22,24 @@ from . import idea_agent, factor_agent, eval_agent
 
 # ============ Mutation (5 步循环) ============
 
+def _get_latest_iteration(trajs: list[Trajectory]) -> list[Trajectory]:
+    """从轨迹列表中取最新 iteration 的子集"""
+    if not trajs:
+        return []
+    max_iter = max(t.iteration for t in trajs)
+    return [t for t in trajs if t.iteration == max_iter]
+
+
 def get_mutation_targets(pool: TrajectoryPool, current_round: int) -> list[Trajectory]:
     """获取当前轮 mutation 目标 (论文: 取前一轮的输出)"""
     if current_round <= 1:
         targets = pool.get_by_phase("init")
     else:
-        crossover_trajs = pool.get_by_phase("crossover")
-        if crossover_trajs:
-            max_iter = max(t.iteration for t in crossover_trajs)
-            targets = [t for t in crossover_trajs if t.iteration == max_iter]
-        else:
-            mutation_trajs = pool.get_by_phase("mutation")
-            if mutation_trajs:
-                max_iter = max(t.iteration for t in mutation_trajs)
-                targets = [t for t in mutation_trajs if t.iteration == max_iter]
-            else:
-                targets = pool.get_by_phase("init")
+        targets = (
+            _get_latest_iteration(pool.get_by_phase("crossover"))
+            or _get_latest_iteration(pool.get_by_phase("mutation"))
+            or pool.get_by_phase("init")
+        )
 
     targets.sort(key=lambda t: t.direction_id)
     return targets
@@ -51,10 +53,7 @@ def mutate_trajectory(parent: Trajectory, iteration: int,
     """Mutation: 5 步循环 (对齐论文 AlphaAgentLoop.run())
 
     Step 1: Propose — generate_mutation_suffix + generate_hypothesis_with_trace
-    Step 2: Construct — construct_factors_with_regen
-    Step 3: Calculate — run_validation_pipeline
-    Step 4: Backtest — run_combined_backtest
-    Step 5: Feedback — generate_llm_feedback + direction_trace.append
+    Step 2-5: construct -> calculate -> backtest -> feedback
     """
     direction_trace = pool.get_direction_trace(parent.direction_id)
 
@@ -87,46 +86,9 @@ def mutate_trajectory(parent: Trajectory, iteration: int,
         pool.add(new_traj)
         return new_traj
 
-    # --- Step 2: Construct (with regen) ---
-    print(f"    [Step 2] Construct (with regen loop)")
-    trace_text = direction_trace.render_for_prompt()
-    factor_list_text = direction_trace.render_factor_list_for_prompt()
-
-    candidates, regen_count = factor_agent.construct_factors_with_regen(
-        hypothesis=new_hyp,
-        n=N_CANDIDATES,
-        trace_text=trace_text,
-        factor_list_text=factor_list_text,
-    )
-    new_traj.claude_calls += 1 + regen_count
-    new_traj.regen_attempts = regen_count
-
-    if not candidates:
-        new_traj.failure_step = 1
-        new_traj.error_msg = f"再生循环 {regen_count} 次后仍无有效候选"
-        _finalize_trace(new_traj, pool, direction_trace, no_backtest)
-        return new_traj
-
-    new_traj.factor_candidates = candidates
-
-    # --- Step 3: Calculate (validate + evaluate) ---
-    print(f"    [Step 3] Calculate (validate + evaluate)")
-    eval_agent.run_validation_pipeline(new_traj, candidates)
-
-    # --- Step 4: Backtest ---
-    if not no_backtest and BACKTEST_ENABLED and new_traj.best_factor and new_traj.failure_step == -1:
-        use_rolling = ROLLING_EVAL_LITE
-        sota_factors = _get_sota_factors(direction_trace, factor_pool=factor_pool)
-        print(f"    [Step 4] Backtest ({'rolling-lite' if use_rolling else 'single-shot'}, "
-              f"sota={len(sota_factors)} factors)")
-        new_factors = [(new_traj.best_factor['name'], new_traj.best_factor['expr'])]
-        bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors, use_rolling=use_rolling)
-        new_traj.backtest_metrics = bt_metrics
-    else:
-        print(f"    [Step 4] Backtest (skipped)")
-
-    # --- Step 5: Feedback ---
-    _finalize_trace(new_traj, pool, direction_trace, no_backtest)
+    # --- Steps 2-5: Construct -> Calculate -> Backtest -> Feedback ---
+    _run_steps_2_to_5(new_traj, new_hyp, pool, direction_trace,
+                      no_backtest=no_backtest, factor_pool=factor_pool)
     return new_traj
 
 
@@ -134,23 +96,15 @@ def mutate_trajectory(parent: Trajectory, iteration: int,
 
 def get_crossover_candidates(pool: TrajectoryPool, current_round: int) -> list[Trajectory]:
     """获取 crossover 候选 (论文: 从最近 2 轮选)"""
-    original_trajs = pool.get_by_phase("init")
-    mutation_trajs = pool.get_by_phase("mutation")
-    crossover_trajs = pool.get_by_phase("crossover")
-
-    latest_mut_iter = max((t.iteration for t in mutation_trajs), default=-1)
-    latest_mut = [t for t in mutation_trajs if t.iteration == latest_mut_iter] if latest_mut_iter >= 0 else []
-
-    latest_cross_iter = max((t.iteration for t in crossover_trajs), default=-1)
-    latest_cross = [t for t in crossover_trajs if t.iteration == latest_cross_iter] if latest_cross_iter >= 0 else []
+    latest_mut = _get_latest_iteration(pool.get_by_phase("mutation"))
+    latest_cross = _get_latest_iteration(pool.get_by_phase("crossover"))
 
     if not latest_cross:
-        candidates = original_trajs + latest_mut
+        candidates = pool.get_by_phase("init") + latest_mut
     else:
         candidates = latest_mut + latest_cross
 
-    candidates = [t for t in candidates if t.failure_step == -1 and t.reward > 0]
-    return candidates
+    return [t for t in candidates if t.failure_step == -1 and t.reward > 0]
 
 
 def select_crossover_groups(candidates: list[Trajectory],
@@ -207,10 +161,7 @@ def crossover_trajectories(parents: list[Trajectory], iteration: int,
     """Crossover: 5 步循环 (对齐论文 AlphaAgentLoop.run())
 
     Step 1: Propose — generate_crossover_suffix + generate_hypothesis_with_trace
-    Step 2: Construct — construct_factors_with_regen
-    Step 3: Calculate — run_validation_pipeline
-    Step 4: Backtest — run_combined_backtest
-    Step 5: Feedback — generate_llm_feedback + direction_trace.append
+    Step 2-5: construct -> calculate -> backtest -> feedback
     """
     # crossover 使用第一个 parent 的 direction_id
     direction_id = parents[0].direction_id if parents else group_idx
@@ -228,7 +179,6 @@ def crossover_trajectories(parents: list[Trajectory], iteration: int,
     suffix = idea_agent.generate_crossover_suffix(parents)
     new_traj.claude_calls += 1
 
-    # 合并 parents 的 direction 描述
     combined_direction = " + ".join(set(p.direction for p in parents if p.direction))
 
     new_hyp = idea_agent.generate_hypothesis_with_trace(
@@ -255,50 +205,65 @@ def crossover_trajectories(parents: list[Trajectory], iteration: int,
         pool.add(new_traj)
         return new_traj
 
+    # --- Steps 2-5: Construct -> Calculate -> Backtest -> Feedback ---
+    _run_steps_2_to_5(new_traj, new_hyp, pool, direction_trace,
+                      no_backtest=no_backtest, factor_pool=factor_pool)
+    return new_traj
+
+
+# ============ 内部辅助 ============
+
+def _run_steps_2_to_5(traj: Trajectory, hypothesis: dict,
+                      pool: TrajectoryPool,
+                      direction_trace: DirectionTrace,
+                      no_backtest: bool = False,
+                      factor_pool=None):
+    """Steps 2-5: Construct -> Calculate -> Backtest -> Feedback
+
+    共享逻辑, 供 mutate_trajectory 和 crossover_trajectories 调用。
+    """
     # --- Step 2: Construct (with regen) ---
     print(f"    [Step 2] Construct (with regen loop)")
     trace_text = direction_trace.render_for_prompt()
     factor_list_text = direction_trace.render_factor_list_for_prompt()
 
     candidates, regen_count = factor_agent.construct_factors_with_regen(
-        hypothesis=new_hyp,
+        hypothesis=hypothesis,
         n=N_CANDIDATES,
         trace_text=trace_text,
         factor_list_text=factor_list_text,
     )
-    new_traj.claude_calls += 1 + regen_count
-    new_traj.regen_attempts = regen_count
+    traj.claude_calls += 1 + regen_count
+    traj.regen_attempts = regen_count
 
     if not candidates:
-        new_traj.failure_step = 1
-        new_traj.error_msg = f"再生循环 {regen_count} 次后仍无有效候选"
-        _finalize_trace(new_traj, pool, direction_trace, no_backtest)
-        return new_traj
+        traj.failure_step = 1
+        traj.error_msg = f"再生循环 {regen_count} 次后仍无有效候选"
+        _finalize_trace(traj, pool, direction_trace, no_backtest)
+        return
 
-    new_traj.factor_candidates = candidates
+    traj.factor_candidates = candidates
 
-    # --- Step 3: Calculate ---
+    # --- Step 3: Calculate (validate + evaluate) ---
     print(f"    [Step 3] Calculate (validate + evaluate)")
-    eval_agent.run_validation_pipeline(new_traj, candidates)
+    eval_agent.run_validation_pipeline(traj, candidates)
 
     # --- Step 4: Backtest ---
-    if not no_backtest and BACKTEST_ENABLED and new_traj.best_factor and new_traj.failure_step == -1:
+    if not no_backtest and BACKTEST_ENABLED and traj.best_factor and traj.failure_step == -1:
         use_rolling = ROLLING_EVAL_LITE
         sota_factors = _get_sota_factors(direction_trace, factor_pool=factor_pool)
         print(f"    [Step 4] Backtest ({'rolling-lite' if use_rolling else 'single-shot'}, "
               f"sota={len(sota_factors)} factors)")
-        new_factors = [(new_traj.best_factor['name'], new_traj.best_factor['expr'])]
-        bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors, use_rolling=use_rolling)
-        new_traj.backtest_metrics = bt_metrics
+        new_factors = [(traj.best_factor['name'], traj.best_factor['expr'])]
+        bt_metrics = eval_agent.run_combined_backtest(
+            new_factors, sota_factors, use_rolling=use_rolling)
+        traj.backtest_metrics = bt_metrics
     else:
         print(f"    [Step 4] Backtest (skipped)")
 
     # --- Step 5: Feedback ---
-    _finalize_trace(new_traj, pool, direction_trace, no_backtest)
-    return new_traj
+    _finalize_trace(traj, pool, direction_trace, no_backtest)
 
-
-# ============ 内部辅助 ============
 
 def _finalize_trace(traj: Trajectory, pool: TrajectoryPool,
                     direction_trace: DirectionTrace,

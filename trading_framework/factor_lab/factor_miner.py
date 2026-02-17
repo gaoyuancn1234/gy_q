@@ -130,6 +130,23 @@ def _push_feishu(message: str):
         print(f"  消息内容:\n{message}")
 
 
+def _save_discoveries(promising_factors: list[dict], run_id: str):
+    """保存非冗余 promising 因子到 discoveries 目录"""
+    for pf in promising_factors:
+        if not pf.get("is_redundant"):
+            disc_file = DISCOVERIES_DIR / f"{run_id}_{pf['name']}.json"
+            disc_file.write_text(
+                json.dumps(pf, ensure_ascii=False, indent=2, default=_json_default),
+                encoding="utf-8",
+            )
+
+
+def _check_beat_baseline(backtest) -> bool:
+    """检查回测是否超越 baseline"""
+    return (backtest and isinstance(backtest, dict)
+            and backtest.get("improvement", {}).get("is_better", False))
+
+
 def _build_discovery_message(run_result: dict, backtest: dict) -> str:
     """构建飞书通知消息"""
     run_id = run_result.get("run_id", "?")
@@ -387,18 +404,14 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
     run_file.write_text(json.dumps(run_result, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
     print(f"\n  审计记录: {run_file}")
 
-    # 保存 discovery
-    for pf in promising_factors:
-        if not pf.get("is_redundant"):
-            disc_file = DISCOVERIES_DIR / f"{run_id}_{pf['name']}.json"
-            disc_file.write_text(json.dumps(pf, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+    _save_discoveries(promising_factors, run_id)
 
     # 5. 更新 context
     ctx.update_after_run(run_result)
     print(f"  Agent 记忆已更新")
 
     # 6. 通知
-    beat_baseline = backtest and isinstance(backtest, dict) and backtest.get("improvement", {}).get("is_better")
+    beat_baseline = _check_beat_baseline(backtest)
     run_result["beat_baseline"] = beat_baseline
 
     if beat_baseline and not dry_run:
@@ -824,22 +837,14 @@ def run_evolved_mining(dry_run: bool = False, smoke_test: bool = False):
     )
     print(f"\n  审计记录: {run_file}")
 
-    # 保存 discovery
-    for pf in promising_factors:
-        if not pf.get("is_redundant"):
-            disc_file = DISCOVERIES_DIR / f"{run_id}_{pf['name']}.json"
-            disc_file.write_text(
-                json.dumps(pf, ensure_ascii=False, indent=2, default=_json_default),
-                encoding="utf-8",
-            )
+    _save_discoveries(promising_factors, run_id)
 
     # 更新 context
     ctx.update_after_run(run_result)
     print(f"  Agent 记忆已更新")
 
     # 8. 通知
-    beat_baseline = (backtest and isinstance(backtest, dict)
-                     and backtest.get("improvement", {}).get("is_better"))
+    beat_baseline = _check_beat_baseline(backtest)
     run_result["beat_baseline"] = beat_baseline
 
     if beat_baseline and not dry_run:
@@ -944,7 +949,8 @@ def _run_original_5step(direction: dict, d_idx: int,
     if not candidates:
         traj.failure_step = 1
         traj.error_msg = f"再生循环 {regen_count} 次后仍无有效候选"
-        _finalize_original_trace(traj, pool, direction_trace)
+        from factor_lab.quanta.evolution import _finalize_trace
+        _finalize_trace(traj, pool, direction_trace)
         return traj
 
     traj.factor_candidates = candidates
@@ -967,14 +973,9 @@ def _run_original_5step(direction: dict, d_idx: int,
         print(f"    [Step 4] Backtest (skipped)")
 
     # --- Step 5: Feedback ---
-    _finalize_original_trace(traj, pool, direction_trace)
-    return traj
-
-
-def _finalize_original_trace(traj, pool, direction_trace):
-    """Step 5 for original: Feedback + compute_reward + add to pool"""
     from factor_lab.quanta.evolution import _finalize_trace
     _finalize_trace(traj, pool, direction_trace)
+    return traj
 
 
 def _build_evolved_message(run_result: dict, backtest: dict, stats: dict) -> str:
@@ -1115,6 +1116,34 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
 
     factors_admitted_this_session = 0
 
+    def _admit_and_save(traj, dir_id: str, iteration: int):
+        """尝试入池 + 记录结果 + 保存状态 (Phase B/C 共享逻辑)"""
+        nonlocal factors_admitted_this_session
+        admitted = False
+        if traj and traj.best_factor and traj.failure_step == -1:
+            ok, reason = global_pool.try_admit(
+                name=traj.best_factor['name'],
+                expr=traj.best_factor['expr'],
+                rank_ic=traj.rank_ic,
+                icir=traj.icir,
+                hypothesis=traj.hypothesis,
+                direction=traj.direction,
+                source_traj_id=traj.id,
+                iteration=iteration,
+            )
+            admitted = ok
+            print(f"    因子池: {'ADMITTED' if ok else 'REJECTED'} — {reason}")
+
+        registry.record_result(dir_id, admitted=admitted,
+                               icir=traj.icir if traj else 0.0,
+                               session_id=run_id)
+        if admitted:
+            factors_admitted_this_session += 1
+
+        pool.save()
+        global_pool.save(GLOBAL_POOL_FILE)
+        registry.save()
+
     # --- Phase B: 广度 — 探索 pending 方向 ---
     print(f"\n  === Phase B: 广度探索 ===")
     breadth_deadline = time.time() + breadth_time
@@ -1139,37 +1168,10 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             "time_scale": d_entry.get("time_scale", ""),
         }
 
-        # 用 direction_id = dir_NNN 的数字部分
         d_idx = int(dir_id.split("_")[1])
         traj = _run_original_5step(direction, d_idx, pool, dry_run,
                                    factor_pool=global_pool)
-
-        # 尝试入池
-        admitted = False
-        if traj and traj.best_factor and traj.failure_step == -1:
-            ok, reason = global_pool.try_admit(
-                name=traj.best_factor['name'],
-                expr=traj.best_factor['expr'],
-                rank_ic=traj.rank_ic,
-                icir=traj.icir,
-                hypothesis=traj.hypothesis,
-                direction=traj.direction,
-                source_traj_id=traj.id,
-                iteration=0,
-            )
-            admitted = ok
-            print(f"    因子池: {'ADMITTED' if ok else 'REJECTED'} — {reason}")
-
-        registry.record_result(dir_id, admitted=admitted,
-                               icir=traj.icir if traj else 0.0,
-                               session_id=run_id)
-        if admitted:
-            factors_admitted_this_session += 1
-
-        # 每条轨迹后保存
-        pool.save()
-        global_pool.save(GLOBAL_POOL_FILE)
-        registry.save()
+        _admit_and_save(traj, dir_id, iteration=0)
 
     # --- Phase C: 深度 — mutation ---
     print(f"\n  === Phase C: 深度挖掘 ===")
@@ -1190,12 +1192,10 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         print(f"\n  --- [Mutation] {dir_id}: {d_entry['direction']} "
               f"(ICIR={d_entry['best_icir']:.3f}) ---")
 
-        # 找到该方向在 pool 中的最佳轨迹作为 parent
         d_idx = int(dir_id.split("_")[1])
         direction_trajs = [t for t in pool.get_successful()
                            if t.direction_id == d_idx]
         if not direction_trajs:
-            # 没有本 session 的轨迹，跳过
             print(f"    无可用 parent, 跳过")
             continue
 
@@ -1204,31 +1204,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
 
         traj = mutate_trajectory(parent, 1, pool, dry_run=dry_run,
                                  factor_pool=global_pool)
-
-        admitted = False
-        if traj and traj.best_factor and traj.failure_step == -1:
-            ok, reason = global_pool.try_admit(
-                name=traj.best_factor['name'],
-                expr=traj.best_factor['expr'],
-                rank_ic=traj.rank_ic,
-                icir=traj.icir,
-                hypothesis=traj.hypothesis,
-                direction=traj.direction,
-                source_traj_id=traj.id,
-                iteration=1,
-            )
-            admitted = ok
-            print(f"    因子池: {'ADMITTED' if ok else 'REJECTED'} — {reason}")
-
-        registry.record_result(dir_id, admitted=admitted,
-                               icir=traj.icir if traj else 0.0,
-                               session_id=run_id)
-        if admitted:
-            factors_admitted_this_session += 1
-
-        pool.save()
-        global_pool.save(GLOBAL_POOL_FILE)
-        registry.save()
+        _admit_and_save(traj, dir_id, iteration=1)
 
     # --- Phase D: 质量筛选 → 全量回测 → mined.py ---
     print(f"\n  === Phase D: 最终评估 ===")
@@ -1289,8 +1265,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     ctx.update_after_run(run_result)
 
     # 通知 + mined.py + shadow
-    beat_baseline = (backtest and isinstance(backtest, dict)
-                     and backtest.get("improvement", {}).get("is_better"))
+    beat_baseline = _check_beat_baseline(backtest)
     run_result["beat_baseline"] = beat_baseline
 
     if beat_baseline and not dry_run:

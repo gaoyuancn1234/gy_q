@@ -730,17 +730,7 @@ class ShadowManager:
             max_dd = min(max_dd, dd)
 
         cum_return = cum - 1.0
-        n = len(daily_returns)
-
-        # Sharpe
-        if n >= 2:
-            mean_r = sum(daily_returns) / n
-            var_r = sum((r - mean_r) ** 2 for r in daily_returns) / (n - 1)
-            std_r = math.sqrt(var_r) if var_r > 0 else 1e-9
-            sharpe = (mean_r / std_r) * math.sqrt(252)
-        else:
-            sharpe = 0.0
-
+        sharpe = _compute_daily_sharpe(daily_returns)
         avg_overlap = sum(overlaps) / len(overlaps) if overlaps else 0
 
         summaries[shadow_id] = {
@@ -771,21 +761,22 @@ class ShadowManager:
         cum = 1.0
         for r in daily_returns:
             cum *= (1 + r)
-        cum_return = cum - 1.0
-        n = len(daily_returns)
-
-        if n >= 2:
-            mean_r = sum(daily_returns) / n
-            var_r = sum((r - mean_r) ** 2 for r in daily_returns) / (n - 1)
-            std_r = math.sqrt(var_r) if var_r > 0 else 1e-9
-            sharpe = (mean_r / std_r) * math.sqrt(252)
-        else:
-            sharpe = 0.0
 
         return {
-            "cumulative_return": round(cum_return, 6),
-            "sharpe": round(sharpe, 3),
+            "cumulative_return": round(cum - 1.0, 6),
+            "sharpe": round(_compute_daily_sharpe(daily_returns), 3),
         }
+
+
+def _compute_daily_sharpe(daily_returns: list[float]) -> float:
+    """从日收益序列计算年化 Sharpe (共享逻辑)"""
+    n = len(daily_returns)
+    if n < 2:
+        return 0.0
+    mean_r = sum(daily_returns) / n
+    var_r = sum((r - mean_r) ** 2 for r in daily_returns) / (n - 1)
+    std_r = math.sqrt(var_r) if var_r > 0 else 1e-9
+    return (mean_r / std_r) * math.sqrt(252)
 
 
 PREV_PRICES_FILE = SHADOW_DIR / "prev_prices.json"

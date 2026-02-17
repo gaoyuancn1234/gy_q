@@ -24,6 +24,25 @@ from .config import (
 from .trajectory import Trajectory, HypothesisFeedback, TraceEntry, DirectionTrace
 
 
+def _zero_metrics(**extra) -> dict:
+    """构建零值指标结果 (用于评估失败或无数据时)"""
+    result = {'ic': 0.0, 'icir': 0.0, 'rank_ic': 0.0, 'rank_icir': 0.0}
+    result.update(extra)
+    return result
+
+
+def _extract_metrics(row) -> dict:
+    """从 evaluate_candidates 的结果行中提取指标"""
+    return {
+        'ic': float(row.get('mean_IC', 0)),
+        'icir': float(row.get('ICIR', 0)),
+        'rank_ic': float(row.get('mean_IC', 0)),  # evaluate_candidates 返回的是 rank IC
+        'rank_icir': float(row.get('ICIR', 0)),
+        'is_promising': bool(row.get('is_promising', False)),
+        'is_excellent': bool(row.get('is_excellent', False)),
+    }
+
+
 def evaluate_factor(name: str, expr: str,
                     start_time: str = VALID_START,
                     end_time: str = VALID_END) -> dict:
@@ -32,7 +51,7 @@ def evaluate_factor(name: str, expr: str,
     使用 Valid 期 (2021) 评估, 与论文一致。
 
     Returns:
-        {ic, icir, rank_ic, rank_icir, nan_ratio, eval_time}
+        {ic, icir, rank_ic, rank_icir, eval_time, ...}
     """
     from factor_lab.mining.evaluator import evaluate_candidates
 
@@ -46,26 +65,13 @@ def evaluate_factor(name: str, expr: str,
         elapsed = time.time() - t0
 
         if df.empty:
-            return {
-                'ic': 0.0, 'icir': 0.0, 'rank_ic': 0.0, 'rank_icir': 0.0,
-                'nan_ratio': 1.0, 'eval_time': elapsed, 'error': 'empty result',
-            }
+            return _zero_metrics(nan_ratio=1.0, eval_time=elapsed, error='empty result')
 
-        row = df.iloc[0]
-        return {
-            'ic': float(row.get('mean_IC', 0)),
-            'icir': float(row.get('ICIR', 0)),
-            'rank_ic': float(row.get('mean_IC', 0)),  # evaluate_candidates 返回的是 rank IC
-            'rank_icir': float(row.get('ICIR', 0)),
-            'is_promising': bool(row.get('is_promising', False)),
-            'is_excellent': bool(row.get('is_excellent', False)),
-            'eval_time': elapsed,
-        }
+        result = _extract_metrics(df.iloc[0])
+        result['eval_time'] = elapsed
+        return result
     except Exception as e:
-        return {
-            'ic': 0.0, 'icir': 0.0, 'rank_ic': 0.0, 'rank_icir': 0.0,
-            'eval_time': time.time() - t0, 'error': str(e),
-        }
+        return _zero_metrics(eval_time=time.time() - t0, error=str(e))
 
 
 def evaluate_candidates_batch(factors: list[tuple[str, str]],
@@ -78,48 +84,30 @@ def evaluate_candidates_batch(factors: list[tuple[str, str]],
     try:
         df = evaluate_candidates(factors, start_time=start_time, end_time=end_time)
         elapsed = time.time() - t0
+        per_factor_time = elapsed / len(factors)
 
         results = []
         for name, expr in factors:
             row = df[df['factor'] == name]
             if row.empty:
-                results.append({
-                    'name': name, 'expr': expr,
-                    'ic': 0.0, 'icir': 0.0, 'rank_ic': 0.0, 'rank_icir': 0.0,
-                    'eval_time': elapsed / len(factors),
-                })
+                entry = _zero_metrics(name=name, expr=expr, eval_time=per_factor_time)
             else:
-                r = row.iloc[0]
-                results.append({
-                    'name': name, 'expr': expr,
-                    'ic': float(r.get('mean_IC', 0)),
-                    'icir': float(r.get('ICIR', 0)),
-                    'rank_ic': float(r.get('mean_IC', 0)),
-                    'rank_icir': float(r.get('ICIR', 0)),
-                    'is_promising': bool(r.get('is_promising', False)),
-                    'is_excellent': bool(r.get('is_excellent', False)),
-                    'eval_time': elapsed / len(factors),
-                })
+                entry = _extract_metrics(row.iloc[0])
+                entry.update(name=name, expr=expr, eval_time=per_factor_time)
+            results.append(entry)
         return results
     except Exception as e:
         print(f"  [eval_agent] 批量评估失败: {e}")
-        return [{
-            'name': n, 'expr': e_,
-            'ic': 0.0, 'icir': 0.0, 'rank_ic': 0.0, 'rank_icir': 0.0,
-            'error': str(e),
-        } for n, e_ in factors]
+        return [_zero_metrics(name=n, expr=e_, error=str(e)) for n, e_ in factors]
 
 
 def select_best_candidate(candidates: list[dict]) -> Optional[dict]:
-    """从评估结果中选出最佳因子
-
-    优先选 |ICIR| 最大的
-    """
+    """从评估结果中选出 |ICIR| 最大的因子"""
     if not candidates:
         return None
     valid = [c for c in candidates if abs(c.get('icir', 0)) > 0]
     if not valid:
-        return candidates[0] if candidates else None
+        return candidates[0]
     return max(valid, key=lambda c: abs(c.get('icir', 0)))
 
 
@@ -187,7 +175,7 @@ def diagnose_failure(traj: Trajectory) -> tuple[int, str]:
 
 
 def run_validation_pipeline(traj: Trajectory, candidates: list[dict]):
-    """验证候选因子 + 选最佳 + 评估 (共享逻辑, 供 evolution.py 和 run_quanta_alpha.py 调用)"""
+    """验证候选因子 + 选最佳 + 评估 (共享逻辑, 供 evolution.py 和 factor_miner.py 调用)"""
     from factor_lab.mining.validator import validate_expression, validate_with_qlib
     from . import factor_agent
 
@@ -336,8 +324,7 @@ def generate_llm_feedback(traj: Trajectory, sota_entry: Optional[TraceEntry],
         print(f"  [eval_agent] LLM 反馈调用失败: {e}, fallback 到规则反馈")
 
     # Fallback: 规则反馈
-    is_first = sota_entry is None
-    if is_first:
+    if sota_entry is None:
         return HypothesisFeedback(
             observations=f"第一轮, IC={traj.ic:.4f}, ICIR={traj.icir:.4f}",
             hypothesis_evaluation="作为首轮结果自动接受为 SOTA",
@@ -347,10 +334,10 @@ def generate_llm_feedback(traj: Trajectory, sota_entry: Optional[TraceEntry],
         )
 
     # 与 SOTA 比较
-    is_better = abs(traj.icir) > abs(sota_entry.icir) if sota_entry else True
+    is_better = abs(traj.icir) > abs(sota_entry.icir)
     failure_step, feedback_text = diagnose_failure(traj)
     return HypothesisFeedback(
-        observations=f"ICIR={traj.icir:.4f} vs SOTA={sota_entry.icir:.4f if sota_entry else 0:.4f}",
+        observations=f"ICIR={traj.icir:.4f} vs SOTA={sota_entry.icir:.4f}",
         hypothesis_evaluation=feedback_text if failure_step >= 0 else "因子有效",
         new_hypothesis="继续探索正交方向" if is_better else "需要改进信号强度",
         reasoning=f"{'优于' if is_better else '不及'} SOTA",
