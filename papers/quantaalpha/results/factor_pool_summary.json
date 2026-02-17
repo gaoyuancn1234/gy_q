@@ -1,0 +1,139 @@
+{
+  "factors": [
+    {
+      "name": "QA_MOMENTUM_60D_REVERT",
+      "expr": "Mul(Div(Ref($close, 1) - Ref($close, 60), Ref($close, 60) + 1e-8), -1)",
+      "rank_ic": 0.05260919869373937,
+      "icir": 0.949128454822618,
+      "direction": "价格结构",
+      "iteration": 0
+    },
+    {
+      "name": "QA_VOLREG_MOMENTUM_FLIP",
+      "expr": "Mul(Sub(1, Div(Std($close, 10), Std($close, 60) + 1e-8)), Mul(Div(Ref($close, 1) - Ref($close, 60), Ref($close, 60) + 1e-8), -1))",
+      "rank_ic": 0.04586486050860988,
+      "icir": 0.830204443701378,
+      "direction": "动量反转 × 波动率regime",
+      "iteration": 2
+    },
+    {
+      "name": "QA_VOL_CV_REVERT",
+      "expr": "Mul(Div(Std($volume, 20), Mean($volume, 20) + 1e-8), Div(Ref($close, 5) - $close, Std($close, 20) + 1e-8))",
+      "rank_ic": 0.03859754684208096,
+      "icir": 0.6674699124632238,
+      "direction": "量能模式",
+      "iteration": 0
+    },
+    {
+      "name": "QA_TURN_TREND_RATIO",
+      "expr": "Div(Mean($turn, 40), Mean($turn, 60) + 1e-8)",
+      "rank_ic": -0.03335363309619644,
+      "icir": -0.5771865869369769,
+      "direction": "量能模式",
+      "iteration": 0
+    },
+    {
+      "name": "QA_AVG_TRADE_PRICE_RATIO",
+      "expr": "Div(Mean(Div($amount, $volume + 1e-8), 5), Mean(Div($amount, $volume + 1e-8), 20) + 1e-8)",
+      "rank_ic": -0.03205862609323348,
+      "icir": -0.5888363813421813,
+      "direction": "量价结构",
+      "iteration": 1
+    },
+    {
+      "name": "QA_VOL_REGIME_RATIO",
+      "expr": "Div(Mean(Sub($high, $low), 10), Mean(Sub($high, $low), 60) + 1e-8)",
+      "rank_ic": -0.02786445729051186,
+      "icir": -0.5324471977555885,
+      "direction": "波动率",
+      "iteration": 0
+    },
+    {
+      "name": "QA_VOL_SQUEEZE_MOMENTUM",
+      "expr": "Mul(Div(Min(Div($high - $low, $close + 1e-8), 5), Max(Div($high - $low, $close + 1e-8), 20) + 1e-8), Sign($close - Mean($close, 20)))",
+      "rank_ic": -0.02599319682493789,
+      "icir": -0.4518918358486681,
+      "direction": "volatility_regime_compression",
+      "iteration": 3
+    },
+    {
+      "name": "QA_VWAP_SUMDEV_NORM",
+      "expr": "Div(Sum(Sub($close, Div($amount, Add($volume, 1e-8))), 40), Sum(Abs($close), 40) + 1e-8)",
+      "rank_ic": -0.020445526458706897,
+      "icir": -0.3463101307003938,
+      "direction": "VWAP偏离",
+      "iteration": 0
+    },
+    {
+      "name": "QA_DOWNVOL_RATIO_20",
+      "expr": "Div(Std(If(Less($close - Ref($close, 1), 0), $close - Ref($close, 1), 0), 20), Std($close - Ref($close, 1), 20) + 1e-8)",
+      "rank_ic": 0.020144634533338382,
+      "icir": 0.36400795881719306,
+      "direction": "波动非对称性",
+      "iteration": 1
+    },
+    {
+      "name": "QA_VOL_PEAK_RATIO",
+      "expr": "Div(Max($volume, 20), Mean($volume, 20) + 1e-8)",
+      "rank_ic": 0.015979084113076355,
+      "icir": 0.2685180468693017,
+      "direction": "量价微观结构",
+      "iteration": 1
+    },
+    {
+      "name": "QA_VOL_CONCENTRATION_RATIO",
+      "expr": "Mul(Div(Std($volume, 20), Div(Sum($volume, 20), 20) + 1e-8), Div(Max($volume, 20), Mean($volume, 20) + 1e-8))",
+      "rank_ic": 0.014642348458939882,
+      "icir": 0.23785403044080616,
+      "direction": "微观结构",
+      "iteration": 1
+    },
+    {
+      "name": "QA_LIQUIDITY_DISPLACEMENT_ELASTIC",
+      "expr": "Mul(Div(Abs(Sub(Ref($close, 1), Ref($close, 5))), Div(Mean($amount, 5), Mean($amount, 20) + 1e-8) + 1e-8), -1)",
+      "rank_ic": 0.014376707324115959,
+      "icir": 0.20420328021106496,
+      "direction": "流动性微观结构",
+      "iteration": 3
+    },
+    {
+      "name": "QA_AMPCOMP_VWAPDEV_VOLCV",
+      "expr": "Mul(Div(Mean(Div(Sub($high,$low),$close+1e-8),40),Mean(Div(Sub($high,$low),$close+1e-8),5)+1e-8),Mul(Mean(Sub(Div($amount,$volume+1e-8),$close),20),Div(Std($volume,20),Mean($volume,20)+1e-8)))",
+      "rank_ic": -0.01333091459345768,
+      "icir": -0.24074039542757383,
+      "direction": "mean_reversion",
+      "iteration": 4
+    },
+    {
+      "name": "QA_DUAL_SILENCE_RATIO",
+      "expr": "Div(Div(Mean(Div(Sub($high, $low), $close + 1e-8), 5), Mean(Div(Sub($high, $low), $close + 1e-8), 40) + 1e-8), Div(Mean($amount, 5), Mean($amount, 20) + 1e-8) + 1e-8)",
+      "rank_ic": 0.00907107453013064,
+      "icir": 0.15671686608589494,
+      "direction": "liquidity_volatility_interaction",
+      "iteration": 4
+    }
+  ],
+  "stats": {
+    "size": 14,
+    "capacity": 14,
+    "total_attempted": 29,
+    "avg_rank_ic": 0.026023700668648262,
+    "max_rank_ic": 0.05260919869373937,
+    "min_rank_ic": 0.00907107453013064,
+    "by_direction": {
+      "价格结构": 1,
+      "动量反转 × 波动率regime": 1,
+      "量能模式": 2,
+      "量价结构": 1,
+      "波动率": 1,
+      "volatility_regime_compression": 1,
+      "VWAP偏离": 1,
+      "波动非对称性": 1,
+      "量价微观结构": 1,
+      "微观结构": 1,
+      "流动性微观结构": 1,
+      "mean_reversion": 1,
+      "liquidity_volatility_interaction": 1
+    }
+  }
+}

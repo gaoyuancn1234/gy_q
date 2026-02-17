@@ -16,6 +16,7 @@ VALID_OPS = {
     "Ref", "Mean", "Std", "Sum", "Delta", "Min", "Max", "Slope", "Rsquare",
     "Rank", "Abs", "Log", "Sign", "Power", "Div", "Greater", "Less", "If",
     "Corr", "Cov", "IdxMin", "IdxMax", "Quantile", "Mad", "Kurt", "Skew",
+    "Mul", "Add", "Sub",
 }
 
 
@@ -65,6 +66,46 @@ def validate_expression(name: str, expr: str) -> tuple[bool, str]:
     unknown = ops_used - VALID_OPS
     if unknown:
         return False, f"未知算子: {unknown}"
+
+    # 复杂度约束
+    ok, reason = check_complexity(expr)
+    if not ok:
+        return False, reason
+
+    return True, ""
+
+
+def check_complexity(expr: str) -> tuple[bool, str]:
+    """检查表达式复杂度，防止过拟合
+
+    规则:
+    - 表达式长度 ≤ 200 字符
+    - 括号嵌套深度 ≤ 5 层
+    - 基础字段 ($xxx) ≤ 6 种
+
+    Returns:
+        (is_ok, reason) — 不通过时 reason 供 mutation 参考
+    """
+    # 长度
+    if len(expr) > 200:
+        return False, f"表达式过长 ({len(expr)} > 200 字符)，请简化"
+
+    # 嵌套深度
+    max_depth = 0
+    depth = 0
+    for ch in expr:
+        if ch == '(':
+            depth += 1
+            max_depth = max(max_depth, depth)
+        elif ch == ')':
+            depth -= 1
+    if max_depth > 5:
+        return False, f"嵌套过深 ({max_depth} > 5 层)，请减少嵌套"
+
+    # 基础字段数
+    fields = set(re.findall(r'\$[a-z_]+', expr))
+    if len(fields) > 6:
+        return False, f"字段过多 ({len(fields)} > 6 种: {fields})，请精简"
 
     return True, ""
 

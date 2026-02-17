@@ -77,7 +77,7 @@ def collect_today_data() -> dict:
                     data["errors"].append(f"读取 {user_dir.name} 对话失败: {e}")
 
     # 2. 收集 smart_bot.log 中今天的内容
-    bot_log = BOT_DIR / "smart_bot.log"
+    bot_log = BOT_DIR / "logs" / "smart_bot.log"
     if bot_log.exists():
         try:
             today_prefix = today.replace("-", "-")  # 2026-02-11
@@ -138,7 +138,7 @@ def collect_today_data() -> dict:
             data["errors"].append(f"读取 macro analysis 失败: {e}")
 
     # 6. 收集 daemon 日志
-    daemon_log = BOT_DIR / "daemon.log"
+    daemon_log = BOT_DIR / "logs" / "daemon.log"
     if daemon_log.exists():
         try:
             with open(daemon_log, 'r', encoding='utf-8', errors='ignore') as f:

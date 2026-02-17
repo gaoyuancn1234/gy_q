@@ -16,7 +16,9 @@ from datetime import datetime
 
 WORK_DIR = Path(__file__).parent
 BOT_SCRIPT = WORK_DIR / "smart_bot.py"
-LOG_FILE = WORK_DIR / "daemon.log"
+LOG_DIR = WORK_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "daemon.log"
 PID_FILE = WORK_DIR / "daemon.pid"
 CHECK_INTERVAL = 10  # 检查间隔（秒）
 MAX_RESTARTS = 10    # 最大连续重启次数
@@ -42,7 +44,7 @@ class Daemon:
         self.bot_process = subprocess.Popen(
             [sys.executable, str(BOT_SCRIPT)],
             cwd=str(WORK_DIR),
-            stdout=open(WORK_DIR / "smart_bot.log", 'a'),
+            stdout=open(WORK_DIR / "logs" / "smart_bot.log", 'a'),
             stderr=subprocess.STDOUT
         )
         self.log(f"机器人已启动，PID: {self.bot_process.pid}")

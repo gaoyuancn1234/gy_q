@@ -152,11 +152,12 @@ class ShadowManager:
             rolling_config, rc, test_start, test_end)
 
         import qlib
+        from qlib.config import C as _qlib_C
         from qlib.data.dataset import DatasetH
-        try:
+        # 避免重复 init — backtest_daily 后 QlibRecorder 已激活,
+        # 再次 init 会导致 C.reset() 清除 _registered 然后 register() 异常
+        if not _qlib_C.__dict__.get('_config', {}).get('_registered', False):
             qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region='cn')
-        except Exception:
-            pass
 
         preds = []
         window_details = []

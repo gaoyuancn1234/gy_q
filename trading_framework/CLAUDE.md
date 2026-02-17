@@ -49,17 +49,29 @@ trading_framework/
 │   ├── registry.json          # 实验注册表
 │   ├── news_cache/            # 新闻缓存 ({date}_macro.json 等)
 │   └── daily_log/             # 每日对比 + 汇总
+├── self_reflect.py        # 每日自我反思 (23:30, Claude驱动)
 ├── factor_lab/            # 因子实验室
-│   ├── factor_miner.py        # 自动因子挖掘 (每周日20:00)
+│   ├── factor_miner.py        # 自动因子挖掘 (每日22:00, --daily模式)
+│   ├── utils.py               # 共享工具 (atomic_json_dump, json_default)
 │   ├── signal_generator.py    # ML信号生成器
 │   ├── paper_trader.py        # 模拟盘引擎
 │   ├── mining/                # 因子挖掘模块
-│   │   ├── context.py         # Agent 记忆管理
-│   │   ├── hypothesis.py      # Claude 因子假说生成
-│   │   ├── validator.py       # 表达式验证
-│   │   ├── evaluator.py       # IC/ICIR 评估
-│   │   └── backtest_runner.py # Rolling 回测对比
+│   │   ├── context.py             # Agent 记忆管理
+│   │   ├── hypothesis.py          # Claude 因子假说生成
+│   │   ├── validator.py           # 表达式验证
+│   │   ├── evaluator.py           # IC/ICIR 评估
+│   │   ├── backtest_runner.py     # Rolling 回测对比
+│   │   ├── direction_registry.py  # 搜索方向注册表 (跨天累积)
+│   │   └── planning_agent.py      # Claude 方向规划
+│   ├── quanta/                # QuantaAlpha 演化式挖掘
+│   │   ├── config.py              # 挖掘超参数
+│   │   ├── trajectory.py          # 轨迹数据结构 + Trace
+│   │   ├── factor_pool.py         # 因子池准入控制
+│   │   ├── evolution.py           # Mutation/Crossover 演化
+│   │   ├── eval_agent.py          # 评估 Agent
+│   │   └── ast_dedup.py           # AST 去重
 │   ├── mining_results/        # 挖掘结果
+│   ├── run_quanta_alpha.py    # QuantaAlpha 论文复现 (Exp 013)
 │   ├── run_rolling_benchmark.py   # rolling训练
 │   └── run_signal_decay_benchmark.py # 信号衰减分析
 ├── qlib_engine/
@@ -87,10 +99,15 @@ intraday_monitor.py → Sina实时行情 → 止损/异动/待执行订单 → �
 - 日内急跌: -5%
 - 15:00 收盘总结
 
-### 每周日 20:00 因子挖掘 (launchd)
+### 每日 22:00 因子挖掘 (launchd, --daily 模式)
 ```
-factor_miner.py → Claude生成假说 → 验证 → IC评估 → 冗余检测 → 回测 → 飞书通知
+factor_miner.py --daily
+  → Phase A: 加载全局 FactorPool + DirectionRegistry
+  → Phase B: 广度探索 pending 方向 (Claude假说→构造→验证→IC评估→回测→反馈)
+  → Phase C: 深度挖掘 (mutation 已有方向)
+  → Phase D: 质量筛选 → 全量 Rolling 回测 → beat_baseline 则写 mined.py + shadow
 ```
+- 三种模式: `--daily` (默认, 每日渐进), `--evolved` (单次全量演化), `--legacy` (旧流程)
 - beat_baseline 时自动写入 mined.py + 创建 shadow 验证
 - `--accept run_001` 接受因子并创建 shadow 验证 (不直接上线)
 
@@ -159,9 +176,14 @@ python monitor/intraday_monitor.py --once       # 单次检查 + 推送
 # launchd (因子挖掘)
 launchctl load ~/Library/LaunchAgents/com.trading.factor-miner.plist
 launchctl unload ~/Library/LaunchAgents/com.trading.factor-miner.plist
-python -m factor_lab.factor_miner --dry-run     # 测试运行
-python -m factor_lab.factor_miner --report      # 查看历史
-python -m factor_lab.factor_miner --accept run_001  # 接受因子 + 创建 shadow
+python -m factor_lab.factor_miner                       # 每日渐进式 (默认)
+python -m factor_lab.factor_miner --daily --smoke-test   # 快速验证 (2方向, 1h)
+python -m factor_lab.factor_miner --evolved              # 单次全量演化式
+python -m factor_lab.factor_miner --evolved --smoke-test # 演化快速验证
+python -m factor_lab.factor_miner --legacy               # 旧流程
+python -m factor_lab.factor_miner --dry-run              # 不推送不回测
+python -m factor_lab.factor_miner --report               # 查看历史
+python -m factor_lab.factor_miner --accept run_001       # 接受因子 + 创建 shadow
 
 # 影子交易管理
 python daily_runner.py --shadow-status              # 查看状态

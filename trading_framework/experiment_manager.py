@@ -21,6 +21,8 @@ import math
 from datetime import date, datetime
 from pathlib import Path
 
+from factor_lab.utils import json_default as _json_default
+
 PROJECT_DIR = Path(__file__).resolve().parent
 EXPERIMENT_DIR = PROJECT_DIR / "experiment"
 REGISTRY_FILE = EXPERIMENT_DIR / "registry.json"
@@ -480,14 +482,6 @@ def _load_prev_prices() -> dict:
     if PREV_PRICES_FILE.exists():
         return json.loads(PREV_PRICES_FILE.read_text(encoding='utf-8'))
     return {}
-
-
-def _json_default(obj):
-    """Handle numpy float32/int64 for JSON serialization"""
-    import numpy as np
-    if isinstance(obj, (np.floating, np.integer)):
-        return float(obj)
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def _save_prev_prices(prices: dict):

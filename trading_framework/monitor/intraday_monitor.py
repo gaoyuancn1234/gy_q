@@ -408,6 +408,28 @@ def is_trading_day() -> bool:
 
 # ============ 主循环 ============
 
+def _check_virtual_portfolios() -> str:
+    """检查是否有活跃的 shadow 或 experiment 虚拟盘"""
+    parts = []
+    try:
+        from shadow_manager import ShadowManager
+        sm = ShadowManager()
+        active = sm.get_active_candidates()
+        if active:
+            parts.append(f"影子{len(active)}个")
+    except Exception:
+        pass
+    try:
+        from experiment_manager import ExperimentManager
+        em = ExperimentManager()
+        active = em.get_active_experiments()
+        if active:
+            parts.append(f"实验{len(active)}个")
+    except Exception:
+        pass
+    return ", ".join(parts)
+
+
 def run_single_check(dry_run: bool = False) -> dict:
     """单次检查，返回结果摘要"""
     # 加载持仓
@@ -426,6 +448,11 @@ def run_single_check(dry_run: bool = False) -> dict:
     has_pending = pending.get('sells') or pending.get('buys')
 
     if not instruments and not has_pending:
+        # 检查是否有活跃的虚拟盘 (shadow/experiment)
+        virtual_active = _check_virtual_portfolios()
+        if virtual_active:
+            log.info(f"实盘空仓，但虚拟盘活跃: {virtual_active}")
+            return {'status': 'empty_but_virtual', 'virtual': virtual_active}
         log.info("空仓且无待执行订单")
         return {'status': 'empty'}
 
@@ -513,12 +540,21 @@ def run_monitor_loop(dry_run: bool = False):
         # 执行检查
         result = run_single_check(dry_run)
 
-        # 空仓且无待执行订单: 低频模式 (30分钟)
-        is_idle = result.get('status') in ('empty', 'no_holdings')
-        if is_idle:
+        # 空仓处理
+        status = result.get('status', '')
+        if status in ('empty', 'no_holdings'):
+            # 完全空仓 + 无虚拟盘: 低频 30 分钟
             log.info("空仓低频模式: 30分钟后再检查")
-            # 跳到 30 分钟后，但不超过 15:05
-            next_check_time = now + timedelta(minutes=30)
+            idle_minutes = 30
+        elif status == 'empty_but_virtual':
+            # 实盘空仓但虚拟盘活跃: 中频 15 分钟
+            log.info(f"实盘空仓，虚拟盘活跃 ({result.get('virtual', '')}): 15分钟后再检查")
+            idle_minutes = 15
+        else:
+            idle_minutes = 0
+
+        if idle_minutes > 0:
+            next_check_time = now + timedelta(minutes=idle_minutes)
             close_time = now.replace(hour=15, minute=5, second=0, microsecond=0)
             if next_check_time > close_time:
                 next_check_time = close_time

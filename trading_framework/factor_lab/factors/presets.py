@@ -53,6 +53,24 @@ def update_full_selected(factor_names: set[str]):
     _FULL_SELECTED_FACTORS = factor_names
 
 
+# Regime-robust 因子名单 (由 run_robustness_research.py 动态设置)
+_ROBUST_FACTORS: set[str] | None = None
+
+
+def update_robust_factors(factor_names: set[str]):
+    """更新 regime-robust 因子名单"""
+    global _ROBUST_FACTORS
+    _ROBUST_FACTORS = factor_names
+
+
+def _get_robust_exprs():
+    """获取 regime-robust 因子表达式 (回退到 alpha158_val)"""
+    if _ROBUST_FACTORS is None:
+        return _get_selected_exprs() + fundamental.get_all_exprs()
+    all_exprs = _get_selected_exprs() + fundamental.get_all_exprs()
+    return [(n, e) for n, e in all_exprs if n in _ROBUST_FACTORS]
+
+
 # 预设定义
 FACTOR_PRESETS = {
     "alpha158": {
@@ -93,6 +111,21 @@ FACTOR_PRESETS = {
         "description": "alpha158_val + 挖掘因子",
         "include_alpha158": True,
         "extra_factors": lambda: _get_selected_exprs() + fundamental.get_all_exprs() + mined.get_all_exprs(),
+    },
+    "alpha158_val_qa": {
+        "description": "alpha158_val + QuantaAlpha 全部挖掘因子 (~273因子)",
+        "include_alpha158": True,
+        "extra_factors": lambda: _get_selected_exprs() + fundamental.get_all_exprs() + mined.get_quantaalpha_exprs(),
+    },
+    "alpha158_val_qa_selected": {
+        "description": "alpha158_val + QuantaAlpha 筛选因子 (~220因子)",
+        "include_alpha158": True,
+        "extra_factors": lambda: _get_selected_exprs() + fundamental.get_all_exprs() + mined.get_quantaalpha_selected_exprs(),
+    },
+    "alpha158_val_robust": {
+        "description": "Alpha158 + regime-robust 因子子集",
+        "include_alpha158": True,
+        "extra_factors": _get_robust_exprs,
     },
 }
 
