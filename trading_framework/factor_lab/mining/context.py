@@ -120,6 +120,11 @@ Total runs: 0 | Factors tested: 0 | Promising: 0 | Beat M01: 0
 
         recent_text = "\n".join(recent_lines) if recent_lines else "(none yet)"
 
+        # Successful patterns (提取成功因子的结构化特征)
+        patterns_text = "(none yet)"
+        if discoveries_dir.exists():
+            patterns_text = self._extract_patterns(discoveries_dir)
+
         text = f"""# Factor Mining Agent Memory
 
 ## Stats
@@ -127,6 +132,9 @@ Total runs: {total_runs} | Factors tested: {total_tested} | Promising: {total_pr
 
 ## Best Discoveries
 {discoveries_text}
+
+## Successful Patterns
+{patterns_text}
 
 ## Failed Approaches
 {failed_text}
@@ -139,6 +147,63 @@ Total runs: {total_runs} | Factors tested: {total_tested} | Promising: {total_pr
 """
         CONTEXT_FILE.write_text(text, encoding="utf-8")
 
+    def _extract_patterns(self, discoveries_dir: Path) -> str:
+        """从成功因子中提取结构化模式"""
+        import re
+        discoveries = []
+        for f in sorted(discoveries_dir.glob("*.json")):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+                discoveries.append(d)
+            except Exception:
+                continue
+
+        if not discoveries:
+            return "(none yet)"
+
+        # 按 |ICIR| 排序取 top
+        discoveries.sort(key=lambda d: abs(d.get("icir", 0)), reverse=True)
+
+        # 提取算子频次
+        op_counts: dict[str, int] = {}
+        window_sizes: list[int] = []
+        fields_used: dict[str, int] = {}
+        temporal_ops = {'Mean', 'Std', 'Sum', 'Min', 'Max', 'Ref', 'Delta',
+                        'Corr', 'Cov', 'Slope', 'Rsquare', 'Rank'}
+        for d in discoveries:
+            expr = d.get("expr", "")
+            for op in re.findall(r'([A-Z][a-zA-Z]+)\s*\(', expr):
+                op_counts[op] = op_counts.get(op, 0) + 1
+            # 只提取时序算子的窗口参数
+            for m in re.finditer(r'([A-Z][a-zA-Z]+)\s*\([^)]*,\s*(\d+)\s*\)', expr):
+                if m.group(1) in temporal_ops:
+                    window_sizes.append(int(m.group(2)))
+            for fld in re.findall(r'\$[a-z_]+', expr):
+                fields_used[fld] = fields_used.get(fld, 0) + 1
+
+        top_ops = sorted(op_counts.items(), key=lambda x: x[1], reverse=True)[:6]
+        top_fields = sorted(fields_used.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        lines = []
+        lines.append(f"基于 {len(discoveries)} 个成功因子的模式:")
+        if top_ops:
+            lines.append(f"- 高频算子: {', '.join(f'{op}({n})' for op, n in top_ops)}")
+        if top_fields:
+            lines.append(f"- 常用字段: {', '.join(f'{f}({n})' for f, n in top_fields)}")
+        if window_sizes:
+            from collections import Counter
+            wc = Counter(window_sizes).most_common(5)
+            lines.append(f"- 常用窗口: {', '.join(f'{w}天({n}次)' for w, n in wc)}")
+        # 类别分布
+        cats = {}
+        for d in discoveries:
+            c = d.get("category", "unknown")
+            cats[c] = cats.get(c, 0) + 1
+        if cats:
+            lines.append(f"- 类别分布: {', '.join(f'{c}={n}' for c, n in sorted(cats.items(), key=lambda x: x[1], reverse=True))}")
+
+        return "\n".join(lines)
+
     def get_focus_areas(self) -> str:
         """根据历史确定本次探索方向 (避免重复失败)"""
         ctx = self.load()
@@ -149,6 +214,19 @@ Total runs: {total_runs} | Factors tested: {total_tested} | Promising: {total_pr
             end = rest.index("##") if "##" in rest else len(rest)
             return rest[:end].strip()
         return ""
+
+    def get_discoveries(self) -> list[dict]:
+        """获取所有成功因子 (供 crossover 使用)"""
+        discoveries = []
+        discoveries_dir = MINING_DIR / "discoveries"
+        if discoveries_dir.exists():
+            for f in sorted(discoveries_dir.glob("*.json")):
+                try:
+                    d = json.loads(f.read_text(encoding="utf-8"))
+                    discoveries.append(d)
+                except Exception:
+                    continue
+        return discoveries
 
     def get_all_tried_names(self) -> list[str]:
         """已尝试过的所有因子名 (含失败的)"""

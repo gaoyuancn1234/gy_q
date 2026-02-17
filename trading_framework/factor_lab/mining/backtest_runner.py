@@ -12,7 +12,7 @@ import pandas as pd
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 RESULTS_DIR = PROJECT_DIR / "factor_lab" / "results" / "rolling"
 
-# 回测参数从 run_rolling_benchmark 导入 (保持一致)
+# 回测参数 (与 run_rolling_benchmark 一致)
 ROLLING_CONFIG_NAME = "D_expand_3v_3r"
 ROLLING_CONFIG = {
     "train_years": 4,
@@ -20,6 +20,8 @@ ROLLING_CONFIG = {
     "retrain_months": 3,
     "expanding": True,
 }
+TEST_START = '2024-01-01'
+TEST_END = '2026-02-05'
 
 
 def _load_baseline() -> dict | None:

@@ -1,13 +1,13 @@
-"""QuantaAlpha 论文超参常量 (Section 4) — v3 对齐论文实现
+"""QuantaAlpha 论文超参常量 (Section 4) — v4 论文规模实验
 
 对齐论文开源实现: https://github.com/QuantaAlpha/QuantaAlpha
 """
 
-# --- 挖掘规模 (论文 experiment.yaml 默认值) ---
-N_DIRECTIONS = 2        # 初始方向数 (论文 num_directions=2)
-MAX_ROUNDS = 3          # 最大演化轮次 (论文 max_rounds=3)
+# --- 挖掘规模 (v4: 放大搜索空间) ---
+N_DIRECTIONS = 10       # 初始方向数 (v4: 10, 覆盖更广搜索空间)
+MAX_ROUNDS = 5          # 最大演化轮次 (v4: 5, 4轮演化 M→C→M→C)
 N_CANDIDATES = 2        # 每个方向生成的候选因子数 (论文 n_candidates=2)
-CROSSOVER_N = 2         # 每轮 crossover 组合数 (论文 crossover_n=2)
+CROSSOVER_N = 3         # 每轮 crossover 组合数 (v4: 3, 利用10方向多样性)
 CROSSOVER_SIZE = 2      # 每次 crossover 的父代数 (论文 crossover_size=2)
 
 # --- Trace 系统 (论文 core/proposal.py) ---
@@ -32,6 +32,10 @@ AST_SIMILARITY = 0.8            # AST 同构相似度阈值
 POOL_CAP_RATIO = 0.50           # 池容量 = min(total * ratio, POOL_MAX)
 POOL_MAX = 200                  # 池容量硬上限
 
+# --- 因子质量筛选 (写入 mined.py 的门槛, 高于入池门槛) ---
+QUALITY_MIN_ABS_ICIR = 0.4      # 略低于 evaluator "promising" 门槛 (0.5), LightGBM 可学方向
+QUALITY_MIN_ABS_RANK_IC = 0.02  # 过滤纯噪声因子
+
 # --- 回测参数 (论文 Table 5) ---
 TOPK = 50
 N_DROP = 5
@@ -48,6 +52,24 @@ TEST_END = '2025-12-26'
 # 论文用 6 特征含 $vwap, 但我们的 Qlib 数据无 vwap.day.bin
 # VWAP 需写为 Div($amount, $volume + 1e-8), 不能直接引用 $vwap
 BASE_FEATURES = ['$open', '$high', '$low', '$close', '$volume', '$amount', '$turn']
+
+# --- Rolling Eval (对齐生产 SOTA: D_expand_3v_3r 全窗口) ---
+ROLLING_EVAL_LITE = True          # 启用 rolling eval (替代单次训练回测)
+ROLLING_EVAL_WINDOWS = 20         # 窗口数上限 (设足够大, 实际由 test period 决定 ~9 窗口)
+ROLLING_EVAL_CONFIG = "D_expand_3v_3r"  # 对齐生产 SOTA (扩展窗口)
+ROLLING_EVAL_TEST_START = '2024-01-01'
+ROLLING_EVAL_TEST_END = '2026-02-05'  # 与 run_rolling_benchmark.TEST_END 对齐
+
+# --- Evolved Mining (演化式挖掘) ---
+EVOLVED_N_DIRECTIONS = 8          # 搜索方向数 (smoke: 3)
+EVOLVED_N_ROUNDS = 6              # 演化轮次 (smoke: 2)  0=orig, 1=mut, 2=cross, 3=mut, 4=cross, 5=mut
+ACCUMULATED_EVAL = True           # Step 4 Backtest 时包含 FactorPool 全局因子 (跨方向累积)
+
+# --- Daily Session (每日渐进式挖掘) ---
+DAILY_TOTAL_TIMEOUT = 5 * 3600   # 每日 session 总超时 (5h, 22:00→03:00)
+DAILY_N_DIRECTIONS = 5            # 每次规划方向数
+DAILY_BREADTH_STEPS = 5           # 广度阶段每个方向的步数
+DAILY_EXHAUSTED_FAILURES = 3     # 连续失败 N 次标记方向为 exhausted
 
 # --- Claude CLI 配置 ---
 CLAUDE_CLI = '/usr/local/bin/claude'

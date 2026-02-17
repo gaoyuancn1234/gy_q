@@ -10,5 +10,17 @@
     },
     "reason": "加入22个PE/PB/MV基本面因子 (188→210因子), 回测Sharpe 1.324→2.073 (+56.6%)",
     "signal_config_path": "shadow/configs/shadow_001.yaml"
+  },
+  "shadow_002": {
+    "status": "active",
+    "created_date": "2026-02-17",
+    "source": "factor_miner:run_006",
+    "duration_days": 20,
+    "elapsed_days": 0,
+    "config_overrides": {
+      "preset": "alpha158_val_mined"
+    },
+    "reason": "Sharpe +0.143",
+    "signal_config_path": "shadow/configs/shadow_002.yaml"
   }
 }

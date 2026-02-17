@@ -12,6 +12,7 @@
 import random
 from .config import (
     N_CANDIDATES, CROSSOVER_N, CROSSOVER_SIZE, BACKTEST_ENABLED, HISTORY_LIMIT,
+    ROLLING_EVAL_LITE, ACCUMULATED_EVAL,
 )
 from .trajectory import (
     Trajectory, TrajectoryPool, TraceEntry, HypothesisFeedback, DirectionTrace,
@@ -45,7 +46,8 @@ def get_mutation_targets(pool: TrajectoryPool, current_round: int) -> list[Traje
 def mutate_trajectory(parent: Trajectory, iteration: int,
                       pool: TrajectoryPool,
                       dry_run: bool = False,
-                      no_backtest: bool = False) -> Trajectory:
+                      no_backtest: bool = False,
+                      factor_pool=None) -> Trajectory:
     """Mutation: 5 步循环 (对齐论文 AlphaAgentLoop.run())
 
     Step 1: Propose — generate_mutation_suffix + generate_hypothesis_with_trace
@@ -113,10 +115,12 @@ def mutate_trajectory(parent: Trajectory, iteration: int,
 
     # --- Step 4: Backtest ---
     if not no_backtest and BACKTEST_ENABLED and new_traj.best_factor and new_traj.failure_step == -1:
-        print(f"    [Step 4] Backtest (combined)")
+        use_rolling = ROLLING_EVAL_LITE
+        sota_factors = _get_sota_factors(direction_trace, factor_pool=factor_pool)
+        print(f"    [Step 4] Backtest ({'rolling-lite' if use_rolling else 'single-shot'}, "
+              f"sota={len(sota_factors)} factors)")
         new_factors = [(new_traj.best_factor['name'], new_traj.best_factor['expr'])]
-        sota_factors = _get_sota_factors(direction_trace)
-        bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors)
+        bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors, use_rolling=use_rolling)
         new_traj.backtest_metrics = bt_metrics
     else:
         print(f"    [Step 4] Backtest (skipped)")
@@ -198,7 +202,8 @@ def crossover_trajectories(parents: list[Trajectory], iteration: int,
                            pool: TrajectoryPool,
                            group_idx: int = 0,
                            dry_run: bool = False,
-                           no_backtest: bool = False) -> Trajectory:
+                           no_backtest: bool = False,
+                           factor_pool=None) -> Trajectory:
     """Crossover: 5 步循环 (对齐论文 AlphaAgentLoop.run())
 
     Step 1: Propose — generate_crossover_suffix + generate_hypothesis_with_trace
@@ -278,10 +283,12 @@ def crossover_trajectories(parents: list[Trajectory], iteration: int,
 
     # --- Step 4: Backtest ---
     if not no_backtest and BACKTEST_ENABLED and new_traj.best_factor and new_traj.failure_step == -1:
-        print(f"    [Step 4] Backtest (combined)")
+        use_rolling = ROLLING_EVAL_LITE
+        sota_factors = _get_sota_factors(direction_trace, factor_pool=factor_pool)
+        print(f"    [Step 4] Backtest ({'rolling-lite' if use_rolling else 'single-shot'}, "
+              f"sota={len(sota_factors)} factors)")
         new_factors = [(new_traj.best_factor['name'], new_traj.best_factor['expr'])]
-        sota_factors = _get_sota_factors(direction_trace)
-        bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors)
+        bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors, use_rolling=use_rolling)
         new_traj.backtest_metrics = bt_metrics
     else:
         print(f"    [Step 4] Backtest (skipped)")
@@ -328,10 +335,25 @@ def _finalize_trace(traj: Trajectory, pool: TrajectoryPool,
     print(f"    [Feedback] {decision_str} | {feedback.observations[:80]}")
 
 
-def _get_sota_factors(direction_trace: DirectionTrace) -> list[tuple[str, str]]:
-    """从 direction trace 中获取所有 SOTA 因子"""
+def _get_sota_factors(direction_trace: DirectionTrace,
+                      factor_pool=None) -> list[tuple[str, str]]:
+    """从 direction trace 中获取所有 SOTA 因子 + FactorPool 全局因子
+
+    当 ACCUMULATED_EVAL=True 且传入 factor_pool 时，
+    Step 4 Backtest 会包含 FactorPool 中所有已入池因子（跨方向累积）。
+    """
+    seen = set()
     factors = []
+    # 1. 当前方向的 SOTA 因子
     for entry in direction_trace.entries:
         if entry.feedback and entry.feedback.decision and entry.factor_name and entry.factor_expr:
-            factors.append((entry.factor_name, entry.factor_expr))
+            if entry.factor_name not in seen:
+                factors.append((entry.factor_name, entry.factor_expr))
+                seen.add(entry.factor_name)
+    # 2. 跨方向累积: FactorPool 全局因子
+    if ACCUMULATED_EVAL and factor_pool is not None:
+        for name, expr in factor_pool.get_exprs():
+            if name not in seen:
+                factors.append((name, expr))
+                seen.add(name)
     return factors

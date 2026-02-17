@@ -18,6 +18,8 @@ from .config import (
     VALID_START, VALID_END, TRAIN_START, TRAIN_END, TEST_START, TEST_END,
     TOPK, N_DROP, BACKTEST_ENABLED, FEEDBACK_PROMPT,
     CLAUDE_CLI, CLAUDE_TIMEOUT, MAX_RETRY, RETRY_WAIT, get_claude_env,
+    ROLLING_EVAL_LITE, ROLLING_EVAL_WINDOWS, ROLLING_EVAL_CONFIG,
+    ROLLING_EVAL_TEST_START, ROLLING_EVAL_TEST_END,
 )
 from .trajectory import Trajectory, HypothesisFeedback, TraceEntry, DirectionTrace
 
@@ -381,10 +383,16 @@ def _parse_feedback_json(output: str) -> Optional[HypothesisFeedback]:
 # ============ v3 新增: 组合回测 ============
 
 def run_combined_backtest(new_factors: list[tuple[str, str]],
-                          sota_factors: list[tuple[str, str]]) -> dict:
+                          sota_factors: list[tuple[str, str]],
+                          use_rolling: bool = False) -> dict:
     """合并新因子 + SOTA 因子 + Alpha158 -> LightGBM 训练 -> 回测
 
     对齐论文 QlibFactorRunner.develop() 的组合回测。
+
+    Args:
+        new_factors: 新挖掘因子
+        sota_factors: 当前 SOTA 因子
+        use_rolling: True=使用精简版 rolling eval (4窗口~100s), False=单次训练 (原始逻辑)
 
     Returns:
         {IC, ICIR, RankIC, sharpe, ARR, MDD} 或空 dict (失败时)
@@ -392,23 +400,31 @@ def run_combined_backtest(new_factors: list[tuple[str, str]],
     if not BACKTEST_ENABLED:
         return {}
 
+    # 合并因子 (去重)
+    seen = set()
+    all_factors = []
+    for name, expr in list(new_factors) + list(sota_factors):
+        if name not in seen:
+            seen.add(name)
+            all_factors.append((name, expr))
+
+    if not all_factors:
+        return {}
+
+    if use_rolling:
+        return _run_rolling_eval_lite(all_factors)
+
+    return _run_single_shot_backtest(all_factors)
+
+
+def _run_single_shot_backtest(all_factors: list[tuple[str, str]]) -> dict:
+    """单次训练回测 (原始逻辑)"""
     try:
         from factor_lab.run_paper_replication import (
             _get_valid_instruments, filter_test_predictions,
             compute_factor_metrics, run_backtest,
         )
         from factor_lab.factors.custom_handler import build_handler_from_exprs
-
-        # 合并因子 (去重)
-        seen = set()
-        all_factors = []
-        for name, expr in list(new_factors) + list(sota_factors):
-            if name not in seen:
-                seen.add(name)
-                all_factors.append((name, expr))
-
-        if not all_factors:
-            return {}
 
         print(f"  [backtest] 组合回测: {len(all_factors)} 挖掘因子 + Alpha158")
         t0 = time.time()
@@ -454,6 +470,104 @@ def run_combined_backtest(new_factors: list[tuple[str, str]],
 
     except Exception as e:
         print(f"  [backtest] 组合回测失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+
+def _run_rolling_eval_lite(all_factors: list[tuple[str, str]]) -> dict:
+    """Rolling eval (对齐生产 SOTA: D_expand_3v_3r 全窗口)
+
+    复用 run_rolling_benchmark 的核心逻辑:
+    - 使用 D_expand_3v_3r 扩展窗口 (对齐生产 SOTA)
+    - 全部窗口 (~9, 由 ROLLING_EVAL_WINDOWS 上限控制)
+    - 返回 {sharpe, total_return, max_drawdown, calmar}
+    """
+    try:
+        import pandas as pd
+        from factor_lab.run_rolling_benchmark import (
+            generate_rolling_windows, build_model, run_backtest,
+            ROLLING_CONFIGS,
+        )
+        from factor_lab.factors.custom_handler import build_handler_from_exprs
+
+        config = ROLLING_CONFIGS.get(ROLLING_EVAL_CONFIG, ROLLING_CONFIGS["D_expand_3v_3r"])
+        test_start = ROLLING_EVAL_TEST_START
+        test_end = ROLLING_EVAL_TEST_END
+
+        # 生成窗口, 只取最近 N 个
+        all_windows = generate_rolling_windows(
+            ROLLING_EVAL_CONFIG, config, test_start, test_end,
+        )
+        windows = all_windows[-ROLLING_EVAL_WINDOWS:] if len(all_windows) > ROLLING_EVAL_WINDOWS else all_windows
+
+        print(f"  [rolling-lite] {len(windows)} 窗口, "
+              f"{len(all_factors)} 挖掘因子 + Alpha158")
+        t0 = time.time()
+
+        all_preds = []
+        for w in windows:
+            handler, _ = build_handler_from_exprs(
+                factor_exprs=all_factors,
+                start_time=w['train_start'],
+                end_time=w['pred_end'],
+                fit_start_time=w['train_start'],
+                fit_end_time=w['train_end'],
+                instruments='csi300',
+                include_alpha158=True,
+            )
+
+            from qlib.data.dataset import DatasetH
+            dataset = DatasetH(handler=handler, segments={
+                "train": (w['train_start'], w['train_end']),
+                "valid": (w['valid_start'], w['valid_end']),
+                "test": (w['pred_start'], w['pred_end']),
+            })
+
+            model, fit_kwargs = build_model("LightGBM")
+            model.fit(dataset, **fit_kwargs)
+
+            pred = model.predict(dataset)
+            if isinstance(pred.index, pd.MultiIndex):
+                dates = pred.index.get_level_values(0)
+                mask = (dates >= pd.Timestamp(w['pred_start'])) & \
+                       (dates <= pd.Timestamp(w['pred_end']))
+                pred = pred[mask]
+
+            all_preds.append(pred)
+
+            del handler, dataset, model, pred
+            gc.collect()
+
+        if not all_preds:
+            return {}
+
+        combined_pred = pd.concat(all_preds)
+        if combined_pred.index.duplicated().any():
+            combined_pred = combined_pred[~combined_pred.index.duplicated(keep='last')]
+
+        # 回测: 使用 rolling benchmark 的 run_backtest (TopK=12, N_DROP=3)
+        bt = run_backtest(combined_pred)
+
+        elapsed = time.time() - t0
+        result = {
+            'sharpe': bt.get('sharpe', 0),
+            'total_return': bt.get('total_return', 0),
+            'ARR': bt.get('annual_return', 0) * 100 if bt.get('annual_return') else 0,
+            'MDD': bt.get('max_drawdown', 0) * 100 if bt.get('max_drawdown') else 0,
+            'calmar': abs(bt.get('annual_return', 0) / bt.get('max_drawdown', -1)) if bt.get('max_drawdown', 0) != 0 else 0,
+            'n_windows': len(windows),
+            'eval_time': round(elapsed, 1),
+        }
+
+        print(f"  [rolling-lite] Sharpe={result['sharpe']:.3f}, "
+              f"ARR={result['ARR']:.2f}%, MDD={result['MDD']:.2f}% "
+              f"({elapsed:.1f}s)")
+
+        return result
+
+    except Exception as e:
+        print(f"  [rolling-lite] 精简 rolling eval 失败: {e}")
         import traceback
         traceback.print_exc()
         return {}

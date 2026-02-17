@@ -1,6 +1,7 @@
 """Claude CLI 因子假说生成
 
 调用 Claude CLI agent 生成新的量化因子假说。
+支持: 多样化种子初始化 / Mutation 靶向修复 / Crossover 模式重组
 """
 import json
 import re
@@ -9,16 +10,46 @@ from pathlib import Path
 
 WORK_DIR = Path(__file__).resolve().parent.parent.parent.parent  # repo root
 
+# 多样化种子方向 — cycle 轮转使用
+SEED_CATEGORIES = [
+    {
+        "focus": "波动率结构",
+        "hint": "短期/长期波动率比、日内振幅变化、波动率聚集/发散",
+    },
+    {
+        "focus": "量价背离",
+        "hint": "价格创新高但成交量萎缩、放量滞涨、缩量阴跌",
+    },
+    {
+        "focus": "动量与反转",
+        "hint": "动量加速/衰减的二阶导、不同时间尺度的动量交叉",
+    },
+    {
+        "focus": "估值动态",
+        "hint": "PE/PB 的变化率、估值分位数的均值回归、市值动量",
+    },
+    {
+        "focus": "流动性微结构",
+        "hint": "异常换手率、成交额集中度、Amihud 非流动性因子",
+    },
+    {
+        "focus": "多尺度交叉",
+        "hint": "短周期(5日)与长周期(60日)信号的交叉、regime 切换",
+    },
+]
+
 
 def generate_hypotheses(context: str, existing_names: list[str],
-                        batch_size: int = 10, focus: str = "") -> list[dict]:
+                        batch_size: int = 10, focus: str = "",
+                        seed: dict | None = None) -> list[dict]:
     """调用 Claude CLI 生成因子假说
 
     Args:
         context: Agent 记忆文本 (AGENT_CONTEXT.md)
         existing_names: 已有因子名 (防重复)
         batch_size: 每批生成数量
-        focus: 本次探索方向
+        focus: 本次探索方向 (旧参数，seed 优先)
+        seed: 种子方向 {"focus": "...", "hint": "..."}
 
     Returns:
         [{name, expr, hypothesis, category, confidence}, ...]
@@ -26,7 +57,14 @@ def generate_hypotheses(context: str, existing_names: list[str],
     existing_str = ", ".join(existing_names[-100:]) if existing_names else "(无)"
 
     focus_section = ""
-    if focus:
+    if seed:
+        focus_section = f"""
+## 本次探索方向
+**{seed['focus']}**
+提示: {seed['hint']}
+请围绕上述方向设计因子。每个因子的经济逻辑要有差异，避免同质化。
+"""
+    elif focus:
         focus_section = f"""
 ## 本次探索方向
 {focus}
@@ -152,3 +190,199 @@ def _validate_hypotheses(items: list) -> list[dict]:
         item.setdefault("confidence", 0.5)
         valid.append(item)
     return valid
+
+
+# ---------------------------------------------------------------------------
+# Mutation — 靶向修复 "差一点" 的因子
+# ---------------------------------------------------------------------------
+
+def _diagnose_failure(factor: dict) -> str:
+    """根据评估结果生成诊断建议"""
+    icir = abs(factor.get("icir", 0))
+    is_redundant = factor.get("is_redundant", False)
+    max_corr = factor.get("max_corr", 0)
+    most_correlated = factor.get("most_correlated", "")
+
+    if is_redundant:
+        return (f"与已有因子 {most_correlated} 高度相关 (corr={max_corr:.2f})。"
+                f"请增加差异化: 换时间窗口、加入新字段、或改变信号逻辑。")
+
+    if icir < 0.3:
+        return "IC 方向正确但信号极弱。尝试: 调整滚动窗口 (如 5→20 或 20→60)，或换用更敏感的算子。"
+
+    # 0.3 <= icir < 0.5 — near miss
+    return "信号方向对但强度不足。尝试: 微调窗口参数、加入 Rank 截面标准化、或用 regime 条件增强。"
+
+
+def mutate_factors(near_miss: list[dict], context: str,
+                   batch_size: int = 5) -> list[dict]:
+    """对 near-miss 因子做靶向修复
+
+    Args:
+        near_miss: 评估结果列表，每个包含 name/expr/hypothesis/icir/is_redundant/max_corr
+        context: Agent 记忆文本
+        batch_size: 最多修复几个
+
+    Returns:
+        [{name, expr, hypothesis, category, confidence}, ...]
+    """
+    targets = near_miss[:batch_size]
+
+    factor_blocks = []
+    for f in targets:
+        diag = _diagnose_failure(f)
+        factor_blocks.append(
+            f"### {f['name']}\n"
+            f"- 假说: {f.get('hypothesis', '')}\n"
+            f"- 表达式: {f.get('expr', '')}\n"
+            f"- ICIR: {f.get('icir', 0):.3f}\n"
+            f"- 诊断: {diag}"
+        )
+
+    prompt = f"""你是一位资深量化研究员。以下因子接近有效但未达标，请做**靶向修复**。
+
+## 可用字段 (Qlib 日频)
+$open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $circ_mv
+
+## 可用算子
+- 时序: Ref(x,N), Mean(x,N), Std(x,N), Sum(x,N), Delta(x,N), Min(x,N), Max(x,N), Slope(x,N), Rsquare(x,N)
+- 截面: Rank(x,N)
+- 运算: Abs(x), Log(x), Sign(x), Power(x,N), Div(x,y), Greater(x,y), Less(x,y), If(cond,x,y)
+- 统计: Corr(x,y,N), Cov(x,y,N) — 要求 x,y 同源
+
+## 约束
+1. 除零保护: 分母加 1e-8
+2. 名称全大写下划线，以 MUT_ 开头
+3. 只调整诊断指出的问题部分，保留原始因子的核心逻辑
+4. 表达式长度 ≤ 200 字符, 嵌套 ≤ 5 层, 字段 ≤ 6 种
+
+## 待修复因子
+{chr(10).join(factor_blocks)}
+
+## Agent 记忆
+{context[:2000]}
+
+请为每个因子输出 1-2 个修复变体。严格输出 JSON 数组:
+```json
+[
+  {{
+    "name": "MUT_FACTOR_NAME",
+    "expr": "修复后的 Qlib 表达式",
+    "hypothesis": "修复逻辑说明",
+    "category": "volatility/momentum/liquidity/value/reversal/microstructure",
+    "confidence": 0.6
+  }}
+]
+```"""
+
+    try:
+        cmd = [
+            '/usr/local/bin/claude',
+            '--print',
+            '--dangerously-skip-permissions',
+            '--output-format', 'text',
+            '-p', prompt,
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=300, cwd=str(WORK_DIR),
+        )
+        return _parse_hypotheses(result.stdout.strip())
+    except subprocess.TimeoutExpired:
+        print("  [mutation] Claude CLI 超时")
+        return []
+    except Exception as e:
+        print(f"  [mutation] 调用失败: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Crossover — 重组历史成功因子的模式
+# ---------------------------------------------------------------------------
+
+def crossover_hypotheses(discoveries: list[dict], context: str,
+                         batch_size: int = 10) -> list[dict]:
+    """将历史成功因子的模式进行重组
+
+    Args:
+        discoveries: 历史成功因子列表 [{name, expr, hypothesis, icir}, ...]
+        context: Agent 记忆文本
+        batch_size: 生成数量
+
+    Returns:
+        [{name, expr, hypothesis, category, confidence}, ...]
+    """
+    if len(discoveries) < 3:
+        return []
+
+    # 取 top 因子
+    sorted_disc = sorted(discoveries, key=lambda d: abs(d.get("icir", 0)), reverse=True)[:8]
+
+    disc_blocks = []
+    for d in sorted_disc:
+        disc_blocks.append(
+            f"- **{d['name']}** (ICIR={d.get('icir', 0):.3f}): "
+            f"`{d.get('expr', '')[:100]}`\n"
+            f"  假说: {d.get('hypothesis', '')[:80]}"
+        )
+
+    prompt = f"""你是一位资深量化研究员。以下是历史挖掘中表现最好的因子，请**重组成功模式**创造新因子。
+
+## 可用字段 (Qlib 日频)
+$open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $circ_mv
+
+## 可用算子
+- 时序: Ref(x,N), Mean(x,N), Std(x,N), Sum(x,N), Delta(x,N), Min(x,N), Max(x,N), Slope(x,N), Rsquare(x,N)
+- 截面: Rank(x,N)
+- 运算: Abs(x), Log(x), Sign(x), Power(x,N), Div(x,y), Greater(x,y), Less(x,y), If(cond,x,y)
+- 统计: Corr(x,y,N), Cov(x,y,N) — 要求 x,y 同源
+
+## 约束
+1. 除零保护: 分母加 1e-8
+2. 名称全大写下划线，以 CX_ 开头
+3. 表达式长度 ≤ 200 字符, 嵌套 ≤ 5 层, 字段 ≤ 6 种
+
+## 历史最佳因子
+{chr(10).join(disc_blocks)}
+
+## 重组策略
+- 组合 A 的时间结构 + B 的截面逻辑
+- 用 A 的信号源替换 B 中的字段
+- 将成功的窗口参数迁移到不同的算子组合
+- 融合不同类别因子的信号 (如波动率 + 动量)
+
+## Agent 记忆
+{context[:2000]}
+
+请设计 {batch_size} 个重组因子。严格输出 JSON 数组:
+```json
+[
+  {{
+    "name": "CX_FACTOR_NAME",
+    "expr": "重组后的 Qlib 表达式",
+    "hypothesis": "重组逻辑: 来自 A 的 xxx + B 的 yyy",
+    "category": "volatility/momentum/liquidity/value/reversal/microstructure",
+    "confidence": 0.6
+  }}
+]
+```"""
+
+    try:
+        cmd = [
+            '/usr/local/bin/claude',
+            '--print',
+            '--dangerously-skip-permissions',
+            '--output-format', 'text',
+            '-p', prompt,
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=300, cwd=str(WORK_DIR),
+        )
+        return _parse_hypotheses(result.stdout.strip())
+    except subprocess.TimeoutExpired:
+        print("  [crossover] Claude CLI 超时")
+        return []
+    except Exception as e:
+        print(f"  [crossover] 调用失败: {e}")
+        return []

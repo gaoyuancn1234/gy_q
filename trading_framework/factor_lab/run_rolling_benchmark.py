@@ -74,6 +74,13 @@ ROLLING_CONFIGS = {
         "retrain_months": 3,
         "expanding": True,
     },
+    "E_expand_6v_3r": {
+        "description": "扩展窗口训练, 6个月验证, 3个月重训",
+        "train_years": 4,
+        "valid_months": 6,
+        "retrain_months": 3,
+        "expanding": True,
+    },
 }
 
 # 默认参数
@@ -151,14 +158,40 @@ def generate_rolling_windows(config_name: str, config: dict,
     return windows
 
 
-def build_model(model_name: str):
+def _rank_ic_feval(preds, train_data):
+    """LightGBM 自定义 feval: 返回 rank IC (越大越好)
+
+    metric="None" → 进入 self.params → 禁用默认 MSE metric
+    feval → 通过 LGBModel.fit(**kwargs) → lgb.train(feval=...) 透传
+    """
+    labels = train_data.get_label()
+    ic = pd.Series(preds).corr(pd.Series(labels), method='spearman')
+    if pd.isna(ic):
+        ic = 0.0
+    return 'rank_ic', ic, True  # (name, value, is_higher_better)
+
+
+def build_model(model_name: str, variant: str = "default"):
     """创建模型实例 (超参与 benchmark_models.py 一致)
+
+    Args:
+        model_name: 模型名
+        variant: "default" 或 "rank_ic" (rank-IC 早停)
 
     Returns:
         (model, fit_kwargs) 元组
     """
     if model_name == 'LightGBM':
         from qlib.contrib.model.gbdt import LGBModel
+        if variant == "rank_ic":
+            model = LGBModel(
+                loss="mse", metric="None",
+                learning_rate=0.01, num_leaves=64,
+                num_boost_round=500, early_stopping_rounds=80,
+                feature_fraction=0.75, bagging_fraction=0.75, bagging_freq=5,
+                lambda_l1=0.1, lambda_l2=0.1, min_data_in_leaf=80,
+            )
+            return model, {"feval": _rank_ic_feval}
         model = LGBModel(
             loss="mse", learning_rate=0.01, num_leaves=64,
             num_boost_round=500, early_stopping_rounds=80,
@@ -230,7 +263,8 @@ def run_backtest(pred):
 
 def run_rolling_single(preset: str, model_name: str,
                        config_name: str, config: dict,
-                       force: bool = False) -> dict | None:
+                       force: bool = False,
+                       variant: str = "default") -> dict | None:
     """执行一个 (preset × model × config) 的滚动训练
 
     Args:
@@ -239,11 +273,13 @@ def run_rolling_single(preset: str, model_name: str,
         config_name: rolling 配置名
         config: rolling 配置字典
         force: 是否强制重跑
+        variant: 模型变体 ("default" 或 "rank_ic")
 
     Returns:
         结果字典, 或 None (已有结果且非 force)
     """
-    result_file = RESULTS_DIR / f"{config_name}_{preset}_{model_name}.json"
+    suffix = f"_{variant}" if variant != "default" else ""
+    result_file = RESULTS_DIR / f"{config_name}_{preset}_{model_name}{suffix}.json"
 
     if result_file.exists() and not force:
         print(f"  [跳过] 已有结果: {result_file.name}")
@@ -303,7 +339,7 @@ def run_rolling_single(preset: str, model_name: str,
         })
 
         # 3. 构建模型并训练
-        model, fit_kwargs = build_model(model_name)
+        model, fit_kwargs = build_model(model_name, variant=variant)
         model.fit(dataset, **fit_kwargs)
 
         # 4. 预测并过滤到 pred 区间
@@ -365,6 +401,7 @@ def run_rolling_single(preset: str, model_name: str,
         "config_description": config['description'],
         "preset": preset,
         "model": model_name,
+        "variant": variant,
         "n_windows": len(windows),
         "windows": window_details,
         "overall": bt_result,
@@ -401,15 +438,16 @@ def print_comparison_table(all_results: list[dict]):
                             key=lambda x: x['overall'].get('sharpe', 0),
                             reverse=True)
 
-    header = (f"{'排名':<4} {'Config':<16} {'Preset':<16} {'Model':<12} "
+    header = (f"{'排名':<4} {'Config':<16} {'Preset':<16} {'Model':<12} {'Variant':<10} "
               f"{'Windows':>7} {'总收益':>10} {'年化':>10} {'超额':>10} "
               f"{'Sharpe':>8} {'最大回撤':>10} {'耗时(s)':>8}")
     print(header)
-    print("-" * 110)
+    print("-" * 120)
 
     for rank, r in enumerate(sorted_results, 1):
         o = r['overall']
         print(f"{rank:<4} {r['config_name']:<16} {r['preset']:<16} {r['model']:<12} "
+              f"{r.get('variant', 'default'):<10} "
               f"{r['n_windows']:>7} {o.get('total_return', 0):>9.2%} "
               f"{o.get('annual_return', 0):>9.2%} "
               f"{o.get('excess_return', 0):>9.2%} "

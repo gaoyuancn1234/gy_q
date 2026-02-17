@@ -14,7 +14,7 @@ instruments: csi300
 model: LightGBM
 model_cache_dir: factor_lab/results/rolling/predictions
 open_cost: 0.0005
-preset: alpha158_selected
+preset: alpha158_val
 quality_cache_dir: factor_lab/results/signal_decay
 rebalance_every: 5
 rolling_config: D_expand_3v_3r
