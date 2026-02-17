@@ -9,12 +9,12 @@ v3 新增 Trace 系统 (对齐论文 core/proposal.py):
   DirectionTrace: 单个 direction 的轨迹历史
 """
 import json
-import os
-import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+
+from factor_lab.utils import atomic_json_dump, json_default
 
 from .config import HISTORY_LIMIT, TRACE_ENTRY_TMPL
 
@@ -346,7 +346,7 @@ class TrajectoryPool:
                 str(k): v.to_dict() for k, v in self._direction_traces.items()
             },
         }
-        _atomic_json_dump(path, data, indent=2, ensure_ascii=False, default=_json_default)
+        atomic_json_dump(path, data, indent=2, ensure_ascii=False, default=json_default)
 
     def load(self, filename: str = "trajectories.json"):
         path = self.save_dir / filename
@@ -364,31 +364,3 @@ class TrajectoryPool:
             self._direction_traces[int(k)] = DirectionTrace.from_dict(v)
 
 
-def _atomic_json_dump(path: Path, data, **kwargs):
-    """原子写入 JSON: 先写临时文件再 rename，防止中断导致文件损坏"""
-    path = Path(path)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
-    try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(data, f, **kwargs)
-        os.replace(tmp_path, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-def _json_default(obj):
-    """numpy/float32 等类型的 JSON 序列化"""
-    import numpy as np
-    if isinstance(obj, (np.floating, np.complexfloating)):
-        return float(obj)
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")

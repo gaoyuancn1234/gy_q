@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""QuantaAlpha 核心方法复现 — v3 完全对齐论文 (Experiment 013)
+"""QuantaAlpha 核心方法复现 — v4 论文规模实验 (Experiment 013)
 
 严格按论文方法复现核心挖掘流程 + 5 步循环:
 - Phase A: 多样化初始规划 (5 步: Propose -> Construct(regen) -> Calculate -> Backtest -> Feedback)
 - Phase B: 轨迹级自我演化 (Mutation + Crossover, MAX_ROUNDS 轮)
-- Phase C: 最终评估 (Alpha158 + 挖掘因子 -> LightGBM -> TopK=50 回测)
+- Phase C: 最终评估 (Alpha158 + 挖掘因子 + 纯挖掘因子 -> LightGBM -> TopK=50 回测)
 
 用法:
-  # 全量运行 (论文默认: 2方向, 3轮)
+  # 论文规模运行 (10方向, 5轮)
   python -m factor_lab.run_quanta_alpha
 
   # 快速测试 (1方向, 2轮)
@@ -43,6 +43,8 @@ warnings.filterwarnings('ignore')
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
+
+from factor_lab.utils import json_default as _json_default
 
 from factor_lab.quanta.config import (
     N_DIRECTIONS, MAX_ROUNDS, N_CANDIDATES, CROSSOVER_N, CROSSOVER_SIZE,
@@ -147,9 +149,10 @@ def run_phase_a(n_directions: int, pool: TrajectoryPool,
 
         # --- Step 4: Backtest ---
         if not no_backtest and BACKTEST_ENABLED and traj.best_factor and traj.failure_step == -1:
-            print(f"  [Step 4] Backtest (combined)")
             new_factors = [(traj.best_factor['name'], traj.best_factor['expr'])]
-            bt_metrics = eval_agent.run_combined_backtest(new_factors, [])
+            sota_factors = evolution._get_sota_factors(direction_trace, factor_pool=factor_pool)
+            print(f"  [Step 4] Backtest (combined, sota={len(sota_factors)} factors)")
+            bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors)
             traj.backtest_metrics = bt_metrics
         else:
             print(f"  [Step 4] Backtest (skipped)")
@@ -226,6 +229,7 @@ def run_phase_b(max_rounds: int, pool: TrajectoryPool,
                 new_traj = evolution.mutate_trajectory(
                     parent, iteration=rnd, pool=pool,
                     dry_run=dry_run, no_backtest=no_backtest,
+                    factor_pool=factor_pool,
                 )
                 _try_admit_to_pool(new_traj, factor_pool, rnd)
                 _print_traj_summary(new_traj, indent=4)
@@ -252,6 +256,7 @@ def run_phase_b(max_rounds: int, pool: TrajectoryPool,
                 new_traj = evolution.crossover_trajectories(
                     group, iteration=rnd, pool=pool,
                     group_idx=gi, dry_run=dry_run, no_backtest=no_backtest,
+                    factor_pool=factor_pool,
                 )
                 _try_admit_to_pool(new_traj, factor_pool, rnd)
                 _print_traj_summary(new_traj, indent=4)
@@ -347,6 +352,18 @@ def run_phase_c(factor_pool: FactorPool, pool: TrajectoryPool):
                 results[label] = metrics
                 _print_metrics(f"  {label}", metrics)
 
+    # 5. 纯挖掘因子评估 (对齐论文: 不混入 Alpha158)
+    if mined_factors:
+        print(f"\n[C.5] 纯挖掘因子评估 ({len(mined_factors)} 因子, 无 Alpha158)...")
+        pred_pure = _train_and_predict_lightgbm(
+            preset='alpha158', extra_factors=mined_factors,
+            include_alpha158=False,
+        )
+        if pred_pure is not None:
+            metrics_pure = _compute_full_metrics(pred_pure)
+            results['mined_only_pure'] = metrics_pure
+            _print_metrics("mined_only_pure", metrics_pure)
+
     # 保存结果
     _save_results(results, factor_pool, pool)
     _print_comparison_table(results)
@@ -356,8 +373,13 @@ def run_phase_c(factor_pool: FactorPool, pool: TrajectoryPool):
 
 # ============ LightGBM 训练 ============
 
-def _train_and_predict_lightgbm(preset: str, extra_factors: list[tuple[str, str]]):
-    """训练 LightGBM 并返回测试集预测"""
+def _train_and_predict_lightgbm(preset: str, extra_factors: list[tuple[str, str]],
+                                include_alpha158: bool = True):
+    """训练 LightGBM 并返回测试集预测
+
+    Args:
+        include_alpha158: 是否包含 Alpha158 基础因子。False 时只用 extra_factors (纯挖掘因子评估)。
+    """
     from factor_lab.run_paper_replication import (
         _get_valid_instruments, filter_test_predictions,
     )
@@ -368,9 +390,13 @@ def _train_and_predict_lightgbm(preset: str, extra_factors: list[tuple[str, str]
             from factor_lab.factors.presets import FACTOR_PRESETS
 
             preset_config = FACTOR_PRESETS.get(preset, FACTOR_PRESETS['alpha158'])
-            extra_preset = preset_config.get('extra_factors', [])
-            if callable(extra_preset):
-                extra_preset = extra_preset()
+
+            if include_alpha158:
+                extra_preset = preset_config.get('extra_factors', [])
+                if callable(extra_preset):
+                    extra_preset = extra_preset()
+            else:
+                extra_preset = []
 
             seen_names = set()
             all_extra = []
@@ -384,7 +410,7 @@ def _train_and_predict_lightgbm(preset: str, extra_factors: list[tuple[str, str]
                 start_time=TRAIN_START, end_time=TEST_END,
                 fit_start_time=TRAIN_START, fit_end_time=TRAIN_END,
                 instruments=_get_valid_instruments(),
-                include_alpha158=preset_config.get('include_alpha158', True),
+                include_alpha158=include_alpha158,
             )
         else:
             from factor_lab.factors.presets import build_handler
@@ -461,7 +487,7 @@ def _print_metrics(label: str, m: dict):
 def _print_comparison_table(results: dict):
     """打印对比表"""
     print(f"\n{'='*100}")
-    print(f"  QuantaAlpha 最终结果 (Experiment 013 v3)")
+    print(f"  QuantaAlpha 最终结果 (Experiment 013 v4)")
     print(f"  Train: {TRAIN_START}~{TRAIN_END} | Valid: {VALID_START}~{VALID_END} | Test: {TEST_START}~{TEST_END}")
     print(f"  Strategy: TopK={TOPK}, N_drop={N_DROP}")
     print(f"  Config: MAX_ROUNDS={MAX_ROUNDS}, N_CANDIDATES={N_CANDIDATES}, CROSSOVER_N={CROSSOVER_N}")
@@ -523,19 +549,6 @@ def _save_results(results: dict, factor_pool: FactorPool, pool: TrajectoryPool):
         json.dump(pool.stats(), f, indent=2, ensure_ascii=False, default=_json_default)
 
 
-def _json_default(obj):
-    import numpy as np_
-    if isinstance(obj, (np_.floating, np_.complexfloating)):
-        return float(obj)
-    if isinstance(obj, (np_.integer,)):
-        return int(obj)
-    if isinstance(obj, (np_.bool_,)):
-        return bool(obj)
-    if isinstance(obj, np_.ndarray):
-        return obj.tolist()
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-
-
 # ============ 报告 ============
 
 def print_report():
@@ -578,7 +591,7 @@ def init_qlib():
 # ============ CLI ============
 
 def main():
-    parser = argparse.ArgumentParser(description="QuantaAlpha 多智能体因子挖掘 (Exp 013 v3)")
+    parser = argparse.ArgumentParser(description="QuantaAlpha 多智能体因子挖掘 (Exp 013 v4)")
     parser.add_argument('--directions', type=int, default=N_DIRECTIONS,
                         help=f"Phase A 方向数 (默认 {N_DIRECTIONS})")
     parser.add_argument('--max-rounds', type=int, default=MAX_ROUNDS,
@@ -621,7 +634,7 @@ def main():
     t_total = time.time()
 
     print(f"\n{'#'*70}")
-    print(f"  QuantaAlpha 多智能体因子挖掘 (Experiment 013 v3)")
+    print(f"  QuantaAlpha 多智能体因子挖掘 (Experiment 013 v4)")
     print(f"  方向: {args.directions} | 最大轮数: {args.max_rounds} | "
           f"crossover_n: {CROSSOVER_N} | dry-run: {args.dry_run}")
     print(f"  v3 新增: Trace={HISTORY_LIMIT} | Regen={MAX_REGEN_ATTEMPTS} | "

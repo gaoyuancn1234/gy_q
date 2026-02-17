@@ -6,12 +6,15 @@
 - 池容量: min(总挖掘数 × POOL_CAP_RATIO, POOL_MAX)
 """
 import json
-import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import REDUNDANCY_CORR, AST_SIMILARITY, POOL_CAP_RATIO, POOL_MAX
+from factor_lab.utils import atomic_json_dump
+
+from .config import (
+    REDUNDANCY_CORR, AST_SIMILARITY, POOL_CAP_RATIO, POOL_MAX,
+    QUALITY_MIN_ABS_ICIR, QUALITY_MIN_ABS_RANK_IC,
+)
 from .ast_dedup import ast_similarity
 
 
@@ -135,6 +138,22 @@ class FactorPool:
         """返回 [(name, expr), ...] 格式"""
         return [(f.name, f.expr) for f in self._factors]
 
+    def get_quality_exprs(
+        self,
+        min_abs_icir: float = QUALITY_MIN_ABS_ICIR,
+        min_abs_rank_ic: float = QUALITY_MIN_ABS_RANK_IC,
+    ) -> list[tuple[str, str]]:
+        """返回通过质量筛选的因子 [(name, expr), ...]
+
+        比 get_exprs() 更严格: 要求 abs(ICIR) >= 阈值 AND abs(RankIC) >= 阈值。
+        用于写入 mined.py，避免弱因子引入噪声。
+        """
+        quality = []
+        for f in self._factors:
+            if abs(f.icir) >= min_abs_icir and abs(f.rank_ic) >= min_abs_rank_ic:
+                quality.append((f.name, f.expr))
+        return quality
+
     def stats(self) -> dict:
         rank_ics = [abs(f.rank_ic) for f in self._factors] if self._factors else [0]
         return {
@@ -161,7 +180,7 @@ class FactorPool:
                 for f in self._factors
             ],
         }
-        _atomic_json_dump(path, data, indent=2, ensure_ascii=False)
+        atomic_json_dump(path, data, indent=2, ensure_ascii=False)
 
     def load(self, filename: str = "factor_pool.json"):
         path = self.save_dir / filename
@@ -186,17 +205,3 @@ def _count_by_key(factors: list[PoolFactor], key: str) -> dict:
     return counts
 
 
-def _atomic_json_dump(path: Path, data, **kwargs):
-    """原子写入 JSON"""
-    path = Path(path)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
-    try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(data, f, **kwargs)
-        os.replace(tmp_path, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise

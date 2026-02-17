@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""自动因子挖掘 — Claude Agent 驱动，每周运行
+"""自动因子挖掘 — Claude Agent 驱动，每日渐进式运行
 
 用法:
-    python -m factor_lab.factor_miner              # 完整周期
-    python -m factor_lab.factor_miner --dry-run    # 不推送不回测
-    python -m factor_lab.factor_miner --report     # 查看历史
-    python -m factor_lab.factor_miner --accept run_001  # 人工接受因子
+    python -m factor_lab.factor_miner                        # 每日渐进式挖掘 (默认)
+    python -m factor_lab.factor_miner --daily --smoke-test   # 快速验证 (2方向, 1h)
+    python -m factor_lab.factor_miner --evolved              # 单次全量演化式挖掘
+    python -m factor_lab.factor_miner --evolved --smoke-test # 快速验证 (3方向×2轮)
+    python -m factor_lab.factor_miner --legacy               # 旧流程
+    python -m factor_lab.factor_miner --dry-run              # 不推送不回测
+    python -m factor_lab.factor_miner --report               # 查看历史
+    python -m factor_lab.factor_miner --accept run_001       # 人工接受因子
 """
 import argparse
 import json
@@ -22,12 +26,14 @@ warnings.filterwarnings("ignore")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
+from factor_lab.utils import json_default as _json_default
+
 MINING_DIR = PROJECT_DIR / "factor_lab" / "mining_results"
 RUNS_DIR = MINING_DIR / "runs"
 DISCOVERIES_DIR = MINING_DIR / "discoveries"
 LOCK_FILE = MINING_DIR / ".lock"
 
-MAX_CYCLES = 3  # 最多迭代轮数
+MAX_CYCLES = 4  # 最多迭代轮数 (0-2: 种子轮转, 3: crossover)
 BATCH_SIZE = 10  # 每轮生成因子数
 TOTAL_TIMEOUT = 3600  # 总运行超时 (秒)
 
@@ -170,7 +176,10 @@ def _build_discovery_message(run_result: dict, backtest: dict) -> str:
 def run_mining(dry_run: bool = False, skip_backtest: bool = False):
     """执行一次完整的挖掘周期"""
     from factor_lab.mining.context import MiningContext
-    from factor_lab.mining.hypothesis import generate_hypotheses
+    from factor_lab.mining.hypothesis import (
+        generate_hypotheses, mutate_factors, crossover_hypotheses,
+        SEED_CATEGORIES,
+    )
     from factor_lab.mining.validator import validate_expression, validate_with_qlib
     from factor_lab.mining.evaluator import evaluate_candidates, check_redundancy
 
@@ -198,6 +207,11 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
     promising_factors = []
     non_redundant_factors = []
     failed_approaches = []
+    near_miss_factors = []  # 差一点的因子 (供 mutation)
+
+    # 获取历史 discoveries (供 crossover)
+    discoveries = ctx.get_discoveries()
+    seed_index = 0  # 独立种子计数器 (不被 mutation/crossover 打断)
 
     # 2. 迭代生成和评估
     for cycle in range(MAX_CYCLES):
@@ -207,16 +221,34 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
 
         print(f"\n  --- 第 {cycle + 1}/{MAX_CYCLES} 轮 ---")
 
-        # 生成假说
-        hypotheses = generate_hypotheses(
-            ctx.load(), existing, batch_size=BATCH_SIZE, focus=focus,
-        )
+        # 决定本轮策略: 种子轮转 / mutation / crossover
+        # 取出本轮 mutation 目标 (独立副本)，清空 near_miss 供本轮重新收集
+        mutation_targets = near_miss_factors.copy() if (near_miss_factors and cycle > 0) else []
+        near_miss_factors = []
+
+        if mutation_targets:
+            # 有 near-miss → mutation 优先
+            print(f"  [mutation] 对 {len(mutation_targets)} 个 near-miss 因子靶向修复")
+            hypotheses = mutate_factors(mutation_targets, ctx.load())
+        elif cycle == MAX_CYCLES - 1 and len(discoveries) >= 3:
+            # 最后一轮 + 有足够历史 → crossover
+            print(f"  [crossover] 基于 {len(discoveries)} 个历史因子重组")
+            hypotheses = crossover_hypotheses(discoveries, ctx.load(), BATCH_SIZE)
+        else:
+            # 种子轮转生成
+            seed = SEED_CATEGORIES[seed_index % len(SEED_CATEGORIES)]
+            seed_index += 1
+            print(f"  [seed] 方向: {seed['focus']}")
+            hypotheses = generate_hypotheses(
+                ctx.load(), existing, batch_size=BATCH_SIZE,
+                seed=seed,
+            )
+
         print(f"  生成假说: {len(hypotheses)} 个")
         all_hypotheses.extend(hypotheses)
 
         if not hypotheses:
             failed_approaches.append(f"cycle_{cycle+1}: Claude 未返回有效假说")
-            focus = "之前方向无效，请尝试完全不同的因子类型"
             continue
 
         # 静态验证
@@ -243,7 +275,6 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
 
         if not valid:
             failed_approaches.append(f"cycle_{cycle+1}: 所有因子验证失败")
-            focus = "之前表达式有语法错误，请更仔细构造"
             continue
 
         # IC/ICIR 评估
@@ -261,7 +292,21 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
         promising_df = eval_df[eval_df["is_promising"]] if not eval_df.empty else eval_df
         if promising_df.empty:
             failed_approaches.append(f"cycle_{cycle+1}: 无 promising 因子 (|ICIR|<0.5)")
-            focus = "之前因子预测力不足，请尝试更强的信号因子"
+            # 收集 near-miss (0.3 ≤ |ICIR| < 0.5) 供下轮 mutation
+            if not eval_df.empty:
+                nm_df = eval_df[(eval_df["ICIR"].abs() >= 0.3) & (eval_df["ICIR"].abs() < 0.5)]
+                for _, row in nm_df.iterrows():
+                    h_info = next((h for h in valid if h["name"] == row["factor"]), {})
+                    near_miss_factors.append({
+                        "name": row["factor"],
+                        "expr": h_info.get("expr", ""),
+                        "hypothesis": h_info.get("hypothesis", ""),
+                        "icir": float(row["ICIR"]),
+                        "is_redundant": False,
+                        "max_corr": 0,
+                    })
+                if near_miss_factors:
+                    print(f"  发现 {len(near_miss_factors)} 个 near-miss 因子 (0.3≤|ICIR|<0.5)")
             continue
 
         # 冗余检测
@@ -279,7 +324,7 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
         for n, e in promising_tuples:
             h_info = next((h for h in valid if h["name"] == n), {})
             icir = float(eval_df[eval_df["factor"] == n]["ICIR"].iloc[0]) if not eval_df[eval_df["factor"] == n].empty else 0
-            promising_factors.append({
+            factor_detail = {
                 "name": n,
                 "expr": e,
                 "icir": icir,
@@ -287,7 +332,12 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
                 "category": h_info.get("category", ""),
                 "is_redundant": redundancy.get(n, {}).get("is_redundant", False),
                 "max_corr": redundancy.get(n, {}).get("max_corr", 0),
-            })
+                "most_correlated": redundancy.get(n, {}).get("most_correlated", ""),
+            }
+            promising_factors.append(factor_detail)
+            # 冗余且 |ICIR| ≥ 0.3 的 promising 因子也收集为 near-miss (供 mutation 差异化)
+            if factor_detail["is_redundant"] and abs(factor_detail["icir"]) >= 0.3:
+                near_miss_factors.append(factor_detail)
 
         non_redundant_factors.extend(non_redundant)
         if non_redundant:
@@ -295,7 +345,8 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
             break  # 有发现，进入回测
 
         failed_approaches.append(f"cycle_{cycle+1}: promising 因子全部冗余")
-        focus = "之前因子与已有因子高相关，请设计更独特的因子"
+        if near_miss_factors:
+            print(f"  收集 {len(near_miss_factors)} 个 near-miss/冗余因子待 mutation")
 
     # 3. 回测对比
     backtest = None
@@ -333,14 +384,14 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
     run_result["next_directions"] = next_directions
 
     run_file = RUNS_DIR / f"{run_id}.json"
-    run_file.write_text(json.dumps(run_result, ensure_ascii=False, indent=2), encoding="utf-8")
+    run_file.write_text(json.dumps(run_result, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
     print(f"\n  审计记录: {run_file}")
 
     # 保存 discovery
     for pf in promising_factors:
         if not pf.get("is_redundant"):
             disc_file = DISCOVERIES_DIR / f"{run_id}_{pf['name']}.json"
-            disc_file.write_text(json.dumps(pf, ensure_ascii=False, indent=2), encoding="utf-8")
+            disc_file.write_text(json.dumps(pf, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
 
     # 5. 更新 context
     ctx.update_after_run(run_result)
@@ -546,12 +597,778 @@ def accept_run(run_id: str):
         print("\n注意: shadow 创建失败，因子已写入 mined.py 但未启动验证")
 
 
+# ============================================================================
+# 演化式挖掘 (QuantaAlpha 风格, --evolved 默认)
+# ============================================================================
+
+EVOLVED_TOTAL_TIMEOUT = 28800  # 演化式挖掘总超时 (8h, 8方向×6轮需~5h)
+
+
+def run_evolved_mining(dry_run: bool = False, smoke_test: bool = False):
+    """演化式因子挖掘 (QuantaAlpha 风格)
+
+    流程:
+    1. Planning: Claude 生成 N 个搜索方向
+    2. Round 0 (Original): 每个方向 → 5步循环 → TrajectoryPool
+    3. Round 1+ (Mutation/Crossover 交替): 演化搜索
+    4. Final: FactorPool 量化准入因子 → D_expand 最终验证 → shadow/mined.py
+    """
+    from factor_lab.quanta.config import EVOLVED_N_DIRECTIONS, EVOLVED_N_ROUNDS
+    from factor_lab.quanta.trajectory import TrajectoryPool, Trajectory
+    from factor_lab.quanta.factor_pool import FactorPool
+    from factor_lab.quanta.evolution import (
+        mutate_trajectory, get_mutation_targets,
+        get_crossover_candidates, select_crossover_groups, crossover_trajectories,
+    )
+    from factor_lab.quanta import idea_agent, factor_agent, eval_agent
+    from factor_lab.mining.planning_agent import plan_directions
+    from factor_lab.mining.context import MiningContext
+
+    t_start = time.time()
+    run_id = _next_run_id()
+    today = date.today().isoformat()
+
+    n_dirs = 3 if smoke_test else EVOLVED_N_DIRECTIONS
+    n_rounds = 2 if smoke_test else EVOLVED_N_ROUNDS
+
+    print(f"\n{'='*60}")
+    print(f"  演化式因子挖掘 — {run_id} ({today})")
+    print(f"  模式: {'smoke-test' if smoke_test else 'evolved'}")
+    print(f"  方向: {n_dirs} | 轮次: {n_rounds}")
+    print(f"{'='*60}")
+
+    # 初始化 Qlib
+    _init_qlib()
+
+    # 1. 初始化 TrajectoryPool + FactorPool (支持断点恢复)
+    pool_dir = MINING_DIR / "trajectory_pool" / run_id
+    pool = TrajectoryPool(save_dir=pool_dir)
+    pool.load()  # 尝试从上次断点恢复
+
+    factor_pool = FactorPool(save_dir=pool_dir)
+    factor_pool.load()
+
+    if pool.size > 0:
+        print(f"  从断点恢复: {pool.size} 条轨迹, {factor_pool.size} 个入池因子")
+
+    # 2. Planning: 生成搜索方向 (优先从断点恢复)
+    print(f"\n  === Phase 1: 方向规划 ===")
+    ctx = MiningContext()
+    context_text = ctx.load()
+    directions_file = pool_dir / "directions.json"
+    if directions_file.exists():
+        directions = json.loads(directions_file.read_text(encoding="utf-8"))
+        print(f"  从断点恢复 {len(directions)} 个方向")
+    else:
+        directions = plan_directions(context_text, n_dirs)
+        pool_dir.mkdir(parents=True, exist_ok=True)
+        directions_file.write_text(
+            json.dumps(directions, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    print(f"  搜索方向 ({len(directions)} 个):")
+    for i, d in enumerate(directions):
+        print(f"    [{i}] {d['direction']}: {d['hypothesis'][:60]}...")
+
+    # 3. Round 0 (Original): 每个方向 → 5步循环
+    print(f"\n  === Phase 2: Round 0 (Original) ===")
+    existing_init = pool.get_by_phase("init")
+    existing_init_dirs = {t.direction_id for t in existing_init}
+
+    for d_idx, direction in enumerate(directions):
+        if time.time() - t_start > EVOLVED_TOTAL_TIMEOUT:
+            print(f"  [超时] 总运行超过 {EVOLVED_TOTAL_TIMEOUT}s")
+            break
+
+        if d_idx in existing_init_dirs:
+            print(f"\n  --- Direction {d_idx}/{n_dirs} (已有, 跳过) ---")
+            continue
+
+        print(f"\n  --- Direction {d_idx}/{n_dirs}: {direction['direction']} ---")
+        traj = _run_original_5step(direction, d_idx, pool, dry_run,
+                                   factor_pool=factor_pool)
+        _try_admit_to_pool(traj, factor_pool, 0)
+        pool.save()
+        factor_pool.save()
+
+        if traj and traj.failure_step == -1:
+            print(f"    结果: ICIR={traj.icir:.4f}, reward={traj.reward:.4f}")
+        elif traj:
+            print(f"    结果: 失败@step{traj.failure_step}")
+
+    # 4. Rounds 1+ (Mutation/Crossover 交替)
+    for round_idx in range(1, n_rounds):
+        if time.time() - t_start > EVOLVED_TOTAL_TIMEOUT:
+            print(f"  [超时] 总运行超过 {EVOLVED_TOTAL_TIMEOUT}s")
+            break
+
+        phase = "mutation" if round_idx % 2 == 1 else "crossover"
+        print(f"\n  === Phase {round_idx + 2}: Round {round_idx} ({phase}) ===")
+
+        if phase == "mutation":
+            targets = get_mutation_targets(pool, round_idx)
+            if not targets:
+                print(f"    无可用 mutation 目标, 跳过")
+                continue
+            print(f"    Mutation 目标: {len(targets)} 个轨迹")
+            for parent in targets:
+                if time.time() - t_start > EVOLVED_TOTAL_TIMEOUT:
+                    break
+                print(f"\n    [Mutation] Parent: {parent.id} (ICIR={parent.icir:.4f})")
+                traj = mutate_trajectory(parent, round_idx, pool, dry_run=dry_run,
+                                         factor_pool=factor_pool)
+                _try_admit_to_pool(traj, factor_pool, round_idx)
+                pool.save()
+                factor_pool.save()
+                if traj and traj.failure_step == -1:
+                    print(f"    结果: ICIR={traj.icir:.4f}, reward={traj.reward:.4f}")
+        else:
+            candidates = get_crossover_candidates(pool, round_idx)
+            if not candidates:
+                print(f"    无可用 crossover 候选, 跳过")
+                continue
+            groups = select_crossover_groups(candidates)
+            print(f"    Crossover 组合: {len(groups)} 组 (from {len(candidates)} 候选)")
+            for g_idx, group in enumerate(groups):
+                if time.time() - t_start > EVOLVED_TOTAL_TIMEOUT:
+                    break
+                parent_ids = [p.id for p in group]
+                print(f"\n    [Crossover] Group {g_idx}: {parent_ids}")
+                traj = crossover_trajectories(group, round_idx, pool, g_idx, dry_run=dry_run,
+                                              factor_pool=factor_pool)
+                _try_admit_to_pool(traj, factor_pool, round_idx)
+                pool.save()
+                factor_pool.save()
+                if traj and traj.failure_step == -1:
+                    print(f"    结果: ICIR={traj.icir:.4f}, reward={traj.reward:.4f}")
+
+    # 5. 从 FactorPool 收集量化准入的因子 (质量筛选)
+    print(f"\n  === Phase Final: 收集 + 最终评估 ===")
+    all_pool = factor_pool.get_exprs()
+    admitted = factor_pool.get_quality_exprs()
+    if len(admitted) < len(all_pool):
+        filtered_out = len(all_pool) - len(admitted)
+        print(f"  质量筛选: {len(all_pool)} 入池 → {len(admitted)} 通过 ({filtered_out} 过滤)")
+        # 打印被过滤的因子
+        admitted_names = {n for n, _ in admitted}
+        for pf in factor_pool.get_all():
+            if pf.name not in admitted_names:
+                print(f"    过滤: {pf.name} (ICIR={pf.icir:.3f}, RankIC={pf.rank_ic:.4f})")
+    stats = pool.stats()
+    fp_stats = factor_pool.stats()
+
+    print(f"  轨迹池统计:")
+    print(f"    总计: {stats['total']} (成功 {stats['successful']}, 失败 {stats['failed']})")
+    print(f"    阶段: init={stats['by_phase']['init']}, "
+          f"mutation={stats['by_phase']['mutation']}, "
+          f"crossover={stats['by_phase']['crossover']}")
+    print(f"    平均 reward: {stats['avg_reward']:.4f}, 最大: {stats['max_reward']:.4f}")
+    print(f"  因子池统计:")
+    print(f"    入池: {fp_stats['size']}/{fp_stats['capacity']} "
+          f"(尝试 {fp_stats['total_attempted']})")
+    print(f"    平均|RankIC|: {fp_stats['avg_rank_ic']:.4f}, "
+          f"最大: {fp_stats['max_rank_ic']:.4f}")
+    print(f"    入池因子: {len(admitted)} 个")
+
+    if admitted:
+        print(f"\n  入池因子列表:")
+        for name, expr in admitted:
+            print(f"    + {name}: {expr[:60]}")
+
+    # 6. 最终 D_expand 评估 + shadow/mined.py
+    backtest = None
+    if admitted and not dry_run:
+        print(f"\n  === 全量 Rolling 回测 ({len(admitted)} 新因子) ===")
+        try:
+            from factor_lab.mining.backtest_runner import run_comparison
+            backtest = run_comparison(admitted)
+        except Exception as e:
+            print(f"  [backtest] 回测失败: {e}")
+            backtest = {"error": str(e)}
+
+    # 7. 保存审计记录
+    # 构建 promising factors 列表 (从 pool 中提取)
+    promising_factors = []
+    for traj in pool.get_successful():
+        if traj.best_factor:
+            promising_factors.append({
+                "name": traj.best_factor['name'],
+                "expr": traj.best_factor['expr'],
+                "icir": traj.icir,
+                "hypothesis": traj.hypothesis[:200],
+                "category": traj.direction,
+                "phase": traj.phase,
+                "is_redundant": False,
+                "max_corr": 0,
+            })
+
+    run_result = {
+        "run_id": run_id,
+        "date": today,
+        "mode": "evolved" + ("-smoke" if smoke_test else ""),
+        "factors_tested": stats['total'],
+        "hypotheses_generated": stats['total'],
+        "promising_count": len(admitted),
+        "promising_factors": promising_factors,
+        "non_redundant": [{"name": n, "expr": e} for n, e in admitted],
+        "backtest": backtest,
+        "pool_stats": stats,
+        "directions": [d.get('direction', '') for d in directions],
+        "total_time": round(time.time() - t_start, 1),
+    }
+
+    run_file = RUNS_DIR / f"{run_id}.json"
+    run_file.write_text(
+        json.dumps(run_result, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    print(f"\n  审计记录: {run_file}")
+
+    # 保存 discovery
+    for pf in promising_factors:
+        if not pf.get("is_redundant"):
+            disc_file = DISCOVERIES_DIR / f"{run_id}_{pf['name']}.json"
+            disc_file.write_text(
+                json.dumps(pf, ensure_ascii=False, indent=2, default=_json_default),
+                encoding="utf-8",
+            )
+
+    # 更新 context
+    ctx.update_after_run(run_result)
+    print(f"  Agent 记忆已更新")
+
+    # 8. 通知
+    beat_baseline = (backtest and isinstance(backtest, dict)
+                     and backtest.get("improvement", {}).get("is_better"))
+    run_result["beat_baseline"] = beat_baseline
+
+    if beat_baseline and not dry_run:
+        _accept_factors_to_mined(admitted, run_id)
+        shadow_id = _create_shadow_for_run(run_id, backtest)
+        msg = _build_evolved_message(run_result, backtest, stats)
+        if shadow_id:
+            msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
+        _push_feishu(msg)
+    elif admitted and not dry_run:
+        names = [n for n, _ in admitted[:5]]
+        msg = (f"🧬 演化式因子挖掘 #{run_id}\n"
+               f"轨迹: {stats['total']} | ACCEPT: {len(admitted)} 因子\n"
+               f"因子: {', '.join(names)}\n"
+               f"{'回测未超越 M01' if backtest else '未执行回测'}")
+        _push_feishu(msg)
+
+    # 打印总结
+    print(f"\n{'='*60}")
+    print(f"  总结: {stats['total']} 轨迹, "
+          f"成功 {stats['successful']}, "
+          f"ACCEPT {len(admitted)}")
+    if backtest and "baseline" in backtest:
+        print(f"  回测: Sharpe {backtest['candidate']['sharpe']:.3f} "
+              f"(baseline {backtest['baseline']['sharpe']:.3f}, "
+              f"delta {backtest['improvement']['sharpe_delta']:+.3f})")
+    print(f"  耗时: {time.time() - t_start:.1f}s")
+    print(f"{'='*60}")
+
+
+def _try_admit_to_pool(traj, factor_pool, iteration):
+    """尝试将轨迹的最佳因子加入池"""
+    if traj and traj.best_factor and traj.failure_step == -1:
+        admitted, reason = factor_pool.try_admit(
+            name=traj.best_factor['name'],
+            expr=traj.best_factor['expr'],
+            rank_ic=traj.rank_ic,
+            icir=traj.icir,
+            hypothesis=traj.hypothesis,
+            direction=traj.direction,
+            source_traj_id=traj.id,
+            iteration=iteration,
+        )
+        status = "ADMITTED" if admitted else "REJECTED"
+        print(f"    因子池: {status} — {reason}")
+
+
+def _run_original_5step(direction: dict, d_idx: int,
+                        pool, dry_run: bool = False,
+                        factor_pool=None):
+    """Round 0: 对一个方向执行 5 步循环 (Original)
+
+    复用 evolution.py 的 mutate_trajectory 结构,
+    但不需要 parent (这是初始轮)。
+    """
+    from factor_lab.quanta.trajectory import Trajectory
+    from factor_lab.quanta.config import N_CANDIDATES, HISTORY_LIMIT, BACKTEST_ENABLED, ROLLING_EVAL_LITE
+    from factor_lab.quanta import idea_agent, factor_agent, eval_agent
+
+    direction_trace = pool.get_direction_trace(d_idx)
+
+    traj = Trajectory(
+        direction_id=d_idx,
+        iteration=0,
+        phase="init",
+        parent_ids=[],
+    )
+
+    # --- Step 1: Propose ---
+    print(f"    [Step 1] Propose (initial hypothesis)")
+    hyp = idea_agent.generate_hypothesis_with_trace(
+        direction_trace=direction_trace,
+        direction=direction.get('direction', ''),
+        suffix="",
+        history_limit=HISTORY_LIMIT,
+    )
+    traj.hypothesis = hyp.get('hypothesis', direction.get('hypothesis', ''))
+    traj.direction = hyp.get('direction', direction.get('direction', ''))
+    traj.mechanism = hyp.get('mechanism', direction.get('mechanism', ''))
+    traj.claude_calls += 1
+
+    if dry_run:
+        print(f"    [dry-run] 假说: {traj.hypothesis[:80]}...")
+        traj.compute_reward()
+        pool.add(traj)
+        return traj
+
+    # --- Step 2: Construct ---
+    print(f"    [Step 2] Construct (with regen loop)")
+    trace_text = direction_trace.render_for_prompt()
+    factor_list_text = direction_trace.render_factor_list_for_prompt()
+
+    candidates, regen_count = factor_agent.construct_factors_with_regen(
+        hypothesis=hyp,
+        n=N_CANDIDATES,
+        trace_text=trace_text,
+        factor_list_text=factor_list_text,
+    )
+    traj.claude_calls += 1 + regen_count
+    traj.regen_attempts = regen_count
+
+    if not candidates:
+        traj.failure_step = 1
+        traj.error_msg = f"再生循环 {regen_count} 次后仍无有效候选"
+        _finalize_original_trace(traj, pool, direction_trace)
+        return traj
+
+    traj.factor_candidates = candidates
+
+    # --- Step 3: Calculate ---
+    print(f"    [Step 3] Calculate (validate + evaluate)")
+    eval_agent.run_validation_pipeline(traj, candidates)
+
+    # --- Step 4: Backtest ---
+    if BACKTEST_ENABLED and traj.best_factor and traj.failure_step == -1:
+        use_rolling = ROLLING_EVAL_LITE
+        new_factors = [(traj.best_factor['name'], traj.best_factor['expr'])]
+        from factor_lab.quanta.evolution import _get_sota_factors
+        sota_factors = _get_sota_factors(direction_trace, factor_pool=factor_pool)
+        print(f"    [Step 4] Backtest ({'rolling-lite' if use_rolling else 'single-shot'}, "
+              f"sota={len(sota_factors)} factors)")
+        bt_metrics = eval_agent.run_combined_backtest(new_factors, sota_factors, use_rolling=use_rolling)
+        traj.backtest_metrics = bt_metrics
+    else:
+        print(f"    [Step 4] Backtest (skipped)")
+
+    # --- Step 5: Feedback ---
+    _finalize_original_trace(traj, pool, direction_trace)
+    return traj
+
+
+def _finalize_original_trace(traj, pool, direction_trace):
+    """Step 5 for original: Feedback + compute_reward + add to pool"""
+    from factor_lab.quanta.evolution import _finalize_trace
+    _finalize_trace(traj, pool, direction_trace)
+
+
+def _build_evolved_message(run_result: dict, backtest: dict, stats: dict) -> str:
+    """构建演化式挖掘的飞书通知"""
+    run_id = run_result.get("run_id", "?")
+    dt = run_result.get("date", "?")
+
+    lines = [
+        f"🧬 演化式因子挖掘 — 发现候选因子",
+        "",
+        f"运行: #{run_id} ({dt})",
+        f"轨迹: {stats.get('total', 0)} | 成功: {stats.get('successful', 0)}",
+        f"ACCEPT: {run_result.get('promising_count', 0)} 个因子",
+    ]
+
+    # 最佳发现
+    best_factors = run_result.get("promising_factors", [])
+    if best_factors:
+        best_sorted = sorted(best_factors, key=lambda f: abs(f.get('icir', 0)), reverse=True)
+        lines.append("")
+        lines.append("【最佳发现】")
+        for f in best_sorted[:3]:
+            lines.append(f"  {f['name']} (ICIR={f.get('icir', 0):.3f}, {f.get('phase', '')})")
+            lines.append(f"  {f.get('expr', '')[:80]}")
+            lines.append("")
+
+    # 回测对比
+    if backtest and "baseline" in backtest:
+        bl = backtest["baseline"]
+        cd = backtest["candidate"]
+        imp = backtest["improvement"]
+        lines.append("回测对比 (vs M01-LGB-D3v3r-v2602):")
+        lines.append(f"  M01:  Sharpe {bl['sharpe']:.3f} | MDD {bl['mdd']:.2%} | Return {bl['return']:.0%}")
+        lines.append(f"  候选: Sharpe {cd['sharpe']:.3f} | MDD {cd['mdd']:.2%} | Return {cd['return']:.0%}")
+        mark = "BETTER" if imp["is_better"] else "no improvement"
+        lines.append(f"  提升: {imp['sharpe_delta']:+.3f} Sharpe ({mark})")
+
+    lines.append("")
+    lines.append(f"接受命令: python -m factor_lab.factor_miner --accept {run_id}")
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# 每日渐进式挖掘 (--daily)
+# ============================================================================
+
+GLOBAL_POOL_FILE = "global_factor_pool.json"
+DIRECTION_REGISTRY_FILE = MINING_DIR / "direction_registry.json"
+
+
+def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
+    """每日渐进式挖掘 — 全局 FactorPool + DirectionRegistry
+
+    Phase A: 加载全局状态，判断是否需要规划新方向
+    Phase B: 广度 — 探索 pending 方向
+    Phase C: 深度 — 对有潜力的方向做 mutation
+    Phase D: 质量筛选 → 全量回测 → beat_baseline 则写 mined.py + shadow
+    """
+    from factor_lab.quanta.config import (
+        DAILY_TOTAL_TIMEOUT, DAILY_N_DIRECTIONS, DAILY_BREADTH_STEPS,
+    )
+    from factor_lab.quanta.trajectory import TrajectoryPool
+    from factor_lab.quanta.factor_pool import FactorPool
+    from factor_lab.quanta.evolution import mutate_trajectory
+    from factor_lab.mining.planning_agent import plan_directions
+    from factor_lab.mining.direction_registry import DirectionRegistry
+    from factor_lab.mining.context import MiningContext
+
+    t_start = time.time()
+    run_id = _next_run_id()
+    today = date.today().isoformat()
+    timeout = 3600 if smoke_test else DAILY_TOTAL_TIMEOUT
+
+    print(f"\n{'='*60}")
+    print(f"  每日渐进式挖掘 — {run_id} ({today})")
+    print(f"  模式: {'smoke-test' if smoke_test else 'daily'}")
+    print(f"  时间预算: {timeout/3600:.1f}h")
+    print(f"{'='*60}")
+
+    # 初始化 Qlib
+    _init_qlib()
+
+    # --- Phase A: 加载全局状态 ---
+    print(f"\n  === Phase A: 加载全局状态 ===")
+
+    # 全局 FactorPool (跨天累积)
+    global_pool = FactorPool(save_dir=MINING_DIR)
+    global_pool.load(GLOBAL_POOL_FILE)
+    print(f"  全局因子池: {global_pool.size} 个因子")
+
+    # DirectionRegistry (方向注册表)
+    registry = DirectionRegistry(save_path=DIRECTION_REGISTRY_FILE)
+    registry.load()
+    reg_stats = registry.stats()
+    print(f"  方向注册表: {reg_stats['total']} 个方向 ({reg_stats['by_status']})")
+
+    # 本次 session 的 TrajectoryPool (按 run_id 隔离)
+    pool_dir = MINING_DIR / "trajectory_pool" / run_id
+    pool = TrajectoryPool(save_dir=pool_dir)
+
+    # 判断是否需要新规划
+    ctx = MiningContext()
+    context_text = ctx.load()
+    n_plan = 2 if smoke_test else DAILY_N_DIRECTIONS
+
+    if registry.needs_new_planning():
+        print(f"\n  需要新规划 (pending=0, depth_targets=0)")
+        explored_summary = registry.get_explored_summary()
+        directions = plan_directions(context_text, n_plan,
+                                     explored_summary=explored_summary)
+        registry.add_directions(directions, run_id)
+        registry.save()
+        print(f"  已规划 {len(directions)} 个新方向:")
+        for d in directions:
+            print(f"    + {d['direction']}: {d['hypothesis'][:60]}...")
+    else:
+        print(f"  无需新规划")
+
+    # 计算广度/深度比例
+    pending = registry.get_pending(limit=100)
+    depth_targets = registry.get_depth_targets(limit=100)
+    if len(pending) >= 5:
+        breadth_ratio = 0.70
+    elif len(depth_targets) >= 3:
+        breadth_ratio = 0.40
+    else:
+        breadth_ratio = 0.60
+
+    remaining = timeout - (time.time() - t_start)
+    reserve_final = 600  # Phase D 预留 10min
+    work_time = max(remaining - reserve_final, 0)
+    breadth_time = work_time * breadth_ratio
+    depth_time = work_time * (1 - breadth_ratio)
+    print(f"\n  时间分配: 广度 {breadth_time/60:.0f}min ({breadth_ratio:.0%}) | "
+          f"深度 {depth_time/60:.0f}min ({1-breadth_ratio:.0%}) | "
+          f"预留 {reserve_final/60:.0f}min")
+
+    factors_admitted_this_session = 0
+
+    # --- Phase B: 广度 — 探索 pending 方向 ---
+    print(f"\n  === Phase B: 广度探索 ===")
+    breadth_deadline = time.time() + breadth_time
+    pending_dirs = registry.get_pending(limit=20)
+    if smoke_test:
+        pending_dirs = pending_dirs[:2]
+    print(f"  待探索方向: {len(pending_dirs)} 个")
+
+    for d_entry in pending_dirs:
+        if time.time() > breadth_deadline:
+            print(f"  [广度超时]")
+            break
+
+        dir_id = d_entry["id"]
+        print(f"\n  --- [{dir_id}] {d_entry['direction']} ---")
+        registry.mark_exploring(dir_id)
+
+        direction = {
+            "direction": d_entry["direction"],
+            "hypothesis": d_entry["hypothesis"],
+            "mechanism": d_entry.get("mechanism", ""),
+            "time_scale": d_entry.get("time_scale", ""),
+        }
+
+        # 用 direction_id = dir_NNN 的数字部分
+        d_idx = int(dir_id.split("_")[1])
+        traj = _run_original_5step(direction, d_idx, pool, dry_run,
+                                   factor_pool=global_pool)
+
+        # 尝试入池
+        admitted = False
+        if traj and traj.best_factor and traj.failure_step == -1:
+            ok, reason = global_pool.try_admit(
+                name=traj.best_factor['name'],
+                expr=traj.best_factor['expr'],
+                rank_ic=traj.rank_ic,
+                icir=traj.icir,
+                hypothesis=traj.hypothesis,
+                direction=traj.direction,
+                source_traj_id=traj.id,
+                iteration=0,
+            )
+            admitted = ok
+            print(f"    因子池: {'ADMITTED' if ok else 'REJECTED'} — {reason}")
+
+        registry.record_result(dir_id, admitted=admitted,
+                               icir=traj.icir if traj else 0.0,
+                               session_id=run_id)
+        if admitted:
+            factors_admitted_this_session += 1
+
+        # 每条轨迹后保存
+        pool.save()
+        global_pool.save(GLOBAL_POOL_FILE)
+        registry.save()
+
+    # --- Phase C: 深度 — mutation ---
+    print(f"\n  === Phase C: 深度挖掘 ===")
+    depth_deadline = time.time() + depth_time
+    depth_dirs = registry.get_depth_targets(limit=10)
+    if not depth_dirs:
+        depth_dirs = registry.get_explorable(limit=5)
+    if smoke_test:
+        depth_dirs = depth_dirs[:1]
+    print(f"  深度目标: {len(depth_dirs)} 个方向")
+
+    for d_entry in depth_dirs:
+        if time.time() > depth_deadline:
+            print(f"  [深度超时]")
+            break
+
+        dir_id = d_entry["id"]
+        print(f"\n  --- [Mutation] {dir_id}: {d_entry['direction']} "
+              f"(ICIR={d_entry['best_icir']:.3f}) ---")
+
+        # 找到该方向在 pool 中的最佳轨迹作为 parent
+        d_idx = int(dir_id.split("_")[1])
+        direction_trajs = [t for t in pool.get_successful()
+                           if t.direction_id == d_idx]
+        if not direction_trajs:
+            # 没有本 session 的轨迹，跳过
+            print(f"    无可用 parent, 跳过")
+            continue
+
+        parent = max(direction_trajs, key=lambda t: t.reward)
+        print(f"    Parent: {parent.id} (ICIR={parent.icir:.4f})")
+
+        traj = mutate_trajectory(parent, 1, pool, dry_run=dry_run,
+                                 factor_pool=global_pool)
+
+        admitted = False
+        if traj and traj.best_factor and traj.failure_step == -1:
+            ok, reason = global_pool.try_admit(
+                name=traj.best_factor['name'],
+                expr=traj.best_factor['expr'],
+                rank_ic=traj.rank_ic,
+                icir=traj.icir,
+                hypothesis=traj.hypothesis,
+                direction=traj.direction,
+                source_traj_id=traj.id,
+                iteration=1,
+            )
+            admitted = ok
+            print(f"    因子池: {'ADMITTED' if ok else 'REJECTED'} — {reason}")
+
+        registry.record_result(dir_id, admitted=admitted,
+                               icir=traj.icir if traj else 0.0,
+                               session_id=run_id)
+        if admitted:
+            factors_admitted_this_session += 1
+
+        pool.save()
+        global_pool.save(GLOBAL_POOL_FILE)
+        registry.save()
+
+    # --- Phase D: 质量筛选 → 全量回测 → mined.py ---
+    print(f"\n  === Phase D: 最终评估 ===")
+    quality_factors = global_pool.get_quality_exprs()
+    all_pool_factors = global_pool.get_exprs()
+    fp_stats = global_pool.stats()
+    reg_stats = registry.stats()
+
+    print(f"  全局因子池: {fp_stats['size']} 个因子 (质量因子: {len(quality_factors)})")
+    print(f"  本次新增: {factors_admitted_this_session} 个因子")
+    print(f"  方向状态: {reg_stats['by_status']}")
+
+    if quality_factors:
+        print(f"\n  质量因子列表:")
+        for name, expr in quality_factors:
+            print(f"    + {name}: {expr[:60]}")
+
+    # 有新增因子才做最终回测
+    backtest = None
+    if quality_factors and factors_admitted_this_session > 0 and not dry_run:
+        print(f"\n  === 全量 Rolling 回测 ({len(quality_factors)} 质量因子) ===")
+        try:
+            from factor_lab.mining.backtest_runner import run_comparison
+            backtest = run_comparison(quality_factors)
+        except Exception as e:
+            print(f"  [backtest] 回测失败: {e}")
+            backtest = {"error": str(e)}
+
+    # 保存审计记录
+    pool_stats = pool.stats()
+    run_result = {
+        "run_id": run_id,
+        "date": today,
+        "mode": "daily" + ("-smoke" if smoke_test else ""),
+        "factors_tested": pool_stats['total'],
+        "hypotheses_generated": pool_stats['total'],
+        "promising_count": len(quality_factors),
+        "promising_factors": [
+            {"name": n, "expr": e} for n, e in quality_factors
+        ],
+        "non_redundant": [{"name": n, "expr": e} for n, e in quality_factors],
+        "backtest": backtest,
+        "pool_stats": pool_stats,
+        "global_pool_size": fp_stats['size'],
+        "direction_stats": reg_stats,
+        "factors_admitted_this_session": factors_admitted_this_session,
+        "total_time": round(time.time() - t_start, 1),
+    }
+
+    run_file = RUNS_DIR / f"{run_id}.json"
+    run_file.write_text(
+        json.dumps(run_result, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    print(f"\n  审计记录: {run_file}")
+
+    # 更新 context
+    ctx.update_after_run(run_result)
+
+    # 通知 + mined.py + shadow
+    beat_baseline = (backtest and isinstance(backtest, dict)
+                     and backtest.get("improvement", {}).get("is_better"))
+    run_result["beat_baseline"] = beat_baseline
+
+    if beat_baseline and not dry_run:
+        _accept_factors_to_mined(quality_factors, run_id)
+        shadow_id = _create_shadow_for_run(run_id, backtest)
+        msg = _build_daily_message(run_result, backtest, reg_stats)
+        if shadow_id:
+            msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
+        _push_feishu(msg)
+    elif factors_admitted_this_session > 0 and not dry_run:
+        msg = (f"📅 每日因子挖掘 #{run_id}\n"
+               f"新增: {factors_admitted_this_session} 因子 | "
+               f"全局池: {fp_stats['size']}\n"
+               f"{'回测未超越 M01' if backtest else '未执行回测 (无新质量因子)'}")
+        _push_feishu(msg)
+
+    # 打印总结
+    print(f"\n{'='*60}")
+    print(f"  总结: {pool_stats['total']} 轨迹, "
+          f"新增 {factors_admitted_this_session} 因子, "
+          f"全局池 {fp_stats['size']}")
+    if backtest and "baseline" in backtest:
+        print(f"  回测: Sharpe {backtest['candidate']['sharpe']:.3f} "
+              f"(baseline {backtest['baseline']['sharpe']:.3f}, "
+              f"delta {backtest['improvement']['sharpe_delta']:+.3f})")
+    print(f"  耗时: {time.time() - t_start:.1f}s")
+    print(f"{'='*60}")
+
+
+def _build_daily_message(run_result: dict, backtest: dict, reg_stats: dict) -> str:
+    """构建每日挖掘的飞书通知"""
+    run_id = run_result.get("run_id", "?")
+    dt = run_result.get("date", "?")
+    new_count = run_result.get("factors_admitted_this_session", 0)
+    pool_size = run_result.get("global_pool_size", 0)
+
+    status_str = ", ".join(f"{k}={v}" for k, v in reg_stats.get("by_status", {}).items())
+    lines = [
+        f"📅 每日因子挖掘 — 发现候选因子",
+        "",
+        f"运行: #{run_id} ({dt})",
+        f"新增因子: {new_count} | 全局池: {pool_size}",
+        f"方向: {reg_stats.get('total', 0)} 个 ({status_str})",
+    ]
+
+    if backtest and "baseline" in backtest:
+        bl = backtest["baseline"]
+        cd = backtest["candidate"]
+        imp = backtest["improvement"]
+        lines.append("")
+        lines.append("回测对比 (vs M01-LGB-D3v3r-v2602):")
+        lines.append(f"  M01:  Sharpe {bl['sharpe']:.3f} | MDD {bl['mdd']:.2%} | Return {bl['return']:.0%}")
+        lines.append(f"  候选: Sharpe {cd['sharpe']:.3f} | MDD {cd['mdd']:.2%} | Return {cd['return']:.0%}")
+        mark = "BETTER" if imp["is_better"] else "no improvement"
+        lines.append(f"  提升: {imp['sharpe_delta']:+.3f} Sharpe ({mark})")
+
+    lines.append("")
+    lines.append(f"接受命令: python -m factor_lab.factor_miner --accept {run_id}")
+    return "\n".join(lines)
+
+
 def main():
     multiprocessing.set_start_method("fork", force=True)
 
     parser = argparse.ArgumentParser(description="自动因子挖掘")
+    # 模式选择 (互斥)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--daily", action="store_true",
+                            help="每日渐进式挖掘 (默认)")
+    mode_group.add_argument("--evolved", action="store_true",
+                            help="演化式挖掘 (单次全量)")
+    mode_group.add_argument("--legacy", action="store_true",
+                            help="旧流程 (4轮种子/mutation/crossover)")
+    # 通用参数
     parser.add_argument("--dry-run", action="store_true", help="不推送不回测")
     parser.add_argument("--skip-backtest", action="store_true", help="跳过回测")
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="快速验证 (3方向x2轮, 约35min)")
     parser.add_argument("--report", action="store_true", help="查看历史报告")
     parser.add_argument("--accept", type=str, help="接受某次运行的因子 (如 run_001)")
     args = parser.parse_args()
@@ -571,7 +1388,16 @@ def main():
         return
 
     try:
-        run_mining(dry_run=args.dry_run, skip_backtest=args.skip_backtest or args.dry_run)
+        if args.legacy:
+            run_mining(dry_run=args.dry_run,
+                       skip_backtest=args.skip_backtest or args.dry_run)
+        elif args.evolved:
+            run_evolved_mining(dry_run=args.dry_run,
+                               smoke_test=args.smoke_test)
+        else:
+            # 默认: 每日渐进式挖掘
+            run_daily_session(smoke_test=args.smoke_test,
+                              dry_run=args.dry_run)
     finally:
         _release_lock()
 
