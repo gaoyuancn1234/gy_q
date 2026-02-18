@@ -22,5 +22,17 @@
     },
     "reason": "Sharpe +0.143",
     "signal_config_path": "shadow/configs/shadow_002.yaml"
+  },
+  "shadow_003": {
+    "status": "active",
+    "created_date": "2026-02-18",
+    "source": "factor_miner:run_010",
+    "duration_days": 20,
+    "elapsed_days": 0,
+    "config_overrides": {
+      "preset": "alpha158_val_mined"
+    },
+    "reason": "Sharpe +0.517",
+    "signal_config_path": "shadow/configs/shadow_003.yaml"
   }
 }

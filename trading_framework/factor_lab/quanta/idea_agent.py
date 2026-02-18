@@ -30,7 +30,8 @@ WORK_DIR = Path(__file__).resolve().parent.parent.parent.parent  # repo root
 def generate_hypothesis_with_trace(direction_trace: DirectionTrace,
                                    direction: str,
                                    suffix: str = "",
-                                   history_limit: int = HISTORY_LIMIT) -> dict:
+                                   history_limit: int = HISTORY_LIMIT,
+                                   experience_memory=None) -> dict:
     """核心: 将 trace 历史 + evolution suffix 全部序列化到 Claude CLI prompt
 
     对齐论文 AlphaAgentHypothesisGen.gen(trace) + prepare_context() 的完整逻辑。
@@ -66,11 +67,18 @@ def generate_hypothesis_with_trace(direction_trace: DirectionTrace,
 ## 演化引导
 {suffix}"""
 
+    # experience memory (FactorMiner Section 3.3)
+    memory_section = ""
+    if experience_memory is not None:
+        memory_text = experience_memory.format_for_prompt()
+        if memory_text:
+            memory_section = f"\n{memory_text}\n"
+
     prompt = f"""你是一位资深量化研究员。请基于以下上下文生成一个投资假说，用于 A 股 CSI300 因子挖掘。
 
 {history_section}
 {suffix_section}
-
+{memory_section}
 ## 可用基础特征
 {features_str}
 (VWAP 需写为 Div($amount, $volume + 1e-8), 不能直接用 $vwap)

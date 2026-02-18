@@ -14,6 +14,7 @@ from factor_lab.utils import atomic_json_dump
 from .config import (
     REDUNDANCY_CORR, AST_SIMILARITY, POOL_CAP_RATIO, POOL_MAX,
     QUALITY_MIN_ABS_ICIR, QUALITY_MIN_ABS_RANK_IC,
+    REPLACE_IC_MIN, REPLACE_RATIO,
 )
 from .ast_dedup import ast_similarity
 
@@ -92,6 +93,63 @@ class FactorPool:
         ))
         self._sort()
         return True, f"admitted (pool={self.size}/{self.capacity})"
+
+    def try_replace(self, name: str, expr: str,
+                    rank_ic: float, icir: float,
+                    max_corr_factor: str, max_corr_value: float,
+                    ) -> bool:
+        """FactorMiner Section 3.4, Stage 2.5 替换机制
+
+        条件:
+          1. |IC(new)| >= REPLACE_IC_MIN
+          2. |IC(new)| >= REPLACE_RATIO * |IC(old)|
+          3. 仅1个因子超过 theta (在调用前已检查)
+          4. 新因子与非目标池成员无 AST 冗余
+
+        Returns:
+            True = 替换成功
+        """
+        if abs(rank_ic) < REPLACE_IC_MIN:
+            return False
+
+        # 名字唯一性
+        if name in {f.name for f in self._factors}:
+            return False
+
+        # 找到被替换的目标因子
+        target = None
+        for f in self._factors:
+            if f.name == max_corr_factor:
+                target = f
+                break
+
+        if target is None:
+            return False
+
+        # 检查替换倍数
+        if abs(target.rank_ic) > 0 and abs(rank_ic) < REPLACE_RATIO * abs(target.rank_ic):
+            return False
+
+        # 检查与非目标池成员的 AST 相似度
+        for f in self._factors:
+            if f.name == target.name:
+                continue
+            sim = ast_similarity(expr, f.expr)
+            if sim >= AST_SIMILARITY:
+                return False
+
+        # 执行替换
+        self._factors.remove(target)
+        self._factors.append(PoolFactor(
+            name=name, expr=expr,
+            rank_ic=rank_ic, icir=icir,
+            hypothesis=f"replaced:{target.name}",
+            direction="",
+        ))
+        self._sort()
+        print(f"    [replace] {name} (|IC|={abs(rank_ic):.4f}) 替换 "
+              f"{target.name} (|IC|={abs(target.rank_ic):.4f})")
+        return True
 
     def check_corr_redundancy(self, expr: str) -> tuple[bool, float, str]:
         """检查与池中因子的 Qlib 相关性 (需要 qlib.init)

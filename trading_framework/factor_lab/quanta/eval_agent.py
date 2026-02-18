@@ -20,6 +20,8 @@ from .config import (
     CLAUDE_CLI, CLAUDE_TIMEOUT, MAX_RETRY, RETRY_WAIT, get_claude_env,
     ROLLING_EVAL_LITE, ROLLING_EVAL_WINDOWS, ROLLING_EVAL_CONFIG,
     ROLLING_EVAL_TEST_START, ROLLING_EVAL_TEST_END,
+    FAST_IC_THRESHOLD, FAST_IC_PERIOD, CORRELATION_THRESHOLD,
+    REPLACE_IC_MIN, REPLACE_RATIO, BATCH_DEDUP_AST,
 )
 from .trajectory import Trajectory, HypothesisFeedback, TraceEntry, DirectionTrace
 
@@ -365,6 +367,194 @@ def _parse_feedback_json(output: str) -> Optional[HypothesisFeedback]:
         except (json.JSONDecodeError, AttributeError, TypeError):
             continue
     return None
+
+
+# ============ FactorMiner: 多阶段评估管道 ============
+
+def run_multistage_pipeline(traj, candidates: list[dict], factor_pool) -> None:
+    """FactorMiner Algorithm 1, Stage 1-4 多阶段评估
+
+    Stage 1: Fast IC screen (短时间窗口, tau_IC)
+    Stage 2: Correlation check vs factor_pool (theta)
+    Stage 2.5: Replacement check (被相关性拒绝但 IC 够强 → 替换)
+    Stage 3: Intra-batch dedup (AST similarity)
+    Stage 4: Full validation (现有逻辑)
+
+    仅在 --daily 模式且 USE_MULTISTAGE=True 时启用。
+    """
+    from factor_lab.mining.validator import validate_expression, validate_with_qlib
+    from . import factor_agent
+    from .ast_dedup import ast_similarity
+
+    # --- 预验证: 复杂度 + 静态 + Qlib 动态 ---
+    valid_candidates = []
+    for cand in candidates:
+        name = cand.get('name', '')
+        expr = cand.get('expr', '')
+
+        ok, reason = factor_agent.check_paper_complexity(expr)
+        if not ok:
+            print(f"    [{name}] 复杂度不通过: {reason}")
+            continue
+        traj.constraint_ok = True
+
+        ok, reason = validate_expression(name, expr)
+        if not ok:
+            fixed_name = name.upper().replace(' ', '_').replace('-', '_')
+            if not fixed_name.startswith('QA_'):
+                fixed_name = 'QA_' + fixed_name
+            ok, reason = validate_expression(fixed_name, expr)
+            if not ok:
+                print(f"    [{name}] 静态验证: {reason}")
+                continue
+            cand['name'] = fixed_name
+
+        ok, reason = validate_with_qlib(cand['name'], expr)
+        if not ok:
+            print(f"    [{cand['name']}] Qlib验证: {reason}")
+            traj.error_msg = reason
+            continue
+        traj.qlib_ok = True
+        valid_candidates.append(cand)
+
+    if not valid_candidates:
+        traj.failure_step = 1
+        traj.error_msg = traj.error_msg or "所有候选验证失败"
+        return
+
+    print(f"    [multistage] {len(valid_candidates)} 候选通过预验证")
+
+    # --- Stage 1: Fast IC screen ---
+    fast_start, fast_end = FAST_IC_PERIOD
+    fast_factors = [(c['name'], c['expr']) for c in valid_candidates]
+    fast_results = evaluate_candidates_batch(fast_factors, start_time=fast_start, end_time=fast_end)
+
+    stage1_pass = []
+    for cand, result in zip(valid_candidates, fast_results):
+        ic_abs = abs(result.get('rank_ic', 0))
+        if ic_abs >= FAST_IC_THRESHOLD:
+            cand['_fast_ic'] = result.get('rank_ic', 0)
+            cand['_fast_icir'] = result.get('icir', 0)
+            stage1_pass.append(cand)
+        else:
+            print(f"    [Stage 1] {cand['name']} 淘汰 (|IC|={ic_abs:.4f} < {FAST_IC_THRESHOLD})")
+
+    print(f"    [Stage 1] Fast IC: {len(stage1_pass)}/{len(valid_candidates)} 通过")
+    if not stage1_pass:
+        traj.failure_step = 2
+        traj.error_msg = "Stage 1: 所有候选 Fast IC 低于阈值"
+        return
+
+    # --- Stage 2: Correlation check vs factor_pool ---
+    stage2_pass = []
+    stage2_corr_rejected = []
+
+    pool_exprs = factor_pool.get_exprs() if factor_pool else []
+    for cand in stage1_pass:
+        if not pool_exprs:
+            stage2_pass.append(cand)
+            continue
+
+        max_corr = 0.0
+        max_corr_factor = ""
+        corr_count = 0  # 超过阈值的因子数
+
+        for pf_name, pf_expr in pool_exprs:
+            sim = ast_similarity(cand['expr'], pf_expr)
+            if sim > max_corr:
+                max_corr = sim
+                max_corr_factor = pf_name
+            if sim >= CORRELATION_THRESHOLD:
+                corr_count += 1
+
+        cand['_max_corr'] = max_corr
+        cand['_max_corr_factor'] = max_corr_factor
+        cand['_corr_count'] = corr_count
+
+        if max_corr < CORRELATION_THRESHOLD:
+            stage2_pass.append(cand)
+        else:
+            stage2_corr_rejected.append(cand)
+            print(f"    [Stage 2] {cand['name']} 相关性过高 "
+                  f"({max_corr:.2f} vs {max_corr_factor})")
+
+    print(f"    [Stage 2] Correlation: {len(stage2_pass)} 通过, "
+          f"{len(stage2_corr_rejected)} 被拒")
+
+    # --- Stage 2.5: Replacement check ---
+    replacements = []
+    if factor_pool and stage2_corr_rejected:
+        for cand in stage2_corr_rejected:
+            fast_ic = abs(cand.get('_fast_ic', 0))
+            corr_count = cand.get('_corr_count', 0)
+
+            if fast_ic >= REPLACE_IC_MIN and corr_count == 1:
+                max_corr_factor = cand['_max_corr_factor']
+                replaced = factor_pool.try_replace(
+                    name=cand['name'],
+                    expr=cand['expr'],
+                    rank_ic=cand.get('_fast_ic', 0),
+                    icir=cand.get('_fast_icir', 0),
+                    max_corr_factor=max_corr_factor,
+                    max_corr_value=cand.get('_max_corr', 0),
+                )
+                if replaced:
+                    replacements.append(cand)
+                    print(f"    [Stage 2.5] {cand['name']} 替换 {max_corr_factor}")
+
+    combined = stage2_pass + replacements
+    if not combined:
+        traj.failure_step = 2
+        traj.error_msg = "Stage 2: 所有候选被相关性拒绝且不满足替换条件"
+        return
+
+    # --- Stage 3: Intra-batch dedup (AST similarity) ---
+    stage3_pass = []
+    for cand in combined:
+        is_dup = False
+        for existing in stage3_pass:
+            sim = ast_similarity(cand['expr'], existing['expr'])
+            if sim >= BATCH_DEDUP_AST:
+                print(f"    [Stage 3] {cand['name']} 批内重复 "
+                      f"(AST sim={sim:.2f} vs {existing['name']})")
+                is_dup = True
+                break
+        if not is_dup:
+            stage3_pass.append(cand)
+
+    print(f"    [Stage 3] Batch dedup: {len(stage3_pass)}/{len(combined)} 通过")
+    if not stage3_pass:
+        traj.failure_step = 2
+        traj.error_msg = "Stage 3: 所有候选批内重复"
+        return
+
+    # --- Stage 4: Full validation (使用与回测一致的时间窗口) ---
+    factors = [(c['name'], c['expr']) for c in stage3_pass]
+    eval_results = evaluate_candidates_batch(
+        factors,
+        start_time=ROLLING_EVAL_TEST_START,
+        end_time=ROLLING_EVAL_TEST_END,
+    )
+
+    best = select_best_candidate(eval_results)
+    if best:
+        traj.best_factor = {
+            'name': best['name'],
+            'expr': best['expr'],
+            'description': next(
+                (c.get('description', '') for c in stage3_pass
+                 if c['name'] == best['name']),
+                '',
+            ),
+        }
+        traj.ic = best.get('ic', 0)
+        traj.icir = best.get('icir', 0)
+        traj.rank_ic = best.get('rank_ic', 0)
+        traj.rank_icir = best.get('rank_icir', 0)
+        print(f"    [Stage 4] 最佳: {best['name']} (ICIR={best.get('icir', 0):.3f})")
+    else:
+        traj.failure_step = 2
+        traj.error_msg = "Stage 4: 所有候选 IC 为 0"
 
 
 # ============ v3 新增: 组合回测 ============

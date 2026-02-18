@@ -71,6 +71,15 @@ DAILY_N_DIRECTIONS = 5            # 每次规划方向数
 DAILY_BREADTH_STEPS = 5           # 广度阶段每个方向的步数
 DAILY_EXHAUSTED_FAILURES = 3     # 连续失败 N 次标记方向为 exhausted
 
+# --- FactorMiner 多阶段评估参数 (论文 Section 3.3-3.4) ---
+USE_MULTISTAGE = True           # 启用多阶段评估 (--daily only)
+FAST_IC_THRESHOLD = 0.02        # Stage 1 快速筛选阈值 (日频, 论文10min用0.04)
+FAST_IC_PERIOD = ("2025-01-01", "2025-12-31")  # 快速筛选时间窗口
+CORRELATION_THRESHOLD = 0.5     # Stage 2 相关性阈值 (论文值)
+REPLACE_IC_MIN = 0.03           # Stage 2.5 替换最低 IC (日频, 论文10min用0.10)
+REPLACE_RATIO = 1.3             # Stage 2.5 替换倍数 (论文值)
+BATCH_DEDUP_AST = 0.7           # Stage 3 批内去重 AST 阈值
+
 # --- Claude CLI 配置 ---
 CLAUDE_CLI = '/usr/local/bin/claude'
 CLAUDE_TIMEOUT = 600  # 秒 (一致性验证等复杂 prompt 可能需要较长时间)
@@ -144,11 +153,28 @@ def get_claude_env():
 
 # --- Qlib 操作符参考 (供 prompt 使用) ---
 QLIB_OPERATORS = """可用算子:
-- 时序: Ref(x,N), Mean(x,N), Std(x,N), Sum(x,N), Delta(x,N), Min(x,N), Max(x,N), Slope(x,N), Rsquare(x,N)
+- 时序: Ref(x,N), Mean(x,N), Std(x,N), Sum(x,N), Delta(x,N), Min(x,N), Max(x,N), Slope(x,N), Rsquare(x,N), IdxMax(x,N), IdxMin(x,N)
 - 截面: Rank(x,N) — 注意需要 window 参数 N
-- 运算: Abs(x), Log(x), Sign(x), Power(x,N), Div(x,y), Mul(x,y), Add(x,y), Sub(x,y), Greater(x,y), Less(x,y), If(cond,x,y)
+- 运算: Abs(x), Log(x), Sign(x), Power(x,N), Div(x,y), Mul(x,y), Add(x,y), Sub(x,y), Greater(x,y), Less(x,y), Ge(x,y), Le(x,y), If(cond,x,y)
 - 统计: Corr(x,y,N), Cov(x,y,N) — 要求 x,y 日期范围一致 (同源字段)
-- 注意: Max/Min 是时序滚动的; 截面比较用 Greater(x,y)/Less(x,y)"""
+- 注意: Max/Min 是时序滚动的; 截面比较用 Greater(x,y)/Less(x,y)
+- 别名: Neg(x)→Mul(x,-1), SMA→Mean, TsMax→Max, TsMin→Min, IfElse→If, GreaterEqual→Ge"""
+
+# --- 算子别名映射 (供 prompt 引导 LLM 使用正确语法) ---
+OPERATOR_ALIASES = {
+    "Neg(x)": "Mul(x, -1)",
+    "Inv(x)": "Div(1, x + 1e-8)",
+    "Sqrt(x)": "Power(x, 0.5)",
+    "Square(x)": "Power(x, 2)",
+    "SMA(x, N)": "Mean(x, N)",
+    "TsMax(x, N)": "Max(x, N)",
+    "TsMin(x, N)": "Min(x, N)",
+    "TsArgMax(x, N)": "IdxMax(x, N)",
+    "TsArgMin(x, N)": "IdxMin(x, N)",
+    "IfElse(c, x, y)": "If(c, x, y)",
+    "GreaterEqual(x, y)": "Ge(x, y)",
+    "LessEqual(x, y)": "Le(x, y)",
+}
 
 QLIB_CONSTRAINTS = """约束:
 1. 除零保护: 分母加 1e-8，如 Div(x, y + 1e-8)

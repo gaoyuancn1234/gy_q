@@ -546,8 +546,12 @@ def _accept_factors_to_mined(non_redundant: list, run_id: str):
             f"MINED_FACTORS = [\n{insert_text}\n]",
         )
     elif "MINED_FACTORS = [" in content:
-        idx = content.rfind("]")
-        content = content[:idx] + "\n" + insert_text + "\n" + content[idx:]
+        # 精确找到 MINED_FACTORS 列表的结尾 `]`，而不用 rfind (会匹配文件最后一个])
+        start = content.index("MINED_FACTORS = [")
+        # 从 MINED_FACTORS 开始位置向后找第一个独立的 ]\n
+        search_from = start + len("MINED_FACTORS = [")
+        idx = content.index("\n]", search_from)
+        content = content[:idx] + "\n" + insert_text + content[idx:]
 
     mined_file.write_text(content, encoding="utf-8")
     print(f"  已写入 {len(new_entries)} 个因子到 mined.py")
@@ -894,14 +898,17 @@ def _try_admit_to_pool(traj, factor_pool, iteration):
 
 def _run_original_5step(direction: dict, d_idx: int,
                         pool, dry_run: bool = False,
-                        factor_pool=None):
+                        factor_pool=None, experience_memory=None,
+                        use_multistage: bool = False):
     """Round 0: 对一个方向执行 5 步循环 (Original)
 
     复用 evolution.py 的 mutate_trajectory 结构,
     但不需要 parent (这是初始轮)。
     """
     from factor_lab.quanta.trajectory import Trajectory
-    from factor_lab.quanta.config import N_CANDIDATES, HISTORY_LIMIT, BACKTEST_ENABLED, ROLLING_EVAL_LITE
+    from factor_lab.quanta.config import (
+        N_CANDIDATES, HISTORY_LIMIT, BACKTEST_ENABLED, ROLLING_EVAL_LITE,
+    )
     from factor_lab.quanta import idea_agent, factor_agent, eval_agent
 
     direction_trace = pool.get_direction_trace(d_idx)
@@ -920,6 +927,7 @@ def _run_original_5step(direction: dict, d_idx: int,
         direction=direction.get('direction', ''),
         suffix="",
         history_limit=HISTORY_LIMIT,
+        experience_memory=experience_memory,
     )
     traj.hypothesis = hyp.get('hypothesis', direction.get('hypothesis', ''))
     traj.direction = hyp.get('direction', direction.get('direction', ''))
@@ -956,8 +964,12 @@ def _run_original_5step(direction: dict, d_idx: int,
     traj.factor_candidates = candidates
 
     # --- Step 3: Calculate ---
-    print(f"    [Step 3] Calculate (validate + evaluate)")
-    eval_agent.run_validation_pipeline(traj, candidates)
+    if use_multistage and factor_pool is not None:
+        print(f"    [Step 3] Calculate (multistage pipeline)")
+        eval_agent.run_multistage_pipeline(traj, candidates, factor_pool)
+    else:
+        print(f"    [Step 3] Calculate (validate + evaluate)")
+        eval_agent.run_validation_pipeline(traj, candidates)
 
     # --- Step 4: Backtest ---
     if BACKTEST_ENABLED and traj.best_factor and traj.failure_step == -1:
@@ -1037,10 +1049,12 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     """
     from factor_lab.quanta.config import (
         DAILY_TOTAL_TIMEOUT, DAILY_N_DIRECTIONS, DAILY_BREADTH_STEPS,
+        USE_MULTISTAGE,
     )
     from factor_lab.quanta.trajectory import TrajectoryPool
     from factor_lab.quanta.factor_pool import FactorPool
     from factor_lab.quanta.evolution import mutate_trajectory
+    from factor_lab.quanta.experience_memory import ExperienceMemory
     from factor_lab.mining.planning_agent import plan_directions
     from factor_lab.mining.direction_registry import DirectionRegistry
     from factor_lab.mining.context import MiningContext
@@ -1066,6 +1080,15 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     global_pool = FactorPool(save_dir=MINING_DIR)
     global_pool.load(GLOBAL_POOL_FILE)
     print(f"  全局因子池: {global_pool.size} 个因子")
+
+    # Experience Memory (FactorMiner 跨 session 经验记忆)
+    experience_memory = ExperienceMemory(save_dir=MINING_DIR)
+    experience_memory.load()
+    mem_text = experience_memory.format_for_prompt()
+    if mem_text:
+        print(f"  经验记忆: 已加载 ({len(mem_text)} 字符)")
+    else:
+        print(f"  经验记忆: 空 (首次运行)")
 
     # DirectionRegistry (方向注册表)
     registry = DirectionRegistry(save_path=DIRECTION_REGISTRY_FILE)
@@ -1144,67 +1167,114 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         global_pool.save(GLOBAL_POOL_FILE)
         registry.save()
 
-    # --- Phase B: 广度 — 探索 pending 方向 ---
+    # --- Phase B: 广度 — 探索 pending 方向 (循环规划) ---
     print(f"\n  === Phase B: 广度探索 ===")
     breadth_deadline = time.time() + breadth_time
-    pending_dirs = registry.get_pending(limit=20)
-    if smoke_test:
-        pending_dirs = pending_dirs[:2]
-    print(f"  待探索方向: {len(pending_dirs)} 个")
+    breadth_round = 0
 
-    for d_entry in pending_dirs:
-        if time.time() > breadth_deadline:
-            print(f"  [广度超时]")
-            break
+    while time.time() < breadth_deadline:
+        pending_dirs = registry.get_pending(limit=20)
+        if smoke_test:
+            pending_dirs = pending_dirs[:2]
 
-        dir_id = d_entry["id"]
-        print(f"\n  --- [{dir_id}] {d_entry['direction']} ---")
-        registry.mark_exploring(dir_id)
+        # 无 pending 方向 → 规划新批次
+        if not pending_dirs:
+            if smoke_test:
+                break  # smoke test 只跑一轮
+            remaining_min = (breadth_deadline - time.time()) / 60
+            if remaining_min < 5:
+                print(f"  [广度] 剩余 {remaining_min:.0f}min, 不再规划")
+                break
+            breadth_round += 1
+            print(f"\n  [广度] 第 {breadth_round+1} 轮规划 (剩余 {remaining_min:.0f}min)")
+            explored_summary = registry.get_explored_summary()
+            new_dirs = plan_directions(context_text, n_plan,
+                                       explored_summary=explored_summary)
+            registry.add_directions(new_dirs, run_id)
+            registry.save()
+            print(f"  已规划 {len(new_dirs)} 个新方向:")
+            for d in new_dirs:
+                print(f"    + {d['direction']}: {d['hypothesis'][:60]}...")
+            continue  # 回到 while 顶部获取新 pending
 
-        direction = {
-            "direction": d_entry["direction"],
-            "hypothesis": d_entry["hypothesis"],
-            "mechanism": d_entry.get("mechanism", ""),
-            "time_scale": d_entry.get("time_scale", ""),
-        }
+        if breadth_round == 0:
+            print(f"  待探索方向: {len(pending_dirs)} 个")
 
-        d_idx = int(dir_id.split("_")[1])
-        traj = _run_original_5step(direction, d_idx, pool, dry_run,
-                                   factor_pool=global_pool)
-        _admit_and_save(traj, dir_id, iteration=0)
+        for d_entry in pending_dirs:
+            if time.time() > breadth_deadline:
+                print(f"  [广度超时]")
+                break
 
-    # --- Phase C: 深度 — mutation ---
+            dir_id = d_entry["id"]
+            print(f"\n  --- [{dir_id}] {d_entry['direction']} ---")
+            registry.mark_exploring(dir_id)
+
+            direction = {
+                "direction": d_entry["direction"],
+                "hypothesis": d_entry["hypothesis"],
+                "mechanism": d_entry.get("mechanism", ""),
+                "time_scale": d_entry.get("time_scale", ""),
+            }
+
+            d_idx = int(dir_id.split("_")[1])
+            traj = _run_original_5step(direction, d_idx, pool, dry_run,
+                                       factor_pool=global_pool,
+                                       experience_memory=experience_memory,
+                                       use_multistage=USE_MULTISTAGE)
+            _admit_and_save(traj, dir_id, iteration=0)
+
+    # --- Phase C: 深度 — mutation (循环直到超时) ---
     print(f"\n  === Phase C: 深度挖掘 ===")
     depth_deadline = time.time() + depth_time
-    depth_dirs = registry.get_depth_targets(limit=10)
-    if not depth_dirs:
-        depth_dirs = registry.get_explorable(limit=5)
-    if smoke_test:
-        depth_dirs = depth_dirs[:1]
-    print(f"  深度目标: {len(depth_dirs)} 个方向")
+    depth_round = 0
 
-    for d_entry in depth_dirs:
-        if time.time() > depth_deadline:
-            print(f"  [深度超时]")
+    while time.time() < depth_deadline:
+        depth_dirs = registry.get_depth_targets(limit=10)
+        if not depth_dirs:
+            depth_dirs = registry.get_explorable(limit=5)
+        if smoke_test:
+            depth_dirs = depth_dirs[:1]
+
+        if not depth_dirs:
+            print(f"  无可 mutation 的方向, 跳过深度阶段")
             break
 
-        dir_id = d_entry["id"]
-        print(f"\n  --- [Mutation] {dir_id}: {d_entry['direction']} "
-              f"(ICIR={d_entry['best_icir']:.3f}) ---")
+        if depth_round == 0:
+            print(f"  深度目标: {len(depth_dirs)} 个方向")
+        else:
+            remaining_min = (depth_deadline - time.time()) / 60
+            print(f"\n  [深度] 第 {depth_round+1} 轮 ({len(depth_dirs)} 方向, "
+                  f"剩余 {remaining_min:.0f}min)")
+        depth_round += 1
 
-        d_idx = int(dir_id.split("_")[1])
-        direction_trajs = [t for t in pool.get_successful()
-                           if t.direction_id == d_idx]
-        if not direction_trajs:
-            print(f"    无可用 parent, 跳过")
-            continue
+        any_progress = False
+        for d_entry in depth_dirs:
+            if time.time() > depth_deadline:
+                print(f"  [深度超时]")
+                break
 
-        parent = max(direction_trajs, key=lambda t: t.reward)
-        print(f"    Parent: {parent.id} (ICIR={parent.icir:.4f})")
+            dir_id = d_entry["id"]
+            print(f"\n  --- [Mutation] {dir_id}: {d_entry['direction']} "
+                  f"(ICIR={d_entry['best_icir']:.3f}) ---")
 
-        traj = mutate_trajectory(parent, 1, pool, dry_run=dry_run,
-                                 factor_pool=global_pool)
-        _admit_and_save(traj, dir_id, iteration=1)
+            d_idx = int(dir_id.split("_")[1])
+            direction_trajs = [t for t in pool.get_successful()
+                               if t.direction_id == d_idx]
+            if not direction_trajs:
+                print(f"    无可用 parent, 跳过")
+                continue
+
+            parent = max(direction_trajs, key=lambda t: t.reward)
+            print(f"    Parent: {parent.id} (ICIR={parent.icir:.4f})")
+
+            traj = mutate_trajectory(parent, 1, pool, dry_run=dry_run,
+                                     factor_pool=global_pool)
+            _admit_and_save(traj, dir_id, iteration=depth_round)
+            any_progress = True
+
+        if not any_progress:
+            print(f"  本轮无进展, 结束深度阶段")
+            break
 
     # --- Phase D: 质量筛选 → 全量回测 → mined.py ---
     print(f"\n  === Phase D: 最终评估 ===")
@@ -1263,6 +1333,13 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
 
     # 更新 context
     ctx.update_after_run(run_result)
+
+    # Experience Memory 演化 + 保存
+    all_trajs = pool.all()
+    if all_trajs:
+        experience_memory.evolve(all_trajs, global_pool)
+        experience_memory.save()
+        print(f"  经验记忆已更新 (从 {len(all_trajs)} 条轨迹提炼)")
 
     # 通知 + mined.py + shadow
     beat_baseline = _check_beat_baseline(backtest)
