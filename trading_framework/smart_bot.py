@@ -35,6 +35,8 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
 # 使用 claude CLI 而不是 anthropic SDK
+# 调用 claude 子进程时需清除 Claude Code 注入的环境变量，避免嵌套会话错误
+_CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT')}
 
 # ============================================================
 # 配置
@@ -1105,7 +1107,7 @@ class SmartBot:
                 '-p', prompt
             ]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15, cwd=str(WORK_DIR)
+                cmd, capture_output=True, text=True, timeout=15, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
 
@@ -1211,7 +1213,7 @@ class SmartBot:
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                cwd=str(WORK_DIR)
+                cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             if session:
                 session.current_process = proc
@@ -1334,7 +1336,7 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
 
             cmd = ['/usr/local/bin/claude', '--print', '--dangerously-skip-permissions', '-p', prompt]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30, cwd=str(WORK_DIR)
+                cmd, capture_output=True, text=True, timeout=30, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
             if not output:
@@ -1501,7 +1503,7 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 '-p', f"请先用 Read 工具查看图片 {image_path}，然后:\n\n{prompt}"
             ]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60, cwd=str(WORK_DIR)
+                cmd, capture_output=True, text=True, timeout=60, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
 
@@ -1988,7 +1990,7 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
                 ['/usr/local/bin/claude', '--print', '--dangerously-skip-permissions',
                  '--output-format', 'json', '--json-schema', schema,
                  '-p', prompt],
-                capture_output=True, text=True, timeout=15
+                capture_output=True, text=True, timeout=15, env=_CLEAN_ENV
             )
             output = result.stdout.strip()
             data = json.loads(output)
@@ -2349,8 +2351,8 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
                     self._ws_disconnect_count += 1
                     print(f"[WS] App {app_id} 断连 #{self._ws_disconnect_count}: {e}")
 
-                    # 连续断连超过3次，发送告警
-                    if self._ws_disconnect_count >= 3 and not self._ws_disconnect_alerted:
+                    # 连续断连超过5次，发送告警
+                    if self._ws_disconnect_count >= 5 and not self._ws_disconnect_alerted:
                         self._ws_disconnect_alerted = True
                         self._send_disconnect_alert(self._ws_disconnect_count)
 
