@@ -454,14 +454,24 @@ def main():
     print(f"  今日对话: {len(today_data['conversations'])} 用户, {conv_count} 条消息")
     print(f"  错误数: {len(today_data['errors'])}")
 
-    # 如果今天没有任何活动，跳过
-    if conv_count == 0 and not today_data["errors"] and not today_data["bot_log_snippets"]:
-        print("  今日无活动，跳过反思")
-        # 仍然记录一条空反思
+    # 判断是否有实质性活动（排除仅有心跳/启动等日志的情况）
+    has_meaningful_logs = False
+    if today_data["bot_log_snippets"]:
+        meaningful_keywords = ['ERROR', 'Exception', '❌', '超时', '失败', 'Claude', '用户']
+        has_meaningful_logs = any(
+            any(kw in line for kw in meaningful_keywords)
+            for line in today_data["bot_log_snippets"]
+        )
+
+    if conv_count == 0 and not today_data["errors"] and not has_meaningful_logs:
+        # 周末/节假日/无用户交互 — 记录但不调用 Claude 反思
+        is_weekend = date.today().weekday() >= 5
+        summary = "周末无活动" if is_weekend else "今日无活动"
+        print(f"  {summary}，跳过反思")
         save_reflection({
             "date": date.today().isoformat(),
-            "score": 0,
-            "summary": "今日无活动",
+            "score": -1,  # -1 表示未评估（区别于实际评分 0）
+            "summary": summary,
         }, [])
         return
 
