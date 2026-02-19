@@ -19,6 +19,9 @@ from pathlib import Path
 
 BOT_DIR = Path(__file__).parent
 WORK_DIR = BOT_DIR.parent
+
+# 清除 Claude Code 注入的环境变量，避免嵌套会话错误
+_CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT')}
 MEMORY_DIR = BOT_DIR / "memory"
 LOGS_DIR = BOT_DIR / "logs"
 REFLECT_DIR = BOT_DIR / "reflections"
@@ -258,7 +261,8 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
         cmd,
         capture_output=True, text=True,
         timeout=timeout,
-        cwd=str(WORK_DIR)
+        cwd=str(WORK_DIR),
+        env=_CLEAN_ENV
     )
     output = result.stdout.strip()
 
@@ -360,7 +364,8 @@ def apply_auto_fixes(reflection: dict) -> list:
             cmd,
             capture_output=True, text=True,
             timeout=1800,  # 30 分钟超时
-            cwd=str(WORK_DIR)
+            cwd=str(WORK_DIR),
+            env=_CLEAN_ENV
         )
         output = result.stdout.strip()
         if output:
