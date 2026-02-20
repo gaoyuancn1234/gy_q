@@ -636,6 +636,7 @@ class UserSession:
         self.last_result: str = ""
         self.pending_actions: Dict[str, dict] = {}
         self._actions_lock = threading.Lock()
+        self.paper_context: Optional[str] = None  # 当前论文对话上下文 (paper_id)
 
     # ---- pending_actions 管理 ----
 
@@ -722,64 +723,76 @@ class SmartBot:
         self._ws_disconnect_alerted = False  # 是否已发送断连告警
 
     def send_text(self, text: str, session: 'UserSession' = None):
-        """发送文本消息"""
+        """发送文本消息 (超长自动分段)"""
         client = session.lark_client if session else None
         open_id = session.open_id if session else None
         if not client or not open_id:
             print(f"[Bot] {text}")
             return
 
-        try:
-            req = CreateMessageRequest.builder() \
-                .receive_id_type("open_id") \
-                .request_body(CreateMessageRequestBody.builder()
-                    .receive_id(open_id)
-                    .msg_type("text")
-                    .content(json.dumps({"text": text}))
-                    .build()) \
-                .build()
-            client.im.v1.message.create(req)
-        except Exception as e:
-            print(f"[发送失败] {e}")
+        # 飞书文本消息限制 ~4000 字符，超长自动分段
+        MAX_TEXT = 4000
+        chunks = self._split_text(text, MAX_TEXT) if len(text) > MAX_TEXT else [text]
+
+        for chunk in chunks:
+            try:
+                req = CreateMessageRequest.builder() \
+                    .receive_id_type("open_id") \
+                    .request_body(CreateMessageRequestBody.builder()
+                        .receive_id(open_id)
+                        .msg_type("text")
+                        .content(json.dumps({"text": chunk}))
+                        .build()) \
+                    .build()
+                client.im.v1.message.create(req)
+            except Exception as e:
+                print(f"[发送失败] {e}")
 
     def send_markdown(self, content: str, title: str = "", session: 'UserSession' = None):
-        """发送 Markdown 卡片消息"""
+        """发送 Markdown 卡片消息 (超长自动分段)"""
         client = session.lark_client if session else None
         open_id = session.open_id if session else None
         if not client or not open_id:
             print(f"[Bot MD] {content[:100]}")
             return
 
-        try:
-            card = {
-                "schema": "2.0",
-                "config": {"wide_screen_mode": True},
-                "body": {
-                    "direction": "vertical",
-                    "elements": [
-                        {"tag": "markdown", "content": content}
-                    ]
-                }
-            }
-            if title:
-                card["header"] = {
-                    "title": {"tag": "plain_text", "content": title},
-                    "template": "blue"
-                }
+        # 飞书卡片 JSON 限制 ~30KB, 预留 header/元数据空间, 中文 3 bytes
+        MAX_CONTENT = 8000
+        chunks = self._split_text(content, MAX_CONTENT) if len(content) > MAX_CONTENT else [content]
 
-            req = CreateMessageRequest.builder() \
-                .receive_id_type("open_id") \
-                .request_body(CreateMessageRequestBody.builder()
-                    .receive_id(open_id)
-                    .msg_type("interactive")
-                    .content(json.dumps(card))
-                    .build()) \
-                .build()
-            client.im.v1.message.create(req)
-        except Exception as e:
-            print(f"[发送MD失败] {e}")
-            # 降级为普通文本
-            self.send_text(content, session)
+        for i, chunk in enumerate(chunks):
+            try:
+                card = {
+                    "schema": "2.0",
+                    "config": {"wide_screen_mode": True},
+                    "body": {
+                        "direction": "vertical",
+                        "elements": [
+                            {"tag": "markdown", "content": chunk}
+                        ]
+                    }
+                }
+                chunk_title = title
+                if title and len(chunks) > 1:
+                    chunk_title = f"{title} ({i+1}/{len(chunks)})"
+                if chunk_title:
+                    card["header"] = {
+                        "title": {"tag": "plain_text", "content": chunk_title},
+                        "template": "blue"
+                    }
+
+                req = CreateMessageRequest.builder() \
+                    .receive_id_type("open_id") \
+                    .request_body(CreateMessageRequestBody.builder()
+                        .receive_id(open_id)
+                        .msg_type("interactive")
+                        .content(json.dumps(card))
+                        .build()) \
+                    .build()
+                client.im.v1.message.create(req)
+            except Exception as e:
+                print(f"[发送MD失败] {e}")
+                self.send_text(chunk, session)
 
     def upload_image(self, image_path: str, session: 'UserSession' = None) -> Optional[str]:
         """上传图片到飞书，返回image_key"""
@@ -1027,13 +1040,22 @@ class SmartBot:
             for mem in related:
                 parts.append(f"- {mem.summary}")
 
-        # 最近对话
+        # 最近对话 (完整内容, 不截断)
         recent = memory.get_recent_context(n=5)
         if recent:
             parts.append("\n【最近对话】")
-            for msg in recent[-6:]:
+            for msg in recent[-8:]:
                 role = "用户" if msg.role == "user" else "助手"
-                parts.append(f"{role}: {msg.content[:80]}")
+                parts.append(f"{role}: {msg.content}")
+
+        # 待确认操作 (让 Claude 理解当前上下文)
+        if session:
+            pending = session.get_pending_actions()
+            if pending:
+                parts.append("\n【待确认操作】")
+                for aid, action in pending.items():
+                    parts.append(f"- {action.get('type', '?')}: {json.dumps(action.get('data', {}), ensure_ascii=False)}")
+                parts.append("用户可能在回应这些待确认操作 (确认/取消/表达不满等)。")
 
         return "\n".join(parts)
 
@@ -1193,12 +1215,29 @@ class SmartBot:
   提取后会输出磁盘路径，你可以用 Read 工具查看该文件。
   当用户提到"之前的图片"、"上次的截图"等，先用 list 或 search 查找。
 
+论文调研系统:
+- 如果用户想搜索/调研某篇论文，用 python -c "from paper_researcher import search_arxiv; ..." 搜索 arXiv
+- 找到后，你必须:
+  1. 简要说明论文核心思想和方法 (2-3句话)
+  2. 结合我们的框架评估复现价值，给出明确推荐 (推荐复现/部分借鉴/不推荐)
+  3. 在回复末尾附上动作标签: [PAPER_SEARCH:arXiv链接]，系统会自动创建确认卡片
+- 我们框架的关键能力 (用于评估论文增量价值):
+  - 因子: alpha158_val(210因子) + QuantaAlpha挖掘因子(68因子), 总278因子
+  - 模型: LightGBM, Rolling D_expand_3v_3r 训练
+  - 当前SOTA: CSI300 Sharpe 2.180, Return 106%, MDD -12%
+  - 已有: 因子自动挖掘(FactorMiner) + 影子验证 + 新闻情绪哨兵 + 盘中监控
+- 评估维度: ①性能是否超越我们SOTA ②方法新颖性 ③工程落地可行性(我们是macOS本地环境,无GPU)
+- 如果用户对搜索结果不满意 (如"都不对"、"不是这个")，帮他澄清需求，不要强行推荐
+- 如果用户想取消待确认操作，在回复末尾附上: [CANCEL_ACTION]
+- 已有论文: python paper_researcher.py --status
+
 规则：
 1. 直接执行任务，不要问"是否需要"，不要等确认
 2. 用户说"画图"就直接写代码、执行、生成图片
 3. 生成图片后，在回复中写明图片路径，格式：[IMAGE:/path/to/image.png]
 4. 如果用户发送了图片，仔细分析图片内容
-5. 回复简洁，中文，告诉用户做了什么"""
+5. 回复简洁，中文，告诉用户做了什么
+6. 动作标签 ([PAPER_SEARCH:...] 等) 只在需要时添加，系统会自动解析并执行"""
 
         try:
             # 如果有图片，在 prompt 中加入图片路径让 Claude 读取
@@ -1398,34 +1437,65 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
         except Exception as e:
             self.send_text(f"❌ 执行失败: {e}", session)
 
+    @staticmethod
+    def _split_text(text: str, max_len: int = 4000) -> list:
+        """在段落/标题边界处分割长文本"""
+        if len(text) <= max_len:
+            return [text]
+        chunks = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            # 在 max_len 范围内找最佳分割点: ## 标题 > 空行 > 换行
+            cut = max_len
+            for sep in ['\n## ', '\n\n', '\n']:
+                pos = text.rfind(sep, 0, max_len)
+                if pos > max_len // 3:  # 至少保留 1/3 内容
+                    cut = pos + (len(sep) if sep == '\n' else 0)
+                    break
+            chunks.append(text[:cut].rstrip())
+            text = text[cut:].lstrip('\n')
+        return chunks
+
     def process_response(self, response: str, session: 'UserSession' = None):
-        """处理 Claude 响应 - 简化版，Claude 已直接执行操作"""
+        """处理 Claude 响应 - 解析文本、图片、动作标签"""
         print(f"[Claude响应] {response[:500]}...")
+
+        # ── 解析动作标签 ──
+        # [PAPER_SEARCH:url] → 创建论文调研确认卡片
+        paper_matches = re.findall(r'\[PAPER_SEARCH:([^\]]+)\]', response)
+        # [CANCEL_ACTION] → 取消待确认操作
+        has_cancel = '[CANCEL_ACTION]' in response
+
+        # 清理动作标签 (不展示给用户)
+        clean_text = re.sub(r'\[PAPER_SEARCH:[^\]]+\]', '', response)
+        clean_text = clean_text.replace('[CANCEL_ACTION]', '')
 
         # 提取图片路径 [IMAGE:/path/to/image.png]
         image_pattern = r'\[IMAGE:([^\]]+)\]'
-        image_matches = re.findall(image_pattern, response)
+        image_matches = re.findall(image_pattern, clean_text)
 
         # 也检测常见路径格式
         path_pattern = r'[`\s](/[^\s`\n]+\.(?:png|jpg|jpeg|gif|webp))'
-        path_matches = re.findall(path_pattern, response, re.IGNORECASE)
+        path_matches = re.findall(path_pattern, clean_text, re.IGNORECASE)
 
         all_images = list(set(image_matches + path_matches))
 
         # 清理文本，移除 [IMAGE:] 标记
-        clean_text = re.sub(image_pattern, '', response).strip()
+        clean_text = re.sub(image_pattern, '', clean_text).strip()
 
         # 发送文本（用 Markdown 卡片以支持格式化）
         if clean_text:
-            # 截断过长的文本
-            if len(clean_text) > 3000:
-                clean_text = clean_text[:3000] + "..."
-            # 检测是否包含 Markdown 格式（表格、代码块、列表等）
-            has_markdown = any(x in clean_text for x in ['|', '```', '- ', '* ', '**', '##'])
-            if has_markdown:
-                self.send_markdown(clean_text, session=session)
-            else:
-                self.send_text(clean_text, session)
+            # 超长文本分段发送 (飞书卡片限制 ~30KB)
+            MAX_CHUNK = 4000
+            chunks = self._split_text(clean_text, MAX_CHUNK) if len(clean_text) > MAX_CHUNK else [clean_text]
+            for chunk in chunks:
+                has_markdown = any(x in chunk for x in ['|', '```', '- ', '* ', '**', '##'])
+                if has_markdown:
+                    self.send_markdown(chunk, session=session)
+                else:
+                    self.send_text(chunk, session)
 
         # 发送图片
         for img_path in all_images:
@@ -1435,6 +1505,38 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 self.send_image(img_path, session)
             else:
                 print(f"[图片不存在] {img_path}")
+
+        # ── 执行动作 ──
+        if has_cancel and session:
+            session.clear_pending_actions()
+            print("[动作] 已取消待确认操作")
+
+        for url in paper_matches:
+            url = url.strip()
+            print(f"[动作] 论文调研: {url}")
+            if not session:
+                continue
+            # 提取论文标识: arXiv ID 优先, 否则用 URL hash
+            arxiv_m = re.search(r'(\d{4}\.\d{4,5})', url)
+            if arxiv_m:
+                paper_key = arxiv_m.group(1)
+                full_url = f"https://arxiv.org/abs/{paper_key}" if 'arxiv.org' not in url else url
+                desc = f"arXiv: **{paper_key}**"
+            elif url.startswith('http'):
+                # 非 arXiv 论文 (IJCAI/NeurIPS/其他)
+                import hashlib
+                paper_key = hashlib.md5(url.encode()).hexdigest()[:8]
+                full_url = url
+                desc = f"论文: **{url.split('/')[-1]}**"
+            else:
+                continue
+            action_id = f"PAPER_{paper_key}_{int(time.time())}"
+            session.add_pending_action(action_id, 'start_paper_research', {"url": full_url})
+            self.send_confirm_card(
+                "📄 论文调研",
+                f"开始调研 {desc} ？\n\n将创建隔离分支，下载并阅读论文。",
+                action_id, session
+            )
 
     def _handle_ml_signal(self, session: 'UserSession' = None):
         """生成 ML 信号并推送"""
@@ -1541,6 +1643,145 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
         except Exception as e:
             self.send_text(f"❌ 截图处理异常: {e}", session)
 
+    # ── 论文调研处理 ────────────────────────────────
+
+    def _handle_paper_status(self, session):
+        """查看论文调研状态"""
+        try:
+            sys.path.insert(0, str(BOT_DIR))
+            from paper_researcher import PaperResearcher
+            pr = PaperResearcher()
+            status = pr.get_status()
+            self.send_markdown(status, title="📄 论文调研", session=session)
+        except Exception as e:
+            self.send_text(f"❌ 论文状态查询失败: {e}", session)
+
+    def _handle_paper_research(self, session, url: str):
+        """启动论文调研: 下载 → 阅读 → 展示价值评估 → 用户决定是否继续"""
+        try:
+            sys.path.insert(0, str(BOT_DIR))
+            from paper_researcher import PaperResearcher
+            pr = PaperResearcher()
+            paper_id = pr.add_paper(url)
+            self.send_text(f"📄 论文 {paper_id} 已添加，开始阅读...", session)
+
+            # Phase 1: 阅读 + 价值评估
+            pr.run_phase(paper_id, "read")
+            if pr.registry[paper_id].get("status") == "failed":
+                self.send_text(f"❌ {paper_id} 阅读失败: {pr.registry[paper_id].get('progress_summary', '')}", session)
+                return
+
+            # 展示论文分析 (核心思想、方法、框架关联、价值评估)
+            entry = pr.registry[paper_id]
+            title = entry.get('title') or entry.get('arxiv_id', '?')
+            summary = pr.get_read_summary(paper_id)
+            self.send_markdown(summary, title=f"📄 {title}", session=session)
+
+            # 用户决定: 继续规划+复现 or 仅对话探索
+            action_id = f"PAPER_PLAN_{paper_id}_{int(time.time())}"
+            session.add_pending_action(action_id, 'plan_paper', {"paper_id": paper_id})
+            self.send_confirm_card(
+                f"📄 是否继续复现?",
+                f"**确认** → 生成复现计划并继续\n"
+                f"**取消** → 仅保留分析，可随时发「论文 {paper_id}」进入对话深入讨论",
+                action_id, session
+            )
+        except Exception as e:
+            self.send_text(f"❌ 论文调研失败: {e}", session)
+
+    def _handle_paper_plan_and_replicate(self, session, paper_id: str):
+        """用户确认有价值后: 规划 → 确认复现"""
+        try:
+            sys.path.insert(0, str(BOT_DIR))
+            from paper_researcher import PaperResearcher
+            pr = PaperResearcher()
+            self.send_text(f"📄 {paper_id} 开始生成复现计划...", session)
+
+            pr.run_phase(paper_id, "plan")
+            if pr.registry[paper_id].get("status") == "failed":
+                self.send_text(f"❌ {paper_id} 规划失败: {pr.registry[paper_id].get('progress_summary', '')}", session)
+                return
+            self.send_markdown(pr.get_status(paper_id), title=f"📄 {paper_id} 计划就绪", session=session)
+
+            # 复现需要二次确认
+            action_id = f"PAPER_REPLICATE_{paper_id}_{int(time.time())}"
+            session.add_pending_action(action_id, 'continue_paper', {"paper_id": paper_id})
+            worktree = pr.registry[paper_id].get('worktree_path', '')
+            self.send_confirm_card(
+                f"📄 {paper_id} 开始复现?",
+                f"复现计划已就绪，是否开始自动复现？\n\n"
+                f"查看详情: `cat {worktree}/PROGRESS.md`",
+                action_id, session
+            )
+        except Exception as e:
+            self.send_text(f"❌ 论文规划失败: {e}", session)
+
+    def _handle_paper_search(self, session, query: str):
+        """搜索 arXiv 并展示结果"""
+        try:
+            sys.path.insert(0, str(BOT_DIR))
+            from paper_researcher import search_arxiv
+            # 清理搜索词: 去除引号和多余空格
+            clean_query = query.strip().strip('"').strip("'").strip('"').strip('"').strip()
+            self.send_text(f"📄 正在搜索 arXiv: {clean_query}...", session)
+            results = search_arxiv(clean_query, max_results=3)
+            if not results:
+                self.send_text(f"📄 未在 arXiv 找到匹配论文: {query}", session)
+                return
+
+            lines = ["📄 arXiv 搜索结果", ""]
+            for i, p in enumerate(results, 1):
+                lines.append(f"**{i}. {p['title']}**")
+                lines.append(f"   arXiv: {p['arxiv_id']} | {p['date']} | {p['authors']}")
+                lines.append(f"   {p['summary'][:150]}...")
+                lines.append("")
+
+            # 用第一个结果创建确认卡片
+            top = results[0]
+            action_id = f"PAPER_{top['arxiv_id']}_{int(time.time())}"
+            session.add_pending_action(action_id, 'start_paper_research', {"url": top['url']})
+
+            lines.append(f"---\n点击确认将调研排名第一的论文: **{top['title']}**")
+            self.send_confirm_card(
+                "📄 论文调研",
+                "\n".join(lines),
+                action_id, session
+            )
+        except Exception as e:
+            self.send_text(f"❌ arXiv 搜索失败: {e}", session)
+
+    def _handle_paper_chat(self, session, paper_id: str, message: str):
+        """与论文助手交互对话"""
+        try:
+            sys.path.insert(0, str(BOT_DIR))
+            from paper_researcher import PaperResearcher
+            pr = PaperResearcher()
+            if paper_id not in pr.registry:
+                self.send_text(f"❌ 未找到 {paper_id}，发「论文」查看列表", session)
+                session.paper_context = None
+                return
+            result = pr.chat(paper_id, message)
+            title = pr.registry[paper_id].get("title") or paper_id
+            self.send_markdown(result, title=f"📄 {title}", session=session)
+        except Exception as e:
+            self.send_text(f"❌ 论文对话失败: {e}", session)
+
+    def _handle_paper_replicate(self, session, paper_id: str):
+        """执行论文复现 + 评估"""
+        try:
+            sys.path.insert(0, str(BOT_DIR))
+            from paper_researcher import PaperResearcher
+            pr = PaperResearcher()
+            self.send_text(f"📄 {paper_id} 开始复现...", session)
+
+            pr.run_phase(paper_id, "replicate")
+            self.send_markdown(pr.get_status(paper_id), title=f"📄 {paper_id} 复现进度", session=session)
+
+            pr.run_phase(paper_id, "evaluate")
+            self.send_markdown(pr.get_status(paper_id), title=f"📄 {paper_id} 评估完成", session=session)
+        except Exception as e:
+            self.send_text(f"❌ 论文复现失败: {e}", session)
+
     def handle_quick_commands(self, text: str, session: 'UserSession' = None, image_path: str = None) -> bool:
         """处理快捷命令，返回是否已处理"""
         # 帮助
@@ -1559,7 +1800,12 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 "• 资金10万 - 设置初始资金(需先清仓)\n"
                 "• 历史文件 - 查看历史图片/文件\n"
                 "• 反思 - 查看每日自我反思记录\n"
-                "• 发截图+「已执行」- 更新持仓",
+                "• 论文 - 论文调研状态\n"
+                "• 论文 paper_001 - 进入论文对话\n"
+                "• @paper_001 <问题> - 一次性提问\n"
+                "• 退出论文 - 退出论文对话\n"
+                "• 发截图+「已执行」- 更新持仓\n"
+                "• 发 arXiv 链接 - 启动论文调研",
                 session
             )
             return True
@@ -1837,6 +2083,60 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             )
             return True
 
+        # --- 论文调研 ---
+
+        # 退出论文对话模式
+        if text in ['退出论文', '返回', 'exit paper'] and session.paper_context:
+            pid = session.paper_context
+            session.paper_context = None
+            self.send_text(f"已退出 {pid} 对话模式", session)
+            return True
+
+        # 论文状态总览
+        if text in ['论文', '调研', 'papers']:
+            if session.paper_context:
+                self.send_text(f"当前在 {session.paper_context} 对话模式中\n发「退出论文」返回", session)
+            threading.Thread(target=self._handle_paper_status, args=(session,), daemon=True).start()
+            return True
+
+        # 进入论文对话模式: "论文 paper_001" / "对话 paper_001"
+        paper_ctx_match = re.match(r'(?:论文|对话|paper)\s+(paper_\d{3})$', text)
+        if paper_ctx_match:
+            paper_id = paper_ctx_match.group(1)
+            session.paper_context = paper_id
+            self.send_text(
+                f"📄 已进入 **{paper_id}** 对话模式\n\n"
+                f"直接发消息即可与论文助手对话，日常命令(持仓/信号等)仍可正常使用。\n"
+                f"发「退出论文」返回。",
+                session
+            )
+            return True
+
+        # 一次性提问: "@paper_001 这个因子怎么算的?"
+        oneshot_match = re.match(r'@(paper_\d{3})\s+(.+)', text, re.DOTALL)
+        if oneshot_match:
+            paper_id = oneshot_match.group(1)
+            message = oneshot_match.group(2).strip()
+            self.send_text(f"📄 正在向 {paper_id} 提问...", session)
+            threading.Thread(
+                target=self._handle_paper_chat, args=(session, paper_id, message),
+                daemon=True
+            ).start()
+            return True
+
+        # arXiv URL 自动检测
+        arxiv_match = re.search(r'arxiv\.org/(?:abs|pdf|html)/(\d{4}\.\d{4,5})', text)
+        if arxiv_match:
+            arxiv_id = arxiv_match.group(1)
+            action_id = f"PAPER_{arxiv_id}_{int(time.time())}"
+            session.add_pending_action(action_id, 'start_paper_research', {"url": text.strip()})
+            self.send_confirm_card(
+                "📄 论文调研",
+                f"检测到 arXiv 论文: **{arxiv_id}**\n\n将创建隔离 worktree 分支进行调研与复现。",
+                action_id, session
+            )
+            return True
+
         # 文字确认/取消
         pending = session.get_pending_actions()
         if text in ['允许', 'y', 'yes', '确认'] and pending:
@@ -1850,6 +2150,16 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
         if text in ['取消', 'n', 'no', '不'] and pending:
             session.clear_pending_actions()
             self.send_text("❌ 已取消", session)
+            return True
+
+        # --- 论文对话模式: 所有未匹配命令转发给论文助手 ---
+        if session.paper_context:
+            self.send_text(f"📄 [{session.paper_context}] 思考中...", session)
+            threading.Thread(
+                target=self._handle_paper_chat,
+                args=(session, session.paper_context, text),
+                daemon=True
+            ).start()
             return True
 
         return False
@@ -1957,6 +2267,20 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             path = data.get('path', '')
             self.send_image(path, session)
 
+        elif action_type == 'start_paper_research':
+            url = data.get("url", "")
+            threading.Thread(target=self._handle_paper_research, args=(session, url), daemon=True).start()
+
+        elif action_type == 'plan_paper':
+            paper_id = data["paper_id"]
+            threading.Thread(target=self._handle_paper_plan_and_replicate, args=(session, paper_id), daemon=True).start()
+
+        elif action_type == 'continue_paper':
+            paper_id = data["paper_id"]
+            threading.Thread(target=self._handle_paper_replicate, args=(session, paper_id), daemon=True).start()
+
+        # search_paper 已由 Claude 通用对话中的上下文注入处理，无需单独 action type
+
     def _filter_pending(self, messages: List[str]) -> List[str]:
         """用 Claude 判断待处理消息中哪些该执行、哪些已被撤回"""
         if len(messages) <= 1:
@@ -2050,7 +2374,7 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             # 记录助手回复
             clean_response = re.sub(r'\[IMAGE:[^\]]*\]', '', response).strip()
             if clean_response:
-                session.memory.add_message(Message(role="assistant", content=clean_response[:500]))
+                session.memory.add_message(Message(role="assistant", content=clean_response))
 
             # 异步评估记忆（不阻塞主流程）
             threading.Thread(
