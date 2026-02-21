@@ -1225,6 +1225,17 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
                                hypothesis=hypothesis_text)
         if admitted:
             factors_admitted_this_session += 1
+            # 发现有效因子时推送飞书通知
+            if not dry_run:
+                elapsed = (time.time() - t_start) / 60
+                _push_feishu(
+                    f"**{run_id}** 发现有效因子 (第 {factors_admitted_this_session} 个)\n"
+                    f"**因子**: `{factor_name}`\n"
+                    f"**ICIR**: `{traj.icir:.3f}`\n"
+                    f"**方向**: {traj.direction[:40]}\n"
+                    f"**已运行**: {elapsed:.0f}min",
+                    "🎯 因子挖掘 — 新因子入池",
+                )
 
         pool.save()
         global_pool.save(GLOBAL_POOL_FILE)
@@ -1287,6 +1298,18 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             _admit_and_save(traj, dir_id, iteration=0)
 
     # --- Phase C: 深度 — mutation (70%) + 探索新假设 (30%) ---
+    # Phase B→C 切换通知
+    if not dry_run:
+        elapsed = (time.time() - t_start) / 60
+        pool_stats_bc = pool.stats()
+        _push_feishu(
+            f"**{run_id}** Phase B 完成，进入 Phase C 深度挖掘\n"
+            f"**广度轨迹**: {pool_stats_bc['total']} 条\n"
+            f"**新增因子**: {factors_admitted_this_session} 个\n"
+            f"**已运行**: {elapsed:.0f}min\n"
+            f"**剩余时间**: {depth_time/60:.0f}min (深度)",
+            "📊 因子挖掘 — 阶段切换",
+        )
     print(f"\n  === Phase C: 深度挖掘 ===")
     explore_ratio = 0.3  # 30% 时间探索新假设
     mutation_budget = depth_time * (1 - explore_ratio)
@@ -1421,6 +1444,27 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         except Exception as e:
             print(f"  [backtest] 回测失败: {e}")
             backtest = {"error": str(e)}
+
+    # 回测结果即时通知 (不等最终总结)
+    if backtest and not dry_run:
+        elapsed = (time.time() - t_start) / 60
+        if "baseline" in backtest:
+            imp = backtest["improvement"]
+            mark = "BEAT" if imp["is_better"] else "未超越"
+            _push_feishu(
+                f"**{run_id}** 最终回测完成 ({mark})\n"
+                f"**Sharpe**: {backtest['baseline']['sharpe']:.3f} → "
+                f"{backtest['candidate']['sharpe']:.3f} ({imp['sharpe_delta']:+.3f})\n"
+                f"**新因子数**: {len(quality_factors)}\n"
+                f"**总耗时**: {elapsed:.0f}min",
+                "📈 因子挖掘 — 回测结果",
+            )
+        elif "error" in backtest:
+            _push_feishu(
+                f"**{run_id}** 回测失败\n**错误**: {backtest['error'][:100]}\n"
+                f"**总耗时**: {elapsed:.0f}min",
+                "⚠️ 因子挖掘 — 回测失败",
+            )
 
     # 保存审计记录
     pool_stats = pool.stats()
