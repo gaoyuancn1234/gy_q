@@ -1143,6 +1143,13 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     # DirectionRegistry (方向注册表)
     registry = DirectionRegistry(save_path=DIRECTION_REGISTRY_FILE)
     registry.load()
+
+    # 自动归档无望方向 (ICIR 持续负 + 多次尝试无入池)
+    archived = registry.cleanup_exhausted()
+    if archived > 0:
+        registry.save()
+        print(f"  自动归档 {archived} 个无望方向 (ICIR<=0, 无入池)")
+
     reg_stats = registry.stats()
     print(f"  方向注册表: {reg_stats['total']} 个方向 ({reg_stats['by_status']})")
 
