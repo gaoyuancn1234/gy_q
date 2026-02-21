@@ -97,8 +97,8 @@ def _get_all_preset_names() -> list[str]:
     return sorted(names)
 
 
-def _push_feishu(message: str):
-    """飞书推送 (复用 daily_runner 的凭证)"""
+def _push_feishu(message: str, title: str = "因子挖掘"):
+    """飞书推送 (interactive 卡片, 支持 markdown)"""
     try:
         from dotenv import load_dotenv
         load_dotenv(PROJECT_DIR / ".env")
@@ -114,13 +114,22 @@ def _push_feishu(message: str):
             print(f"  [feishu] 凭证未配置，消息:\n{message}")
             return
 
+        card = {
+            "header": {
+                "template": "blue",
+                "title": {"content": title, "tag": "plain_text"},
+            },
+            "elements": [
+                {"tag": "markdown", "content": message},
+            ],
+        }
         client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
         req = CreateMessageRequest.builder() \
             .receive_id_type("open_id") \
             .request_body(CreateMessageRequestBody.builder()
                 .receive_id(user_id)
-                .msg_type("text")
-                .content(json.dumps({"text": message}))
+                .msg_type("interactive")
+                .content(json.dumps(card))
                 .build()) \
             .build()
         client.im.v1.message.create(req)
@@ -147,29 +156,30 @@ def _check_beat_baseline(backtest) -> bool:
             and backtest.get("improvement", {}).get("is_better", False))
 
 
-def _build_discovery_message(run_result: dict, backtest: dict) -> str:
-    """构建飞书通知消息"""
+def _build_discovery_message(run_result: dict, backtest: dict) -> tuple[str, str]:
+    """构建飞书通知消息 (markdown 卡片)，返回 (content, title)"""
     run_id = run_result.get("run_id", "?")
     dt = run_result.get("date", "?")
     tested = run_result.get("factors_tested", 0)
     promising = run_result.get("promising_count", 0)
 
     lines = [
-        f"🔬 因子挖掘 — 发现候选因子",
-        "",
-        f"运行: #{run_id} ({dt})",
-        f"测试: {tested} 因子 → {promising} 个有效",
+        f"**运行** #{run_id}　　**日期** {dt}",
+        f"**测试** {tested} 因子 → **{promising} 个有效**",
     ]
 
-    # 最佳发现
+    # 最佳发现 Top 3
     best_factors = run_result.get("promising_factors", [])
     if best_factors:
         lines.append("")
-        lines.append("【最佳发现】")
-        for f in best_factors[:3]:
-            lines.append(f"  {f['name']} (ICIR={f.get('icir', 0):.3f})")
-            lines.append(f"  {f.get('expr', '')[:80]}")
-            lines.append(f"  假说: {f.get('hypothesis', '')[:60]}")
+        lines.append("---")
+        lines.append("**🏆 最佳发现**")
+        for i, f in enumerate(best_factors[:3], 1):
+            lines.append(f"**{i}. {f['name']}**　ICIR = `{f.get('icir', 0):.3f}`")
+            lines.append(f"`{f.get('expr', '')[:80]}`")
+            hyp = f.get('hypothesis', '')[:60]
+            if hyp:
+                lines.append(f"> {hyp}")
             lines.append("")
 
     # 回测对比
@@ -177,17 +187,14 @@ def _build_discovery_message(run_result: dict, backtest: dict) -> str:
         bl = backtest["baseline"]
         cd = backtest["candidate"]
         imp = backtest["improvement"]
-        lines.append("回测对比 (vs M01-LGB-D3v3r-v2602):")
-        lines.append(f"  M01:  Sharpe {bl['sharpe']:.3f} | MDD {bl['mdd']:.2%} | Return {bl['return']:.0%}")
-        lines.append(f"  候选: Sharpe {cd['sharpe']:.3f} | MDD {cd['mdd']:.2%} | Return {cd['return']:.0%}")
         mark = "✅" if imp["is_better"] else "❌"
-        lines.append(f"  提升: {imp['sharpe_delta']:+.3f} Sharpe {mark}")
+        lines.append("---")
+        lines.append("**📊 回测对比** (vs M01-LGB-D3v3r-v2602)")
+        lines.append(f"**Sharpe**:　{bl['sharpe']:.3f} → {cd['sharpe']:.3f}　({imp['sharpe_delta']:+.3f}) {mark}")
+        lines.append(f"**MDD**:　{bl['mdd']:.2%} → {cd['mdd']:.2%}")
+        lines.append(f"**Return**:　{bl['return']:.0%} → {cd['return']:.0%}")
 
-    lines.append("")
-    lines.append("请人工审核后决定是否纳入。")
-    lines.append(f"接受命令: python -m factor_lab.factor_miner --accept {run_id}")
-
-    return "\n".join(lines)
+    return "\n".join(lines), "🔬 因子挖掘 — 发现候选因子"
 
 
 def run_mining(dry_run: bool = False, skip_backtest: bool = False):
@@ -418,18 +425,18 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
         # 写入 mined.py + 自动创建 shadow 验证
         _accept_factors_to_mined(non_redundant_factors, run_id)
         shadow_id = _create_shadow_for_run(run_id, backtest)
-        msg = _build_discovery_message(run_result, backtest)
+        msg, title = _build_discovery_message(run_result, backtest)
         if shadow_id:
-            msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
-        _push_feishu(msg)
+            msg += f"\n\n> 已自动创建影子验证: **{shadow_id}** (20交易日)"
+        _push_feishu(msg, title)
     elif promising_factors and not dry_run:
         # 有 promising 但未 beat baseline，也发一条简要通知
         names = [f["name"] for f in promising_factors if not f.get("is_redundant")]
         if names:
-            msg = (f"🔬 因子挖掘 #{run_id}\n"
-                   f"发现 {len(names)} 个非冗余因子: {', '.join(names[:5])}\n"
+            msg = (f"**运行** #{run_id}\n"
+                   f"发现 **{len(names)}** 个非冗余因子: `{'`, `'.join(names[:5])}`\n"
                    f"{'回测未超越 M01' if backtest else '未执行回测'}")
-            _push_feishu(msg)
+            _push_feishu(msg, "🔬 因子挖掘 — 未超越基线")
 
     # 打印总结
     print(f"\n{'='*60}")
@@ -562,6 +569,7 @@ def _create_shadow_for_run(run_id: str, backtest: dict) -> str:
     try:
         sys.path.insert(0, str(PROJECT_DIR))
         from shadow_manager import ShadowManager
+        from factor_lab.factors import mined
 
         sm = ShadowManager()
         imp = backtest.get("improvement", {}) if isinstance(backtest, dict) else {}
@@ -572,6 +580,28 @@ def _create_shadow_for_run(run_id: str, backtest: dict) -> str:
             reason=reason,
             duration_days=20,
         )
+
+        # 冻结当前因子快照 (用于审计和可能的重训还原)
+        snapshot_dir = PROJECT_DIR / "shadow" / "state" / shadow_id
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        factors_snapshot = mined.get_all_exprs()
+        snapshot_file = snapshot_dir / "mined_snapshot.json"
+        snapshot_file.write_text(
+            json.dumps(
+                {"run_id": run_id, "factor_count": len(factors_snapshot),
+                 "factors": [(n, e) for n, e in factors_snapshot]},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"  [shadow] 因子快照: {len(factors_snapshot)} 个 → {snapshot_file.name}")
+
+        # 在 registry 中记录因子数量
+        if shadow_id in sm.registry:
+            from shadow_manager import _save_registry
+            sm.registry[shadow_id]["mined_factor_count"] = len(factors_snapshot)
+            _save_registry(sm.registry)
+
         # 为 shadow 生成独立预测
         print(f"  [shadow] 正在 retrain {shadow_id}...")
         sm.retrain_for_shadow(shadow_id)
@@ -854,17 +884,17 @@ def run_evolved_mining(dry_run: bool = False, smoke_test: bool = False):
     if beat_baseline and not dry_run:
         _accept_factors_to_mined(admitted, run_id)
         shadow_id = _create_shadow_for_run(run_id, backtest)
-        msg = _build_evolved_message(run_result, backtest, stats)
+        msg, title = _build_evolved_message(run_result, backtest, stats)
         if shadow_id:
-            msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
-        _push_feishu(msg)
+            msg += f"\n\n> 已自动创建影子验证: **{shadow_id}** (20交易日)"
+        _push_feishu(msg, title)
     elif admitted and not dry_run:
         names = [n for n, _ in admitted[:5]]
-        msg = (f"🧬 演化式因子挖掘 #{run_id}\n"
-               f"轨迹: {stats['total']} | ACCEPT: {len(admitted)} 因子\n"
-               f"因子: {', '.join(names)}\n"
+        msg = (f"**运行** #{run_id}\n"
+               f"**轨迹** {stats['total']}　　**ACCEPT** {len(admitted)} 因子\n"
+               f"因子: `{'`, `'.join(names)}`\n"
                f"{'回测未超越 M01' if backtest else '未执行回测'}")
-        _push_feishu(msg)
+        _push_feishu(msg, "🧬 演化式因子挖掘 — 未超越基线")
 
     # 打印总结
     print(f"\n{'='*60}")
@@ -990,28 +1020,28 @@ def _run_original_5step(direction: dict, d_idx: int,
     return traj
 
 
-def _build_evolved_message(run_result: dict, backtest: dict, stats: dict) -> str:
-    """构建演化式挖掘的飞书通知"""
+def _build_evolved_message(run_result: dict, backtest: dict, stats: dict) -> tuple[str, str]:
+    """构建演化式挖掘的飞书通知 (markdown 卡片)，返回 (content, title)"""
     run_id = run_result.get("run_id", "?")
     dt = run_result.get("date", "?")
 
     lines = [
-        f"🧬 演化式因子挖掘 — 发现候选因子",
-        "",
-        f"运行: #{run_id} ({dt})",
-        f"轨迹: {stats.get('total', 0)} | 成功: {stats.get('successful', 0)}",
-        f"ACCEPT: {run_result.get('promising_count', 0)} 个因子",
+        f"**运行** #{run_id}　　**日期** {dt}",
+        f"**轨迹** {stats.get('total', 0)}　　**成功** {stats.get('successful', 0)}　　**ACCEPT** {run_result.get('promising_count', 0)}",
     ]
 
-    # 最佳发现
+    # 最佳发现 (按 |ICIR| 排序 Top 3)
     best_factors = run_result.get("promising_factors", [])
     if best_factors:
         best_sorted = sorted(best_factors, key=lambda f: abs(f.get('icir', 0)), reverse=True)
         lines.append("")
-        lines.append("【最佳发现】")
-        for f in best_sorted[:3]:
-            lines.append(f"  {f['name']} (ICIR={f.get('icir', 0):.3f}, {f.get('phase', '')})")
-            lines.append(f"  {f.get('expr', '')[:80]}")
+        lines.append("---")
+        lines.append("**🏆 最佳发现**")
+        for i, f in enumerate(best_sorted[:3], 1):
+            phase = f.get('phase', '')
+            phase_tag = f"　`{phase}`" if phase else ""
+            lines.append(f"**{i}. {f['name']}**　ICIR = `{f.get('icir', 0):.3f}`{phase_tag}")
+            lines.append(f"`{f.get('expr', '')[:80]}`")
             lines.append("")
 
     # 回测对比
@@ -1019,16 +1049,14 @@ def _build_evolved_message(run_result: dict, backtest: dict, stats: dict) -> str
         bl = backtest["baseline"]
         cd = backtest["candidate"]
         imp = backtest["improvement"]
-        lines.append("回测对比 (vs M01-LGB-D3v3r-v2602):")
-        lines.append(f"  M01:  Sharpe {bl['sharpe']:.3f} | MDD {bl['mdd']:.2%} | Return {bl['return']:.0%}")
-        lines.append(f"  候选: Sharpe {cd['sharpe']:.3f} | MDD {cd['mdd']:.2%} | Return {cd['return']:.0%}")
-        mark = "BETTER" if imp["is_better"] else "no improvement"
-        lines.append(f"  提升: {imp['sharpe_delta']:+.3f} Sharpe ({mark})")
+        mark = "✅" if imp["is_better"] else "❌"
+        lines.append("---")
+        lines.append("**📊 回测对比** (vs M01-LGB-D3v3r-v2602)")
+        lines.append(f"**Sharpe**:　{bl['sharpe']:.3f} → {cd['sharpe']:.3f}　({imp['sharpe_delta']:+.3f}) {mark}")
+        lines.append(f"**MDD**:　{bl['mdd']:.2%} → {cd['mdd']:.2%}")
+        lines.append(f"**Return**:　{bl['return']:.0%} → {cd['return']:.0%}")
 
-    lines.append("")
-    lines.append(f"接受命令: python -m factor_lab.factor_miner --accept {run_id}")
-
-    return "\n".join(lines)
+    return "\n".join(lines), "🧬 演化式因子挖掘 — 发现候选因子"
 
 
 # ============================================================================
@@ -1037,6 +1065,28 @@ def _build_evolved_message(run_result: dict, backtest: dict, stats: dict) -> str
 
 GLOBAL_POOL_FILE = "global_factor_pool.json"
 DIRECTION_REGISTRY_FILE = MINING_DIR / "direction_registry.json"
+
+
+def _create_synthetic_parent(d_entry: dict, d_idx: int):
+    """从 registry 的持久化信息创建合成 parent (跨 session mutation)"""
+    from factor_lab.quanta.trajectory import Trajectory
+    parent = Trajectory(
+        id=f"SYNTH_{d_entry['id']}",
+        direction_id=d_idx,
+        iteration=0,
+        phase="init",
+        hypothesis=d_entry.get("best_hypothesis") or d_entry.get("hypothesis", ""),
+        direction=d_entry.get("direction", ""),
+        mechanism=d_entry.get("mechanism", ""),
+    )
+    factor_name = d_entry.get("best_factor_name", "")
+    factor_expr = d_entry.get("best_factor_expr", "")
+    if factor_name and factor_expr:
+        parent.best_factor = {"name": factor_name, "expr": factor_expr}
+    parent.icir = d_entry.get("best_icir", 0.0)
+    parent.rank_ic = d_entry.get("best_icir", 0.0)
+    parent.compute_reward()
+    return parent
 
 
 def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
@@ -1157,9 +1207,15 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             admitted = ok
             print(f"    因子池: {'ADMITTED' if ok else 'REJECTED'} — {reason}")
 
+        factor_name = traj.best_factor.get('name', '') if traj and traj.best_factor else ''
+        factor_expr = traj.best_factor.get('expr', '') if traj and traj.best_factor else ''
+        hypothesis_text = traj.hypothesis if traj else ''
         registry.record_result(dir_id, admitted=admitted,
                                icir=traj.icir if traj else 0.0,
-                               session_id=run_id)
+                               session_id=run_id,
+                               factor_name=factor_name,
+                               factor_expr=factor_expr,
+                               hypothesis=hypothesis_text)
         if admitted:
             factors_admitted_this_session += 1
 
@@ -1223,12 +1279,16 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
                                        use_multistage=USE_MULTISTAGE)
             _admit_and_save(traj, dir_id, iteration=0)
 
-    # --- Phase C: 深度 — mutation (循环直到超时) ---
+    # --- Phase C: 深度 — mutation (70%) + 探索新假设 (30%) ---
     print(f"\n  === Phase C: 深度挖掘 ===")
+    explore_ratio = 0.3  # 30% 时间探索新假设
+    mutation_budget = depth_time * (1 - explore_ratio)
+    mutation_deadline = time.time() + mutation_budget
     depth_deadline = time.time() + depth_time
     depth_round = 0
 
-    while time.time() < depth_deadline:
+    # Part 1: Mutation (70%)
+    while time.time() < mutation_deadline:
         depth_dirs = registry.get_depth_targets(limit=10)
         if not depth_dirs:
             depth_dirs = registry.get_explorable(limit=5)
@@ -1236,21 +1296,21 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             depth_dirs = depth_dirs[:1]
 
         if not depth_dirs:
-            print(f"  无可 mutation 的方向, 跳过深度阶段")
+            print(f"  无可 mutation 的方向, 跳过 mutation 阶段")
             break
 
         if depth_round == 0:
             print(f"  深度目标: {len(depth_dirs)} 个方向")
         else:
-            remaining_min = (depth_deadline - time.time()) / 60
+            remaining_min = (mutation_deadline - time.time()) / 60
             print(f"\n  [深度] 第 {depth_round+1} 轮 ({len(depth_dirs)} 方向, "
                   f"剩余 {remaining_min:.0f}min)")
         depth_round += 1
 
         any_progress = False
         for d_entry in depth_dirs:
-            if time.time() > depth_deadline:
-                print(f"  [深度超时]")
+            if time.time() > mutation_deadline:
+                print(f"  [mutation 超时]")
                 break
 
             dir_id = d_entry["id"]
@@ -1260,11 +1320,30 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             d_idx = int(dir_id.split("_")[1])
             direction_trajs = [t for t in pool.get_successful()
                                if t.direction_id == d_idx]
-            if not direction_trajs:
-                print(f"    无可用 parent, 跳过")
+
+            if direction_trajs:
+                parent = max(direction_trajs, key=lambda t: t.reward)
+            elif d_entry.get("best_factor_name") and d_entry.get("best_factor_expr"):
+                # 跨 session: 从 registry 构建合成 parent
+                parent = _create_synthetic_parent(d_entry, d_idx)
+                print(f"    使用合成 parent (来自 registry: {d_entry['best_factor_name']})")
+            else:
+                # 无可用 parent → 回退到 Phase B 模式 (从头提出假设)
+                print(f"    无可用 parent, 回退到 Phase B 模式 (original 5-step)")
+                direction = {
+                    "direction": d_entry["direction"],
+                    "hypothesis": d_entry["hypothesis"],
+                    "mechanism": d_entry.get("mechanism", ""),
+                    "time_scale": d_entry.get("time_scale", ""),
+                }
+                traj = _run_original_5step(direction, d_idx, pool, dry_run,
+                                           factor_pool=global_pool,
+                                           experience_memory=experience_memory,
+                                           use_multistage=USE_MULTISTAGE)
+                _admit_and_save(traj, dir_id, iteration=depth_round)
+                any_progress = True
                 continue
 
-            parent = max(direction_trajs, key=lambda t: t.reward)
             print(f"    Parent: {parent.id} (ICIR={parent.icir:.4f})")
 
             traj = mutate_trajectory(parent, 1, pool, dry_run=dry_run,
@@ -1273,8 +1352,41 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             any_progress = True
 
         if not any_progress:
-            print(f"  本轮无进展, 结束深度阶段")
+            print(f"  本轮无进展, 结束 mutation 阶段")
             break
+
+    # Part 2: 探索新假设 (在已有好方向上提出全新假设, 30%)
+    if time.time() < depth_deadline:
+        remaining_explore = (depth_deadline - time.time()) / 60
+        print(f"\n  === Phase C2: 探索新假设 (剩余 {remaining_explore:.0f}min) ===")
+
+        explore_targets = registry.get_depth_targets(limit=5)
+        if not explore_targets:
+            explore_targets = registry.get_explorable(limit=3)
+        if smoke_test:
+            explore_targets = explore_targets[:1]
+
+        if explore_targets:
+            for d_entry in explore_targets:
+                if time.time() > depth_deadline:
+                    break
+
+                dir_id = d_entry["id"]
+                d_idx = int(dir_id.split("_")[1])
+                direction = {
+                    "direction": d_entry["direction"],
+                    "hypothesis": d_entry["hypothesis"],
+                    "mechanism": d_entry.get("mechanism", ""),
+                    "time_scale": d_entry.get("time_scale", ""),
+                }
+                print(f"\n  --- [Explore] {dir_id}: {d_entry['direction']} ---")
+                traj = _run_original_5step(direction, d_idx, pool, dry_run,
+                                           factor_pool=global_pool,
+                                           experience_memory=experience_memory,
+                                           use_multistage=USE_MULTISTAGE)
+                _admit_and_save(traj, dir_id, iteration=0)
+        else:
+            print(f"  无可探索方向")
 
     # --- Phase D: 质量筛选 → 全量回测 → mined.py ---
     print(f"\n  === Phase D: 最终评估 ===")
@@ -1348,16 +1460,16 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     if beat_baseline and not dry_run:
         _accept_factors_to_mined(quality_factors, run_id)
         shadow_id = _create_shadow_for_run(run_id, backtest)
-        msg = _build_daily_message(run_result, backtest, reg_stats)
+        msg, title = _build_daily_message(run_result, backtest, reg_stats)
         if shadow_id:
-            msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
-        _push_feishu(msg)
+            msg += f"\n\n> 已自动创建影子验证: **{shadow_id}** (20交易日)"
+        _push_feishu(msg, title)
     elif factors_admitted_this_session > 0 and not dry_run:
-        msg = (f"📅 每日因子挖掘 #{run_id}\n"
-               f"新增: {factors_admitted_this_session} 因子 | "
-               f"全局池: {fp_stats['size']}\n"
+        msg = (f"**运行** #{run_id}\n"
+               f"**新增** {factors_admitted_this_session} 因子　　"
+               f"**全局池** {fp_stats['size']}\n"
                f"{'回测未超越 M01' if backtest else '未执行回测 (无新质量因子)'}")
-        _push_feishu(msg)
+        _push_feishu(msg, "📅 每日因子挖掘 — 未超越基线")
 
     # 打印总结
     print(f"\n{'='*60}")
@@ -1372,8 +1484,8 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     print(f"{'='*60}")
 
 
-def _build_daily_message(run_result: dict, backtest: dict, reg_stats: dict) -> str:
-    """构建每日挖掘的飞书通知"""
+def _build_daily_message(run_result: dict, backtest: dict, reg_stats: dict) -> tuple[str, str]:
+    """构建每日挖掘的飞书通知 (markdown 卡片)，返回 (content, title)"""
     run_id = run_result.get("run_id", "?")
     dt = run_result.get("date", "?")
     new_count = run_result.get("factors_admitted_this_session", 0)
@@ -1381,27 +1493,24 @@ def _build_daily_message(run_result: dict, backtest: dict, reg_stats: dict) -> s
 
     status_str = ", ".join(f"{k}={v}" for k, v in reg_stats.get("by_status", {}).items())
     lines = [
-        f"📅 每日因子挖掘 — 发现候选因子",
-        "",
-        f"运行: #{run_id} ({dt})",
-        f"新增因子: {new_count} | 全局池: {pool_size}",
-        f"方向: {reg_stats.get('total', 0)} 个 ({status_str})",
+        f"**运行** #{run_id}　　**日期** {dt}",
+        f"**新增因子** {new_count}　　**全局池** {pool_size}",
+        f"**方向** {reg_stats.get('total', 0)} 个 ({status_str})",
     ]
 
     if backtest and "baseline" in backtest:
         bl = backtest["baseline"]
         cd = backtest["candidate"]
         imp = backtest["improvement"]
+        mark = "✅" if imp["is_better"] else "❌"
         lines.append("")
-        lines.append("回测对比 (vs M01-LGB-D3v3r-v2602):")
-        lines.append(f"  M01:  Sharpe {bl['sharpe']:.3f} | MDD {bl['mdd']:.2%} | Return {bl['return']:.0%}")
-        lines.append(f"  候选: Sharpe {cd['sharpe']:.3f} | MDD {cd['mdd']:.2%} | Return {cd['return']:.0%}")
-        mark = "BETTER" if imp["is_better"] else "no improvement"
-        lines.append(f"  提升: {imp['sharpe_delta']:+.3f} Sharpe ({mark})")
+        lines.append("---")
+        lines.append("**📊 回测对比** (vs M01-LGB-D3v3r-v2602)")
+        lines.append(f"**Sharpe**:　{bl['sharpe']:.3f} → {cd['sharpe']:.3f}　({imp['sharpe_delta']:+.3f}) {mark}")
+        lines.append(f"**MDD**:　{bl['mdd']:.2%} → {cd['mdd']:.2%}")
+        lines.append(f"**Return**:　{bl['return']:.0%} → {cd['return']:.0%}")
 
-    lines.append("")
-    lines.append(f"接受命令: python -m factor_lab.factor_miner --accept {run_id}")
-    return "\n".join(lines)
+    return "\n".join(lines), "📅 每日因子挖掘 — 发现候选因子"
 
 
 def main():
