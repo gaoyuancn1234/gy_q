@@ -56,9 +56,6 @@ class DirectionRegistry:
                 "status": "pending",
                 "created_session": session_id,
                 "best_icir": 0.0,
-                "best_factor_name": "",
-                "best_factor_expr": "",
-                "best_hypothesis": "",
                 "factors_admitted": 0,
                 "mutations_tried": 0,
                 "consecutive_failures": 0,
@@ -120,9 +117,7 @@ class DirectionRegistry:
             d["status"] = "exploring"
 
     def record_result(self, dir_id: str, admitted: bool, icir: float = 0.0,
-                      session_id: str = "",
-                      factor_name: str = "", factor_expr: str = "",
-                      hypothesis: str = ""):
+                      session_id: str = ""):
         """记录一次探索结果
 
         Args:
@@ -130,9 +125,6 @@ class DirectionRegistry:
             admitted: 本次是否有因子入池
             icir: 本次最佳 ICIR
             session_id: 当前 session ID
-            factor_name: 最佳因子名
-            factor_expr: 最佳因子表达式
-            hypothesis: 假说文本
         """
         d = self._find(dir_id)
         if not d:
@@ -146,20 +138,12 @@ class DirectionRegistry:
             d["consecutive_failures"] = 0
             if abs(icir) > abs(d["best_icir"]):
                 d["best_icir"] = icir
-                if factor_name:
-                    d["best_factor_name"] = factor_name
-                if factor_expr:
-                    d["best_factor_expr"] = factor_expr
-                if hypothesis:
-                    d["best_hypothesis"] = hypothesis
         else:
             d["consecutive_failures"] += 1
 
         # 状态转换
         from factor_lab.quanta.config import DAILY_EXHAUSTED_FAILURES
         if d["consecutive_failures"] >= DAILY_EXHAUSTED_FAILURES:
-            d["status"] = "exhausted"
-        elif self._is_hopeless(d):
             d["status"] = "exhausted"
         else:
             d["status"] = "explored"
@@ -189,28 +173,6 @@ class DirectionRegistry:
             "by_status": by_status,
             "total_admitted": total_admitted,
         }
-
-    def cleanup_exhausted(self, min_tries: int = 5) -> int:
-        """批量检查并标记无望方向为 exhausted
-
-        条件: mutations_tried >= min_tries, best_icir <= 0, factors_admitted == 0
-        Returns: 本次新标记为 exhausted 的方向数
-        """
-        count = 0
-        for d in self._directions:
-            if d["status"] in ("explored", "exploring") and self._is_hopeless(d, min_tries):
-                d["status"] = "exhausted"
-                count += 1
-        return count
-
-    def _is_hopeless(self, d: dict, min_tries: int = 4) -> bool:
-        """判断方向是否无望 (ICIR 持续负且无改善)
-
-        条件: 尝试 >= min_tries 次, 从未入池, best_icir <= 0
-        """
-        return (d["mutations_tried"] >= min_tries
-                and d["factors_admitted"] == 0
-                and d["best_icir"] <= 0)
 
     def _find(self, dir_id: str) -> dict | None:
         for d in self._directions:
