@@ -23,12 +23,15 @@ PID_FILE = WORK_DIR / "daemon.pid"
 CHECK_INTERVAL = 10  # 检查间隔（秒）
 MAX_RESTARTS = 10    # 最大连续重启次数
 RESTART_WINDOW = 300 # 重启计数窗口（秒）
+CRASH_ALERT_THRESHOLD = 3  # 短时间内崩溃次数超此值则飞书告警
+CRASH_ALERT_WINDOW = 600   # 告警统计窗口（秒，10分钟）
 
 class Daemon:
     def __init__(self):
         self.bot_process = None
         self.restart_times = []
         self.running = True
+        self._crash_alerted = False  # 避免重复告警
 
     def log(self, msg: str):
         """记录日志"""
@@ -41,11 +44,14 @@ class Daemon:
     def start_bot(self):
         """启动机器人"""
         self.log("启动机器人...")
+        env = os.environ.copy()
+        env['PYTHONUNBUFFERED'] = '1'
         self.bot_process = subprocess.Popen(
-            [sys.executable, str(BOT_SCRIPT)],
+            [sys.executable, '-u', str(BOT_SCRIPT)],
             cwd=str(WORK_DIR),
             stdout=open(WORK_DIR / "logs" / "smart_bot.log", 'a'),
-            stderr=subprocess.STDOUT
+            stderr=subprocess.STDOUT,
+            env=env
         )
         self.log(f"机器人已启动，PID: {self.bot_process.pid}")
 
@@ -55,17 +61,39 @@ class Daemon:
             return False
         return self.bot_process.poll() is None
 
+    def _send_crash_alert(self, count: int, window: int):
+        """进程频繁崩溃时发送飞书告警"""
+        try:
+            from send_signal import send_text
+            msg = (
+                f"🔴 Smart Bot 守护进程告警\n\n"
+                f"Bot 进程在 {window // 60} 分钟内崩溃重启 {count} 次，"
+                f"可能存在网络异常或程序错误。\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            send_text(msg)
+            self.log(f"[告警] 飞书崩溃告警已发送 (崩溃 {count} 次)")
+        except Exception as e:
+            self.log(f"[告警] 飞书推送失败: {e}")
+
     def restart_bot(self):
         """重启机器人"""
         now = time.time()
         # 清理过期的重启记录
         self.restart_times = [t for t in self.restart_times if now - t < RESTART_WINDOW]
 
+        # 飞书告警：短时间内频繁崩溃
+        recent_crashes = [t for t in self.restart_times if now - t < CRASH_ALERT_WINDOW]
+        if len(recent_crashes) >= CRASH_ALERT_THRESHOLD and not self._crash_alerted:
+            self._crash_alerted = True
+            self._send_crash_alert(len(recent_crashes), CRASH_ALERT_WINDOW)
+
         # 检查是否重启过于频繁
         if len(self.restart_times) >= MAX_RESTARTS:
             self.log(f"⚠️ {RESTART_WINDOW}秒内重启{MAX_RESTARTS}次，暂停60秒...")
             time.sleep(60)
             self.restart_times.clear()
+            self._crash_alerted = False  # 暂停后重置告警状态
 
         self.restart_times.append(now)
 
