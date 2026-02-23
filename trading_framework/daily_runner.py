@@ -175,10 +175,114 @@ def _update_daily_predictions() -> bool:
         return False
 
 
+def _update_shadow_predictions():
+    """为活跃 shadow 扩展预测到最新数据
+
+    LGB shadow: 调用 retrain_pipeline.extend_rolling_predictions
+    GatedMLP shadow: 重新运行 generate_gate_mlp_predictions
+    """
+    import yaml
+    import subprocess
+    import json as _json
+
+    registry_path = PROJECT_DIR / "shadow" / "registry.json"
+    if not registry_path.exists():
+        return
+
+    with open(registry_path) as f:
+        registry = _json.load(f)
+
+    for sid, cand in registry.items():
+        status = cand.get('status', '')
+        if status not in ('active', 'reverse_shadow'):
+            continue
+
+        config_path = PROJECT_DIR / cand.get('signal_config_path', '')
+        if not config_path.exists():
+            continue
+
+        with open(config_path) as f:
+            shadow_cfg = yaml.safe_load(f)
+
+        model = shadow_cfg.get('model', 'LightGBM')
+        test_end = shadow_cfg.get('test_end', '2026-06-30')
+
+        try:
+            if model == 'GatedMLP':
+                # GatedMLP: 完整重跑 (只有当新数据可用时)
+                output_dir = str(
+                    Path(cand.get('signal_config_path', '')).parent.parent
+                    / "state" / sid)
+                result = subprocess.run(
+                    [sys.executable, '-m',
+                     'factor_lab.generate_gate_mlp_predictions',
+                     '--output-dir', output_dir,
+                     '--test-end', test_end],
+                    capture_output=True, text=True, timeout=2400,
+                    cwd=str(PROJECT_DIR),
+                )
+                if result.returncode == 0:
+                    log.info(f"Shadow {sid} (GatedMLP) 预测已更新")
+                else:
+                    log.warning(f"Shadow {sid} (GatedMLP) 预测更新失败: "
+                                f"{result.stderr[-300:]}")
+            else:
+                # LGB: 调用 extend_rolling_predictions
+                # 需要临时覆盖 retrain_pipeline 的全局配置
+                rc = shadow_cfg.get('rolling_config', 'D_expand_3v_3r')
+                preset = shadow_cfg.get('preset', 'alpha158_val')
+                cache_dir = shadow_cfg.get('model_cache_dir', '')
+                json_dir = shadow_cfg.get('rolling_json_dir', '')
+                quality_dir = shadow_cfg.get('quality_cache_dir', '')
+
+                script = (
+                    'import multiprocessing; '
+                    'multiprocessing.set_start_method("fork", force=True); '
+                    'import sys; sys.path.insert(0, "."); '
+                    'import retrain_pipeline as rp; '
+                    f'rp.CONFIG_NAME = "{rc}"; '
+                    f'rp.PRESET = "{preset}"; '
+                    f'rp.MODEL_NAME = "{model}"; '
+                    f'rp.PRED_DIR = rp.PROJECT_DIR / "{cache_dir}"; '
+                    f'rp.RESULTS_DIR = rp.PROJECT_DIR / "{json_dir}"; '
+                    f'pred = rp.extend_rolling_predictions("{test_end}"); '
+                    f'print(f"RESULT:{{len(pred)}}")'
+                )
+                result = subprocess.run(
+                    [sys.executable, '-c', script],
+                    capture_output=True, text=True, timeout=600,
+                    cwd=str(PROJECT_DIR),
+                )
+                if result.returncode == 0 and 'RESULT:' in result.stdout:
+                    log.info(f"Shadow {sid} ({preset}+{model}) 预测已更新")
+                elif '预测已是最新' in (result.stdout or ''):
+                    pass  # 无需更新
+                else:
+                    stderr = result.stderr[-300:] if result.stderr else ''
+                    if stderr:
+                        log.warning(f"Shadow {sid} 预测更新失败: {stderr}")
+        except subprocess.TimeoutExpired:
+            log.warning(f"Shadow {sid} 预测更新超时")
+        except Exception as e:
+            log.warning(f"Shadow {sid} 预测更新异常: {e}")
+
+
 # ============ 自动重训 ============
 
 PRED_DIR = PROJECT_DIR / "factor_lab" / "results" / "rolling" / "predictions"
-PRED_PKL = PRED_DIR / "D_expand_3v_3r_alpha158_val_LightGBM.pkl"
+
+def _get_pred_pkl() -> Path:
+    """从 signal_config.yaml 动态构建预测文件路径"""
+    import yaml
+    config_path = PROJECT_DIR / "config" / "signal_config.yaml"
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    rc = cfg.get('rolling_config', 'D_expand_3v_3r')
+    preset = cfg.get('preset', 'alpha158_val')
+    model = cfg.get('model', 'LightGBM')
+    return PRED_DIR / f"{rc}_{preset}_{model}.pkl"
+
+PRED_PKL = _get_pred_pkl()
 
 
 def _backup_predictions() -> 'pd.Series | None':
@@ -738,47 +842,117 @@ def morning_reflection_report(dry_run: bool = False):
 
 # ============ 飞书推送 ============
 
-def push_feishu(message: str, dry_run: bool = False):
-    """推送消息到飞书"""
-    if dry_run:
-        log.info(f"[DRY RUN] 飞书消息:\n{message}")
+FEISHU_PENDING_FILE = LOG_DIR / "feishu_pending.json"
+
+
+def _save_pending_message(message: str):
+    """推送失败后持久化到本地，下次成功时补发"""
+    pending = []
+    if FEISHU_PENDING_FILE.exists():
+        try:
+            pending = json.loads(FEISHU_PENDING_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+    pending.append({"ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "msg": message})
+    FEISHU_PENDING_FILE.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding='utf-8')
+    log.info(f"消息已持久化到 {FEISHU_PENDING_FILE} (待补发 {len(pending)} 条)")
+
+
+def _flush_pending_messages(client, user_id: str):
+    """补发之前失败的消息"""
+    if not FEISHU_PENDING_FILE.exists():
+        return
+    try:
+        pending = json.loads(FEISHU_PENDING_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return
+    if not pending:
         return
 
-    try:
-        import lark_oapi as lark
-        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
-        app_id = os.environ.get("FEISHU_APP_ID_1", "")
-        app_secret = os.environ.get("FEISHU_APP_SECRET_1", "")
-        user_id = os.environ.get("FEISHU_USER_OPEN_ID", "")
-
-        if not all([app_id, app_secret, user_id]):
-            log.error("飞书凭证未配置，消息未发送")
-            log.info(f"消息内容:\n{message}")
-            return
-
-        client = lark.Client.builder() \
-            .app_id(app_id) \
-            .app_secret(app_secret) \
-            .build()
-
+    log.info(f"发现 {len(pending)} 条待补发消息，开始补发...")
+    failed = []
+    for item in pending:
+        text = f"[补发 {item['ts']}] {item['msg']}"
         req = CreateMessageRequest.builder() \
             .receive_id_type("open_id") \
             .request_body(CreateMessageRequestBody.builder()
                 .receive_id(user_id)
                 .msg_type("text")
-                .content(json.dumps({"text": message}))
+                .content(json.dumps({"text": text}))
                 .build()) \
             .build()
+        try:
+            resp = client.im.v1.message.create(req)
+            if resp.success():
+                log.info(f"补发成功: {item['ts']}")
+            else:
+                failed.append(item)
+        except Exception:
+            failed.append(item)
 
-        resp = client.im.v1.message.create(req)
-        if resp.success():
-            log.info("飞书消息发送成功")
-        else:
-            log.error(f"飞书发送失败: {resp.code} - {resp.msg}")
-    except Exception as e:
-        log.error(f"飞书推送异常: {e}")
+    if failed:
+        FEISHU_PENDING_FILE.write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding='utf-8')
+    else:
+        FEISHU_PENDING_FILE.unlink(missing_ok=True)
+        log.info("所有待补发消息已发送完毕")
+
+
+def push_feishu(message: str, dry_run: bool = False):
+    """推送消息到飞书（3次指数退避重试，失败后持久化补发）"""
+    if dry_run:
+        log.info(f"[DRY RUN] 飞书消息:\n{message}")
+        return
+
+    import lark_oapi as lark
+    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+    app_id = os.environ.get("FEISHU_APP_ID_1", "")
+    app_secret = os.environ.get("FEISHU_APP_SECRET_1", "")
+    user_id = os.environ.get("FEISHU_USER_OPEN_ID", "")
+
+    if not all([app_id, app_secret, user_id]):
+        log.error("飞书凭证未配置，消息未发送")
         log.info(f"消息内容:\n{message}")
+        return
+
+    client = lark.Client.builder() \
+        .app_id(app_id) \
+        .app_secret(app_secret) \
+        .build()
+
+    req = CreateMessageRequest.builder() \
+        .receive_id_type("open_id") \
+        .request_body(CreateMessageRequestBody.builder()
+            .receive_id(user_id)
+            .msg_type("text")
+            .content(json.dumps({"text": message}))
+            .build()) \
+        .build()
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = client.im.v1.message.create(req)
+            if resp.success():
+                log.info("飞书消息发送成功")
+                # 发送成功后尝试补发之前失败的消息
+                _flush_pending_messages(client, user_id)
+                return
+            else:
+                log.warning(f"飞书发送失败 (第{attempt+1}次): {resp.code} - {resp.msg}")
+        except Exception as e:
+            log.warning(f"飞书推送异常 (第{attempt+1}次): {e}")
+
+        if attempt < max_retries - 1:
+            wait = 2 ** attempt  # 1s, 2s
+            log.info(f"  {wait}s 后重试...")
+            time.sleep(wait)
+
+    # 3次全部失败，持久化到本地
+    log.error(f"飞书推送3次重试均失败，消息已持久化")
+    _save_pending_message(message)
 
 
 # ============ 主入口 ============
@@ -934,6 +1108,12 @@ def main():
         if not _update_daily_predictions() and degraded:
             # 数据刷新失败且增量预测也没更新才告警
             degraded.append("增量预测未更新")
+
+        # 影子预测扩展 (非阻塞, 失败不影响主流程)
+        try:
+            _update_shadow_predictions()
+        except Exception as e:
+            log.warning(f"影子预测更新异常: {e}")
 
         # 自动重训检查 (距 pred_end > 60天则触发)
         _check_auto_retrain(dry_run=args.dry_run)
