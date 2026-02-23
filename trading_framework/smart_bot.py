@@ -719,8 +719,8 @@ class SmartBot:
         self.tmp_store = TempFileStore()
         self.tmp_store.cleanup_disk()  # 启动时清理残留
         self.processed_msg_ids: set = set()  # 内存降级用（Redis 不可用时）
-        self._ws_disconnect_count = 0  # WebSocket 断连统计
-        self._ws_disconnect_alerted = False  # 是否已发送断连告警
+        self._ws_disconnect_times: deque = deque()  # 断连时间戳滑动窗口
+        self._ws_disconnect_alert_cd: float = 0  # 告警冷却截止时间戳
 
     def send_text(self, text: str, session: 'UserSession' = None):
         """发送文本消息 (超长自动分段)"""
@@ -2565,18 +2565,34 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             print(f"[卡片处理错误] {e}")
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": str(e)[:50]}})
 
+    def _record_disconnect(self, app_id: str):
+        """记录断连事件，10分钟内>=3次触发告警"""
+        now = time.time()
+        self._ws_disconnect_times.append(now)
+        # 清理10分钟前的记录
+        cutoff = now - 600
+        while self._ws_disconnect_times and self._ws_disconnect_times[0] < cutoff:
+            self._ws_disconnect_times.popleft()
+
+        recent = len(self._ws_disconnect_times)
+        print(f"[WS] App {app_id} 断连 (10min内 {recent} 次)")
+
+        if recent >= 3 and now > self._ws_disconnect_alert_cd:
+            self._ws_disconnect_alert_cd = now + 600  # 10分钟冷却
+            self._send_disconnect_alert(recent)
+
     def _send_disconnect_alert(self, count: int):
-        """WebSocket 连续断连超阈值时，通过飞书告警通知"""
+        """WebSocket 断连频繁时，通过飞书告警通知"""
         try:
             app_id = APPS[0]["app_id"]
             app_secret = APPS[0]["app_secret"]
             user_id = os.environ.get("FEISHU_USER_OPEN_ID", "")
             if not user_id:
-                print(f"[WS告警] 连续断连 {count} 次，但无 FEISHU_USER_OPEN_ID 无法推送")
+                print(f"[WS告警] 10min内断连 {count} 次，但无 FEISHU_USER_OPEN_ID 无法推送")
                 return
 
             client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
-            msg = f"🔴 Smart Bot WebSocket 连续断连 {count} 次\n\n请检查网络连接或飞书服务状态。\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            msg = f"🔴 Smart Bot WebSocket 10分钟内断连 {count} 次\n\n请检查网络连接或飞书服务状态。\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             req = CreateMessageRequest.builder() \
                 .receive_id_type("open_id") \
                 .request_body(CreateMessageRequestBody.builder()
@@ -2658,30 +2674,23 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
         from lark_oapi.ws.client import loop as sdk_loop
 
         async def _connect_with_retry(ws_client, app_id: str):
-            """带断连统计的连接包装"""
+            """带断连统计的连接包装（滑动窗口告警）"""
+            consecutive = 0
             while True:
                 try:
                     await ws_client._connect()
-                    # 连接成功，重置计数
-                    if self._ws_disconnect_count > 0:
-                        print(f"[WS] App {app_id} 重连成功 (此前断连 {self._ws_disconnect_count} 次)")
-                    self._ws_disconnect_count = 0
-                    self._ws_disconnect_alerted = False
+                    if consecutive > 0:
+                        print(f"[WS] App {app_id} 重连成功 (此前连续断连 {consecutive} 次)")
+                    consecutive = 0
                     sdk_loop.create_task(ws_client._ping_loop())
-                    # 连接建立后等待，直到连接断开
                     while True:
                         await asyncio.sleep(30)
                 except Exception as e:
-                    self._ws_disconnect_count += 1
-                    print(f"[WS] App {app_id} 断连 #{self._ws_disconnect_count}: {e}")
-
-                    # 连续断连超过5次，发送告警
-                    if self._ws_disconnect_count >= 5 and not self._ws_disconnect_alerted:
-                        self._ws_disconnect_alerted = True
-                        self._send_disconnect_alert(self._ws_disconnect_count)
+                    consecutive += 1
+                    self._record_disconnect(app_id)
 
                     # 指数退避重连: 5s, 10s, 20s, ... 最大 300s
-                    backoff = min(5 * (2 ** (self._ws_disconnect_count - 1)), 300)
+                    backoff = min(5 * (2 ** (consecutive - 1)), 300)
                     print(f"[WS] {backoff}s 后重连...")
                     await asyncio.sleep(backoff)
 
