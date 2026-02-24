@@ -175,7 +175,7 @@ def _update_daily_predictions() -> bool:
         return False
 
 
-def _update_shadow_predictions():
+def _update_shadow_predictions(dry_run: bool = False):
     """为活跃 shadow 扩展预测到最新数据
 
     LGB shadow: 调用 retrain_pipeline.extend_rolling_predictions
@@ -184,6 +184,12 @@ def _update_shadow_predictions():
     import yaml
     import subprocess
     import json as _json
+
+    # 模型差异化超时 (秒)
+    MODEL_TIMEOUTS = {
+        'GatedMLP': 3600,   # 60 分钟
+        'LightGBM': 600,    # 10 分钟
+    }
 
     registry_path = PROJECT_DIR / "shadow" / "registry.json"
     if not registry_path.exists():
@@ -206,6 +212,7 @@ def _update_shadow_predictions():
 
         model = shadow_cfg.get('model', 'LightGBM')
         test_end = shadow_cfg.get('test_end', '2026-06-30')
+        timeout_sec = MODEL_TIMEOUTS.get(model, 600)
 
         try:
             if model == 'GatedMLP':
@@ -218,14 +225,17 @@ def _update_shadow_predictions():
                      'factor_lab.generate_gate_mlp_predictions',
                      '--output-dir', output_dir,
                      '--test-end', test_end],
-                    capture_output=True, text=True, timeout=2400,
+                    capture_output=True, text=True, timeout=timeout_sec,
                     cwd=str(PROJECT_DIR),
                 )
                 if result.returncode == 0:
                     log.info(f"Shadow {sid} (GatedMLP) 预测已更新")
                 else:
-                    log.warning(f"Shadow {sid} (GatedMLP) 预测更新失败: "
-                                f"{result.stderr[-300:]}")
+                    err_msg = result.stderr[-300:] if result.stderr else '无错误信息'
+                    log.warning(f"Shadow {sid} (GatedMLP) 预测更新失败: {err_msg}")
+                    push_feishu(
+                        f"⚠️ Shadow {sid} (GatedMLP) 预测更新失败\n{err_msg}",
+                        dry_run)
             else:
                 # LGB: 调用 extend_rolling_predictions
                 # 需要临时覆盖 retrain_pipeline 的全局配置
@@ -250,7 +260,7 @@ def _update_shadow_predictions():
                 )
                 result = subprocess.run(
                     [sys.executable, '-c', script],
-                    capture_output=True, text=True, timeout=600,
+                    capture_output=True, text=True, timeout=timeout_sec,
                     cwd=str(PROJECT_DIR),
                 )
                 if result.returncode == 0 and 'RESULT:' in result.stdout:
@@ -261,10 +271,20 @@ def _update_shadow_predictions():
                     stderr = result.stderr[-300:] if result.stderr else ''
                     if stderr:
                         log.warning(f"Shadow {sid} 预测更新失败: {stderr}")
+                        push_feishu(
+                            f"⚠️ Shadow {sid} ({model}) 预测更新失败\n{stderr}",
+                            dry_run)
         except subprocess.TimeoutExpired:
-            log.warning(f"Shadow {sid} 预测更新超时")
+            timeout_min = timeout_sec // 60
+            log.warning(f"Shadow {sid} ({model}) 预测更新超时 (>{timeout_min}分钟)")
+            push_feishu(
+                f"⚠️ Shadow {sid} ({model}) 预测更新超时 (>{timeout_min}分钟)\n"
+                f"请检查模型状态或手动重试",
+                dry_run)
         except Exception as e:
             log.warning(f"Shadow {sid} 预测更新异常: {e}")
+            push_feishu(
+                f"⚠️ Shadow {sid} 预测更新异常: {e}", dry_run)
 
 
 # ============ 自动重训 ============
@@ -1099,6 +1119,24 @@ def main():
             log.info("今天非交易日，跳过")
             return
 
+        # 长假检测: 距上次推送 > 5 日历天 (≈ > 3 交易日)，主动通知用户
+        try:
+            from portfolio.live_portfolio import load_live_holdings
+            _h = load_live_holdings()
+            _last_signal = _h.get('last_signal_date')
+            if _last_signal:
+                _gap = (date.today() - datetime.strptime(
+                    _last_signal, '%Y-%m-%d').date()).days
+                if _gap > 5:
+                    push_feishu(
+                        f"📢 长假后首次运行\n"
+                        f"距上次推送已 {_gap} 天 ({_last_signal})\n"
+                        f"数据刷新中，预计推送延迟 5-10 分钟...",
+                        args.dry_run)
+                    log.info(f"长假检测: 距上次推送 {_gap} 天，已发送进度通知")
+        except Exception as e:
+            log.warning(f"长假检测失败: {e}")
+
         # 刷新数据 (失败则用旧数据继续，但记录警告)
         if not refresh_daily_data():
             log.warning("数据刷新失败，将使用缓存数据继续")
@@ -1109,9 +1147,9 @@ def main():
             # 数据刷新失败且增量预测也没更新才告警
             degraded.append("增量预测未更新")
 
-        # 影子预测扩展 (非阻塞, 失败不影响主流程)
+        # 影子预测扩展 (非阻塞, 失败不影响主流程，但飞书告警)
         try:
-            _update_shadow_predictions()
+            _update_shadow_predictions(dry_run=args.dry_run)
         except Exception as e:
             log.warning(f"影子预测更新异常: {e}")
 
