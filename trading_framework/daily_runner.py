@@ -187,7 +187,7 @@ def _update_shadow_predictions(dry_run: bool = False):
 
     # 模型差异化超时 (秒)
     MODEL_TIMEOUTS = {
-        'GatedMLP': 3600,   # 60 分钟
+        'GatedMLP': 7200,   # 120 分钟 (9窗口rolling训练需180-270分钟，留余量)
         'LightGBM': 600,    # 10 分钟
     }
 
