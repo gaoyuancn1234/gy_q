@@ -637,6 +637,7 @@ class UserSession:
         self.pending_actions: Dict[str, dict] = {}
         self._actions_lock = threading.Lock()
         self.paper_context: Optional[str] = None  # 当前论文对话上下文 (paper_id)
+        self.last_images: List[tuple] = []  # 最近图片列表 [(path, timestamp), ...] 用于跨消息关联
 
     # ---- pending_actions 管理 ----
 
@@ -842,7 +843,7 @@ class SmartBot:
 
             if resp.success():
                 # 保存到临时文件
-                save_path = WORK_DIR / f"user_image_{int(time.time())}.png"
+                save_path = WORK_DIR / f"user_image_{int(time.time() * 1000)}.png"
                 with open(save_path, 'wb') as f:
                     f.write(resp.file.read())
                 print(f"[下载图片] {save_path}")
@@ -1237,7 +1238,9 @@ class SmartBot:
 3. 生成图片后，在回复中写明图片路径，格式：[IMAGE:/path/to/image.png]
 4. 如果用户发送了图片，仔细分析图片内容
 5. 回复简洁，中文，告诉用户做了什么
-6. 动作标签 ([PAPER_SEARCH:...] 等) 只在需要时添加，系统会自动解析并执行"""
+6. 动作标签 ([PAPER_SEARCH:...] 等) 只在需要时添加，系统会自动解析并执行
+7. 如果用户发送的图片是成交记录/交割单截图（含成交价和数量），或者是持仓截图（显示当前持有股票列表），且用户的意图是确认交易/更新持仓（如"就这些了"、"成交了"、"买好了"、发截图不说话也算），在回复末尾添加: [TRADE_UPDATE]
+   系统会自动解析截图并与当前持仓对比，生成更新确认卡片。注意：行情图、K线图、资讯截图等不触发。"""
 
         try:
             # 如果有图片，在 prompt 中加入图片路径让 Claude 读取
@@ -1249,34 +1252,48 @@ class SmartBot:
 
             cmd = ['/usr/local/bin/claude', '--print', '--dangerously-skip-permissions', '-p', prompt]
 
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                cwd=str(WORK_DIR), env=_CLEAN_ENV
-            )
-            if session:
-                session.current_process = proc
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout)
-                output = stdout.strip() or stderr.strip() or "无响应"
-            except subprocess.TimeoutExpired:
-                # 不杀进程，启动后台线程继续等待结果
-                print(f"[超时] {timeout}秒已到，任务转入后台继续执行")
-                if session:
-                    session.current_process = None
-                self._wait_bg_result(proc, session, complexity_desc)
-                return f"⏳ 任务较复杂（{complexity_desc}），已转入后台继续执行，完成后会自动发送结果。"
-            finally:
-                if session:
-                    session.current_process = None
-            print(f"[Claude输出长度] {len(output)} 字符")
-            # 前台也检测 API 错误，加醒目标记
             api_error_keywords = ['403', 'forbidden', 'Failed to authenticate',
                                   'API Error', '401', 'unauthorized']
-            if any(kw.lower() in output.lower() for kw in api_error_keywords):
-                print(f"[前台API错误] {output[:200]}")
-                return f"⚠️ Claude API 访问错误，需要你处理：\n\n{output}"
-            return output
+            max_retries = 3
+            last_output = ""
+
+            for attempt in range(max_retries):
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    cwd=str(WORK_DIR), env=_CLEAN_ENV
+                )
+                if session:
+                    session.current_process = proc
+                try:
+                    stdout, stderr = proc.communicate(timeout=timeout)
+                    last_output = stdout.strip() or stderr.strip() or "无响应"
+                except subprocess.TimeoutExpired:
+                    # 不杀进程，启动后台线程继续等待结果
+                    print(f"[超时] {timeout}秒已到，任务转入后台继续执行")
+                    if session:
+                        session.current_process = None
+                    self._wait_bg_result(proc, session, complexity_desc)
+                    return f"⏳ 任务较复杂（{complexity_desc}），已转入后台继续执行，完成后会自动发送结果。"
+                finally:
+                    if session:
+                        session.current_process = None
+
+                # 检测 API 错误，指数退避重试
+                if any(kw.lower() in last_output.lower() for kw in api_error_keywords):
+                    print(f"[API错误] 第{attempt+1}次: {last_output[:200]}")
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt  # 1s, 2s
+                        print(f"[API重试] {wait}s 后重试...")
+                        time.sleep(wait)
+                        continue
+                    # 3次全失败
+                    return f"⚠️ Claude API 访问错误（已重试{max_retries}次），需要你处理：\n\n{last_output}"
+
+                print(f"[Claude输出长度] {len(last_output)} 字符")
+                return last_output
+
+            return last_output
         except Exception as e:
             if session:
                 session.current_process = None
@@ -1458,8 +1475,8 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             text = text[cut:].lstrip('\n')
         return chunks
 
-    def process_response(self, response: str, session: 'UserSession' = None):
-        """处理 Claude 响应 - 解析文本、图片、动作标签"""
+    def process_response(self, response: str, session: 'UserSession' = None) -> bool:
+        """处理 Claude 响应 - 解析文本、图片、动作标签。返回 True 表示有后台线程在使用图片。"""
         print(f"[Claude响应] {response[:500]}...")
 
         # ── 解析动作标签 ──
@@ -1467,10 +1484,13 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
         paper_matches = re.findall(r'\[PAPER_SEARCH:([^\]]+)\]', response)
         # [CANCEL_ACTION] → 取消待确认操作
         has_cancel = '[CANCEL_ACTION]' in response
+        # [TRADE_UPDATE] → 成交截图触发持仓更新
+        has_trade_update = '[TRADE_UPDATE]' in response
 
         # 清理动作标签 (不展示给用户)
         clean_text = re.sub(r'\[PAPER_SEARCH:[^\]]+\]', '', response)
         clean_text = clean_text.replace('[CANCEL_ACTION]', '')
+        clean_text = clean_text.replace('[TRADE_UPDATE]', '')
 
         # 提取图片路径 [IMAGE:/path/to/image.png]
         image_pattern = r'\[IMAGE:([^\]]+)\]'
@@ -1538,6 +1558,26 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
                 action_id, session
             )
 
+        # [TRADE_UPDATE] → 解析成交截图并创建持仓更新确认卡片
+        trade_in_flight = False
+        if has_trade_update and session and session.last_images:
+            valid_images = [p for p, t in session.last_images if Path(p).exists()]
+            if valid_images:
+                trade_in_flight = True
+                session.last_images = []  # 防止同一批截图重复触发
+                self.send_text("⏳ 正在解析成交截图...", session)
+                threading.Thread(
+                    target=self._handle_screenshot_trades,
+                    args=("用户确认成交", valid_images, session),
+                    daemon=True
+                ).start()
+            else:
+                self.send_text("未找到最近的成交截图，请重新发送截图", session)
+        elif has_trade_update and session:
+            self.send_text("未找到最近的成交截图，请重新发送截图", session)
+
+        return trade_in_flight
+
     def _handle_ml_signal(self, session: 'UserSession' = None):
         """生成 ML 信号并推送"""
         try:
@@ -1576,72 +1616,147 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             import traceback
             traceback.print_exc()
 
-    def _handle_screenshot_trades(self, text: str, image_path: str, session: 'UserSession' = None):
-        """截图解析持仓更新
+    def _handle_screenshot_trades(self, text: str, image_paths, session: 'UserSession' = None):
+        """截图解析持仓更新 (支持多张截图, 支持成交截图和持仓截图)
 
-        用户发送成交截图 + "已执行/成交/已买入/已卖出" → Claude 解析 → 确认卡片 → apply_trades
+        成交截图: 直接提取 buy/sell trades
+        持仓截图: 提取当前持仓 → 与 live_holdings 对比 → 生成 trades
+        image_paths: 单张路径 (str) 或多张路径列表 (list)
         """
+        # 兼容旧调用: str → list
+        if isinstance(image_paths, str):
+            image_paths = [image_paths]
+        image_paths = [p for p in image_paths if Path(p).exists()]
+        if not image_paths:
+            self.send_text("❌ 截图文件不存在，请重新发送", session)
+            return
+
         try:
-            # 调用 Claude CLI 解析截图
-            prompt = f"""分析这张股票交易成交截图，提取所有成交记录。
+            # 读取当前系统持仓，供对比
+            from portfolio.live_portfolio import load_live_holdings
+            live_h = load_live_holdings()
+            current_positions = live_h.get('positions', {})
+            pos_summary = json.dumps({code: {"shares": p["shares"], "cost": p.get("avg_cost", 0)}
+                                      for code, p in current_positions.items()}, ensure_ascii=False) if current_positions else "{}"
+
+            # 合并多张截图让 Claude 一次性解析
+            read_cmds = "\n".join(f"请用 Read 工具查看图片 {p}" for p in image_paths)
+            n_imgs = len(image_paths)
+
+            prompt = f"""分析{'这' + str(n_imgs) + '张' if n_imgs > 1 else '这张'}股票截图，提取信息用于更新持仓系统。
 
 用户说: {text}
 
-请仔细识别截图中的每笔成交，输出 JSON 格式:
-{{"trades": [
-    {{"action": "buy", "code": "SH600036", "shares": 200, "price": 38.50, "name": "招商银行"}},
-    {{"action": "sell", "code": "SH601166", "shares": 300, "price": 16.80, "name": "兴业银行"}}
+截图可能是以下两种之一：
+A) 成交记录/交割单 — 显示买入/卖出明细（成交价、成交量）
+B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价、现价）
+
+【系统当前持仓】:
+{pos_summary}
+
+请按以下规则输出 JSON:
+
+如果是成交记录 (A)，直接提取每笔成交:
+{{"type": "trades", "trades": [
+    {{"action": "buy", "code": "SH600036", "shares": 200, "price": 38.50, "name": "招商银行"}}
+]}}
+
+如果是持仓截图 (B)，提取截图中所有持仓，系统会自动与当前持仓对比:
+{{"type": "holdings", "holdings": [
+    {{"code": "SH600036", "shares": 200, "price": 38.50, "cost": 37.80, "name": "招商银行"}}
 ]}}
 
 规则:
 1. code 用 Qlib 格式: 沪市 SH + 6位数字, 深市 SZ + 6位数字
 2. action: buy=买入, sell=卖出
-3. shares: 成交数量 (股)
-4. price: 成交均价
-5. 只输出 JSON，不要其他文字"""
+3. shares: 持仓数量或成交数量 (股)
+4. price: 现价或成交均价
+5. cost: 成本价 (仅持仓截图需要)
+6. 多张截图的内容请合并 (可能是同一个持仓列表分页截图)
+7. 只输出一个 JSON，不要其他文字"""
 
             cmd = [
                 '/usr/local/bin/claude', '--print', '--dangerously-skip-permissions',
-                '-p', f"请先用 Read 工具查看图片 {image_path}，然后:\n\n{prompt}"
+                '-p', f"{read_cmds}\n\n{prompt}"
             ]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60, cwd=str(WORK_DIR), env=_CLEAN_ENV
+                cmd, capture_output=True, text=True, timeout=120, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
 
-            # 提取 JSON
             json_match = re.search(r'\{.*\}', output, re.DOTALL)
             if not json_match:
-                self.send_text("❌ 无法从截图中解析成交记录，请确认图片清晰", session)
+                self.send_text("❌ 无法从截图中解析内容，请确认图片清晰", session)
                 return
 
             data = json.loads(json_match.group())
-            trades = data.get('trades', [])
-            if not trades:
-                self.send_text("未识别到成交记录", session)
+            screenshot_type = data.get('type', 'trades')
+
+            if screenshot_type == 'holdings':
+                # 持仓截图 → 与当前持仓对比生成 trades
+                all_trades = self._diff_holdings(current_positions, data.get('holdings', []))
+            else:
+                # 成交截图 → 直接使用
+                all_trades = data.get('trades', [])
+
+            if not all_trades:
+                self.send_text("截图持仓与系统一致，无需更新", session)
                 return
 
             # 构建确认内容
-            lines = ["识别到以下成交记录:\n"]
-            for t in trades:
+            lines = ["识别到以下变动:\n"]
+            for t in all_trades:
                 action_str = "买入" if t['action'] == 'buy' else "卖出"
                 name = t.get('name', t['code'])
                 lines.append(f"• {action_str} {name} {t['shares']}股 ×{t['price']}")
 
             action_id = f"TRADE_{int(time.time())}"
-            session.add_pending_action(action_id, 'apply_trades', {'trades': trades})
+            session.add_pending_action(action_id, 'apply_trades', {'trades': all_trades})
             self.send_confirm_card(
-                "📸 确认成交记录",
+                "📸 确认持仓更新",
                 "\n".join(lines),
                 action_id,
                 session
             )
         except json.JSONDecodeError:
-            self.send_text("❌ 解析成交记录失败，请重新发送截图", session)
+            self.send_text("❌ 解析截图失败，请重新发送", session)
         except subprocess.TimeoutExpired:
             self.send_text("⏳ 截图解析超时，请重试", session)
         except Exception as e:
             self.send_text(f"❌ 截图处理异常: {e}", session)
+        finally:
+            # 清理临时图片文件 → Redis
+            for p in image_paths:
+                if Path(p).exists():
+                    self.tmp_store.store(p, session.open_id if session else "unknown")
+
+    def _diff_holdings(self, current_positions: dict, screenshot_holdings: list) -> list:
+        """对比系统持仓和截图持仓，生成 trades 列表"""
+        trades = []
+        screenshot_map = {}
+        for h in screenshot_holdings:
+            code = h['code']
+            screenshot_map[code] = h
+
+        # 截图中有但系统没有 → 买入
+        # 截图中有且系统也有但数量不同 → 差额买入/卖出
+        for code, h in screenshot_map.items():
+            sys_shares = current_positions.get(code, {}).get('shares', 0)
+            scr_shares = h['shares']
+            price = h.get('price', h.get('cost', 0))
+            name = h.get('name', code)
+
+            if scr_shares > sys_shares:
+                trades.append({"action": "buy", "code": code, "shares": scr_shares - sys_shares, "price": price, "name": name})
+            elif scr_shares < sys_shares:
+                trades.append({"action": "sell", "code": code, "shares": sys_shares - scr_shares, "price": price, "name": name})
+
+        # 系统有但截图中没有 → 卖出 (清仓)
+        for code, pos in current_positions.items():
+            if code not in screenshot_map:
+                trades.append({"action": "sell", "code": code, "shares": pos['shares'], "price": pos.get('avg_cost', 0), "name": pos.get('name', code)})
+
+        return trades
 
     # ── 论文调研处理 ────────────────────────────────
 
@@ -1994,12 +2109,22 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             )
             return True
 
-        # 截图 + 成交确认
-        if image_path and any(kw in text for kw in ['已执行', '成交', '已买入', '已卖出', '已买', '已卖']):
+        # 截图 + 成交确认 (支持 session 最近 5 分钟内的图片)
+        all_images = []
+        if image_path:
+            all_images = [image_path]
+        if session and session.last_images:
+            all_images = list(dict.fromkeys(  # 去重保序
+                [image_path] + [p for p, _ in session.last_images] if image_path
+                else [p for p, _ in session.last_images]
+            ))
+        if all_images and any(kw in text for kw in ['已执行', '成交', '已买入', '已卖出', '已买', '已卖']):
             self.send_text("⏳ 正在解析成交截图...", session)
+            if session:
+                session.last_images = []  # 防止重复触发
             threading.Thread(
                 target=self._handle_screenshot_trades,
-                args=(text, image_path, session),
+                args=(text, all_images, session),
                 daemon=True
             ).start()
             return True
@@ -2354,18 +2479,31 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             session.memory.add_message(Message(role="user", content=text))
             session.current_task = text[:30]
 
+            # 存储图片到 session (跨消息关联, 5分钟窗口)
+            now = time.time()
+            if image_path:
+                session.last_images.append((image_path, now))
+            # 清理过期图片 (>5分钟)
+            session.last_images = [(p, t) for p, t in session.last_images if now - t < 300]
+
             # 快捷命令
             if self.handle_quick_commands(text, session, image_path=image_path):
                 return
 
+            # fallback: 使用 session 中最近 5 分钟内的图片
+            effective_image = image_path
+            if not effective_image and session and session.last_images:
+                effective_image = session.last_images[-1][0]  # 最新一张传给 Claude
+
             # 给消息加"收到"表情
             if msg_id:
                 self.add_reaction(msg_id, "OK", session)
-            response = self.call_claude(text, session, image_path)
-            self.process_response(response, session)
+            response = self.call_claude(text, session, effective_image)
+            trade_in_flight = self.process_response(response, session)
 
             # 处理完毕后将临时图片存入 Redis 并删除磁盘文件
-            if image_path and Path(image_path).exists():
+            # 如果有 TRADE_UPDATE 后台线程在使用图片，跳过删除
+            if image_path and Path(image_path).exists() and not trade_in_flight:
                 self.tmp_store.store(image_path, session.open_id)
 
             # 保存结果供后续任务参考
@@ -2495,8 +2633,13 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
 
             combined_text = " ".join([m.content for m in batch])
             last_msg_id = batch[-1].msg_id if batch else None
-            # 获取最后一张图片
-            last_image = next((m.image_path for m in reversed(batch) if m.image_path), None)
+            # 收集 batch 中所有图片 → 注入 session (多截图支持)
+            batch_images = [m.image_path for m in batch if m.image_path]
+            if len(batch_images) > 1:
+                now = time.time()
+                for img in batch_images[:-1]:  # 最后一张由 process_message 存入
+                    session.last_images.append((img, now))
+            last_image = batch_images[-1] if batch_images else None
             print(f"[处理] [{open_id[:12]}] {combined_text[:50]}{'...' if len(combined_text) > 50 else ''}")
 
             # 异步处理（含 pending 调度）
