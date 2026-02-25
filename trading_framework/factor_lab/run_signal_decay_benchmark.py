@@ -43,14 +43,29 @@ CONFIG_NAME = 'D_expand_3v_3r'
 
 CACHE_DIR = PROJECT_DIR / "factor_lab" / "results" / "rolling" / "predictions"
 RESULTS_DIR = PROJECT_DIR / "factor_lab" / "results" / "signal_decay"
-ROLLING_JSON = PROJECT_DIR / "factor_lab" / "results" / "rolling" / f"{CONFIG_NAME}_alpha158_val_LightGBM.json"
+
+
+def _get_current_preset() -> str:
+    """从 signal_config.yaml 读取当前生产 preset"""
+    import yaml
+    config_path = PROJECT_DIR / "config" / "signal_config.yaml"
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        return cfg.get('preset', 'alpha158_val')
+    except Exception:
+        return 'alpha158_val'
+
+
+PRESET = _get_current_preset()
+ROLLING_JSON = PROJECT_DIR / "factor_lab" / "results" / "rolling" / f"{CONFIG_NAME}_{PRESET}_LightGBM.json"
 
 
 # ============ Part A: 信号质量分析 ============
 
 def load_predictions() -> pd.Series:
     """加载 LightGBM rolling 预测"""
-    pkl_path = CACHE_DIR / f"{CONFIG_NAME}_alpha158_val_LightGBM.pkl"
+    pkl_path = CACHE_DIR / f"{CONFIG_NAME}_{PRESET}_LightGBM.pkl"
     if not pkl_path.exists():
         raise FileNotFoundError(f"预测缓存不存在: {pkl_path}\n请先运行 run_execution_benchmark.py")
     return pd.read_pickle(pkl_path)
