@@ -384,12 +384,15 @@ class ShadowManager:
             yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
         print(f"  [shadow] 已更新 signal_config.yaml")
 
-        # 3. 标记 promoted
+        # 3. 同步 shadow 预测缓存到主 PRED_DIR (factor_miner 等依赖此路径)
+        self._sync_shadow_predictions_to_main(shadow_id, config)
+
+        # 4. 标记 promoted
         cand['status'] = 'promoted'
         cand['promoted_date'] = date.today().isoformat()
         _save_registry(self.registry)
 
-        # 4. 为旧基线创建反转影子
+        # 5. 为旧基线创建反转影子
         reverse_id = self._create_reverse_shadow(shadow_id, bak_path)
 
         print(f"  [shadow] {shadow_id} 已晋升")
@@ -479,6 +482,34 @@ class ShadowManager:
                        "signal_decay" / "quality_score.pkl")
         if src_quality.exists():
             shutil.copy2(src_quality, target_dir / "quality_score.pkl")
+
+    def _sync_shadow_predictions_to_main(self, shadow_id: str,
+                                            new_config: dict):
+        """将 shadow 的预测缓存拷贝到主 PRED_DIR，使 factor_miner 等能找到新基线"""
+        rc = new_config.get('rolling_config', 'D_expand_3v_3r')
+        preset = new_config.get('preset', 'alpha158_val')
+        model = new_config.get('model', 'LightGBM')
+        pkl_name = f"{rc}_{preset}_{model}.pkl"
+
+        shadow_pred_dir = SHADOW_DIR / "state" / shadow_id / "predictions"
+        src = shadow_pred_dir / pkl_name
+        dst = PRED_DIR / pkl_name
+
+        if src.exists():
+            PRED_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"  [shadow] 同步预测缓存: {pkl_name} → {PRED_DIR.name}/")
+        else:
+            print(f"  [shadow] 警告: shadow 预测文件不存在 {src}，"
+                  f"请手动运行 retrain_pipeline.py 重建")
+
+        # 同步 quality_score
+        quality_src = SHADOW_DIR / "state" / shadow_id / "quality_score.pkl"
+        quality_dst = (PROJECT_DIR / "factor_lab" / "results" /
+                       "signal_decay" / "quality_score.pkl")
+        if quality_src.exists():
+            shutil.copy2(quality_src, quality_dst)
+            print(f"  [shadow] 同步 quality_score.pkl")
 
     def archive(self, shadow_id: str):
         """封存模型 — 不再参与自动重训和日常信号生成"""
@@ -738,7 +769,7 @@ class ShadowManager:
             "sharpe": round(sharpe, 3),
             "max_drawdown": round(max_dd, 6),
             "avg_overlap": round(avg_overlap, 4),
-            "n_days": n,
+            "n_days": len(daily_returns),
         }
         summary_file.write_text(
             json.dumps(summaries, ensure_ascii=False, indent=2),
