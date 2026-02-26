@@ -722,6 +722,8 @@ class SmartBot:
         self.processed_msg_ids: set = set()  # 内存降级用（Redis 不可用时）
         self._ws_disconnect_times: deque = deque()  # 断连时间戳滑动窗口
         self._ws_disconnect_alert_cd: float = 0  # 告警冷却截止时间戳
+        self._ws_clients: list = []  # WebSocket 客户端引用 (心跳自适应用)
+        self._default_ping_interval: int = 120  # SDK 默认 ping 间隔
 
     def send_text(self, text: str, session: 'UserSession' = None):
         """发送文本消息 (超长自动分段)"""
@@ -734,8 +736,11 @@ class SmartBot:
         # 飞书文本消息限制 ~4000 字符，超长自动分段
         MAX_TEXT = 4000
         chunks = self._split_text(text, MAX_TEXT) if len(text) > MAX_TEXT else [text]
+        total = len(chunks)
 
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
+            if total > 1:
+                chunk = f"{chunk}\n\n— ({i+1}/{total})"
             try:
                 req = CreateMessageRequest.builder() \
                     .receive_id_type("open_id") \
@@ -757,8 +762,9 @@ class SmartBot:
             print(f"[Bot MD] {content[:100]}")
             return
 
-        # 飞书卡片 JSON 限制 ~30KB, 预留 header/元数据空间, 中文 3 bytes
-        MAX_CONTENT = 8000
+        # 飞书卡片 JSON 限制 ~28KB, 预留 header/元数据 (~1KB)
+        # 中文字符 UTF-8 占 3 bytes, 保守取 5000 字符 (~15KB content + overhead 安全)
+        MAX_CONTENT = 5000
         chunks = self._split_text(content, MAX_CONTENT) if len(content) > MAX_CONTENT else [content]
 
         for i, chunk in enumerate(chunks):
@@ -1456,7 +1462,7 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
 
     @staticmethod
     def _split_text(text: str, max_len: int = 4000) -> list:
-        """在段落/标题边界处分割长文本"""
+        """在段落/标题边界处分割长文本，确保代码块不被截断"""
         if len(text) <= max_len:
             return [text]
         chunks = []
@@ -1464,13 +1470,18 @@ importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=�
             if len(text) <= max_len:
                 chunks.append(text)
                 break
-            # 在 max_len 范围内找最佳分割点: ## 标题 > 空行 > 换行
+            # 在 max_len 范围内找最佳分割点: ```代码块边界 > ## 标题 > 空行 > 换行
             cut = max_len
-            for sep in ['\n## ', '\n\n', '\n']:
-                pos = text.rfind(sep, 0, max_len)
-                if pos > max_len // 3:  # 至少保留 1/3 内容
-                    cut = pos + (len(sep) if sep == '\n' else 0)
-                    break
+            # 优先在代码块结束符后分割 (避免截断代码块)
+            code_end = text.rfind('\n```\n', 0, max_len)
+            if code_end > max_len // 3:
+                cut = code_end + 4  # 包含 ```\n
+            else:
+                for sep in ['\n## ', '\n\n', '\n']:
+                    pos = text.rfind(sep, 0, max_len)
+                    if pos > max_len // 3:
+                        cut = pos + (len(sep) if sep == '\n' else 0)
+                        break
             chunks.append(text[:cut].rstrip())
             text = text[cut:].lstrip('\n')
         return chunks
@@ -1743,7 +1754,7 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
         for code, h in screenshot_map.items():
             sys_shares = current_positions.get(code, {}).get('shares', 0)
             scr_shares = h['shares']
-            price = h.get('price', h.get('cost', 0))
+            price = h.get('cost', h.get('price', 0))  # 优先用成本价
             name = h.get('name', code)
 
             if scr_shares > sys_shares:
@@ -2709,7 +2720,7 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             return P2CardActionTriggerResponse({"toast": {"type": "error", "content": str(e)[:50]}})
 
     def _record_disconnect(self, app_id: str):
-        """记录断连事件，10分钟内>=3次触发告警"""
+        """记录断连事件，10分钟内>=3次触发告警并缩短心跳间隔"""
         now = time.time()
         self._ws_disconnect_times.append(now)
         # 清理10分钟前的记录
@@ -2720,9 +2731,30 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
         recent = len(self._ws_disconnect_times)
         print(f"[WS] App {app_id} 断连 (10min内 {recent} 次)")
 
-        if recent >= 3 and now > self._ws_disconnect_alert_cd:
-            self._ws_disconnect_alert_cd = now + 600  # 10分钟冷却
-            self._send_disconnect_alert(recent)
+        # 频繁断连 → 缩短心跳间隔 (120s → 30s)
+        if recent >= 3:
+            self._set_ping_interval(30)
+            if now > self._ws_disconnect_alert_cd:
+                self._ws_disconnect_alert_cd = now + 600  # 10分钟冷却
+                self._send_disconnect_alert(recent)
+
+    def _set_ping_interval(self, interval: int):
+        """调整所有 WebSocket 客户端的 ping 间隔"""
+        for ws_client in self._ws_clients:
+            old = getattr(ws_client, '_ping_interval', self._default_ping_interval)
+            if old != interval:
+                ws_client._ping_interval = interval
+                print(f"[WS] ping 间隔: {old}s → {interval}s")
+
+    def _maybe_restore_ping_interval(self):
+        """30分钟内无断连 → 恢复默认心跳间隔"""
+        if not self._ws_disconnect_times:
+            return
+        now = time.time()
+        latest = self._ws_disconnect_times[-1]
+        if now - latest > 1800:  # 30分钟无断连
+            self._set_ping_interval(self._default_ping_interval)
+            self._ws_disconnect_times.clear()
 
     def _send_disconnect_alert(self, count: int):
         """WebSocket 断连频繁时，通过飞书告警通知"""
@@ -2799,6 +2831,7 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
                 log_level=lark.LogLevel.INFO
             )
             ws_clients.append(ws_client)
+            self._ws_clients.append(ws_client)
             print(f"  ✓ App {app_id} 已注册")
 
         print()
@@ -2825,9 +2858,14 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
                     if consecutive > 0:
                         print(f"[WS] App {app_id} 重连成功 (此前连续断连 {consecutive} 次)")
                     consecutive = 0
+                    # 记录服务端配置的 ping 间隔作为默认值
+                    server_interval = getattr(ws_client, '_ping_interval', 120)
+                    if server_interval != self._default_ping_interval and server_interval > 30:
+                        self._default_ping_interval = server_interval
                     sdk_loop.create_task(ws_client._ping_loop())
                     while True:
                         await asyncio.sleep(30)
+                        self._maybe_restore_ping_interval()
                 except Exception as e:
                     consecutive += 1
                     self._record_disconnect(app_id)
