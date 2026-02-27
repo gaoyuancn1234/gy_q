@@ -665,6 +665,11 @@ def _run_shadow_updates(live_signal: dict, prices: dict,
                 push_feishu(f"📊 {report}", dry_run)
                 log.info(f"Shadow {sid} 已到期，发送对比报告")
 
+        # 健康检查: 连续 3 天无更新的 shadow 告警
+        health_alerts = sm.check_health(stale_threshold=3)
+        for alert in health_alerts:
+            push_feishu(f"🏥 {alert['message']}", dry_run)
+
         parts = []
         if briefs:
             parts.append("🧪 影子验证:\n" + "\n".join(briefs))

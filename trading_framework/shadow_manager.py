@@ -597,6 +597,70 @@ class ShadowManager:
         print(f"  [shadow] {shadow_id} 延长 {extra_days} 天 "
               f"(总 {cand['duration_days']} 天)")
 
+    def check_health(self, stale_threshold: int = 3) -> list[dict]:
+        """检测连续 N 天无预测更新的 shadow 并返回告警列表
+
+        Args:
+            stale_threshold: 连续无更新天数阈值 (默认3天)
+
+        Returns:
+            [{"shadow_id": str, "days_silent": int, "message": str}, ...]
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        alerts = []
+        active = self.get_active_candidates()
+        if not active:
+            return alerts
+
+        # 收集所有日志日期 (降序)
+        log_files = sorted(
+            (SHADOW_DIR / "daily_log").glob("20*.json"), reverse=True)
+
+        for sid, cand in active.items():
+            # 查找该 shadow 最后一次出现在 daily_log 的日期
+            last_update = None
+            for lf in log_files:
+                try:
+                    daily = json.loads(lf.read_text(encoding='utf-8'))
+                    if sid in daily.get('candidates', {}):
+                        last_update = daily.get('date')
+                        break
+                except Exception:
+                    continue
+
+            if last_update is None:
+                # 从未有过更新记录，看 elapsed_days
+                if cand.get('elapsed_days', 0) == 0:
+                    days_silent = (
+                        date.today() - date.fromisoformat(
+                            cand.get('created_date', date.today().isoformat()))
+                    ).days
+                    if days_silent >= stale_threshold:
+                        msg = (f"Shadow {sid} 创建后从未产生预测 "
+                               f"(已 {days_silent} 天)")
+                        log.warning(msg)
+                        alerts.append({
+                            "shadow_id": sid,
+                            "days_silent": days_silent,
+                            "message": msg,
+                        })
+            else:
+                days_silent = (
+                    date.today() - date.fromisoformat(last_update)).days
+                if days_silent >= stale_threshold:
+                    msg = (f"Shadow {sid} 连续 {days_silent} 天无预测更新 "
+                           f"(最后更新: {last_update})")
+                    log.warning(msg)
+                    alerts.append({
+                        "shadow_id": sid,
+                        "days_silent": days_silent,
+                        "message": msg,
+                    })
+
+        return alerts
+
     def check_expired(self) -> list:
         """检查到期的 shadow，返回到期列表"""
         expired = []
