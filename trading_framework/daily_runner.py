@@ -628,6 +628,7 @@ def _run_shadow_updates(live_signal: dict, prices: dict,
 
         log.info(f"Shadow 验证: {len(active)} 个活跃")
         briefs = []
+        failures = []  # 收集预测失败的 shadow
 
         for sid, cand in active.items():
             try:
@@ -636,8 +637,9 @@ def _run_shadow_updates(live_signal: dict, prices: dict,
                 shadow_signal = sg_shadow.get_signal()
 
                 if 'error' in shadow_signal:
-                    log.warning(f"Shadow {sid} 信号生成失败: "
-                                f"{shadow_signal['error']}")
+                    err_reason = shadow_signal['error']
+                    log.warning(f"Shadow {sid} 信号生成失败: {err_reason}")
+                    failures.append(f"  {sid} 预测失败: {err_reason}")
                     continue
 
                 sm.update_daily(sid, live_signal, shadow_signal, prices)
@@ -663,9 +665,12 @@ def _run_shadow_updates(live_signal: dict, prices: dict,
                 push_feishu(f"📊 {report}", dry_run)
                 log.info(f"Shadow {sid} 已到期，发送对比报告")
 
+        parts = []
         if briefs:
-            return "🧪 影子验证:\n" + "\n".join(briefs)
-        return ""
+            parts.append("🧪 影子验证:\n" + "\n".join(briefs))
+        if failures:
+            parts.append("⚠️ Shadow 预测失败:\n" + "\n".join(failures))
+        return "\n".join(parts)
     except Exception as e:
         log.error(f"Shadow 更新异常: {e}")
         return ""
