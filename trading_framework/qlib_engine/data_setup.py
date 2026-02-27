@@ -182,16 +182,24 @@ def _build_features(stock_map: dict, calendar: list, target_dir: Path):
     print(f"[data_setup] features: {count} 只写入完成")
 
 
+SLOW_THRESHOLD_SEC = 1800  # 30 分钟
+
+
 def setup_qlib_data(target_dir: str = DEFAULT_TARGET_DIR,
                     start_date: str = "2018-01-01",
                     end_date: str = None):
     """下载 A 股数据并转换为 Qlib bin 格式"""
+    import logging
+    log = logging.getLogger(__name__)
+
     if end_date is None:
         end_date = datetime.now().strftime("%Y-%m-%d")
 
     target_path = Path(target_dir).expanduser()
     print(f"[data_setup] 目标: {target_path}")
     print(f"[data_setup] 区间: {start_date} ~ {end_date}")
+
+    t_total = time.time()
 
     # 登录 BaoStock (重试3次)
     for attempt in range(1, 4):
@@ -212,6 +220,7 @@ def setup_qlib_data(target_dir: str = DEFAULT_TARGET_DIR,
     stock_map = {}
     all_dates = []
     total = len(stocks)
+    t_download = time.time()
 
     for i, bao_code in enumerate(stocks, 1):
         if i % 50 == 0 or i == total:
@@ -223,7 +232,9 @@ def setup_qlib_data(target_dir: str = DEFAULT_TARGET_DIR,
             stock_map[instrument] = df
             all_dates.extend(df["date"].tolist())
 
-    print(f"\n[data_setup] 成功下载 {len(stock_map)}/{total} 只")
+    download_sec = time.time() - t_download
+    print(f"\n[data_setup] 成功下载 {len(stock_map)}/{total} 只 "
+          f"(耗时 {download_sec:.0f}s)")
 
     # 3. 下载沪深300指数
     print("[data_setup] 下载沪深300指数...")
@@ -247,7 +258,15 @@ def setup_qlib_data(target_dir: str = DEFAULT_TARGET_DIR,
     _build_instruments(stock_map, target_path)
     _build_features(stock_map, calendar, target_path)
 
-    print(f"\n[data_setup] 完成! provider_uri='{target_dir}'")
+    total_sec = time.time() - t_total
+    print(f"\n[data_setup] 完成! provider_uri='{target_dir}' "
+          f"(总耗时 {total_sec:.0f}s)")
+
+    if total_sec > SLOW_THRESHOLD_SEC:
+        log.warning(
+            f"[data_setup] 数据刷新异常慢: {total_sec:.0f}s "
+            f"(>{SLOW_THRESHOLD_SEC // 60}分钟)，"
+            f"请检查 BaoStock 连接或网络状况")
 
 
 def main():
