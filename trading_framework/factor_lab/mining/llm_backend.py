@@ -193,7 +193,7 @@ class LLMBackend:
 
     def _invoke_file_mode(self, provider: LLMProvider, prompt: str,
                           env: dict, work_dir: Path) -> str:
-        """Codex 等需要文件输出的 CLI — stdout 捕获 + 文件 fallback"""
+        """Codex 等需要 -o 文件输出的 CLI (stdout 含 banner 噪声)"""
         MINING_DIR.mkdir(parents=True, exist_ok=True)
         tmp_path = None
         try:
@@ -201,18 +201,20 @@ class LLMBackend:
                                              delete=False, dir=str(MINING_DIR)) as tmp:
                 tmp_path = tmp.name
 
-            cmd = [provider.cli_path] + list(provider.cli_args) + [prompt]
+            # codex exec ... -o tmpfile "prompt"
+            cmd = ([provider.cli_path] + list(provider.cli_args)
+                   + ["-o", tmp_path, prompt])
 
-            result = subprocess.run(
+            subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=provider.timeout, cwd=str(work_dir), env=env,
             )
-            # 优先读 stdout, 其次读文件
-            if result.stdout.strip():
-                return result.stdout.strip()
+            # -o 写入的是干净的最终回复 (无 banner/thinking)
             if tmp_path and os.path.exists(tmp_path):
                 with open(tmp_path) as f:
-                    return f.read().strip()
+                    content = f.read().strip()
+                if content:
+                    return content
             return ""
         finally:
             if tmp_path and os.path.exists(tmp_path):

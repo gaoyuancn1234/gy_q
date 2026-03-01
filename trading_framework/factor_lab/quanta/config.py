@@ -114,14 +114,12 @@ LLM_PROVIDERS = [
     {
         "name": "codex",
         "cli_path": "/usr/local/bin/codex",
-        "cli_args": ["exec", "-s", "read-only",
-                     "--dangerously-bypass-approvals-and-sandbox"],
+        "cli_args": ["exec", "--ephemeral"],
         "prompt_flag": "",
-        "output_mode": "file",
+        "output_mode": "file",   # codex exec -o tmpfile 输出最终回复
         "env_remove": [],
         "timeout": 600,
         "daily_quota": 50,
-        "enabled": False,  # codex CLI 需要 TTY, 非交互模式挂起, 待适配后启用
     },
 ]
 
