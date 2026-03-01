@@ -121,6 +121,7 @@ LLM_PROVIDERS = [
         "env_remove": [],
         "timeout": 600,
         "daily_quota": 50,
+        "enabled": False,  # codex CLI 需要 TTY, 非交互模式挂起, 待适配后启用
     },
 ]
 
