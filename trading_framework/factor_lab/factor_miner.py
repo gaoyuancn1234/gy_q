@@ -1050,6 +1050,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     from factor_lab.quanta.config import (
         DAILY_TOTAL_TIMEOUT, DAILY_N_DIRECTIONS, DAILY_BREADTH_STEPS,
         USE_MULTISTAGE,
+        IMPORTANCE_SCREEN_ENABLED, IMPORTANCE_MIN_THRESHOLD,
     )
     from factor_lab.quanta.trajectory import TrajectoryPool
     from factor_lab.quanta.factor_pool import FactorPool
@@ -1129,7 +1130,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         breadth_ratio = 0.60
 
     remaining = timeout - (time.time() - t_start)
-    reserve_final = 600  # Phase D 预留 10min
+    reserve_final = 720  # Phase D 预留 12min (含 importance 训练)
     work_time = max(remaining - reserve_final, 0)
     breadth_time = work_time * breadth_ratio
     depth_time = work_time * (1 - breadth_ratio)
@@ -1276,32 +1277,92 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             print(f"  本轮无进展, 结束深度阶段")
             break
 
-    # --- Phase D: 质量筛选 → 全量回测 → mined.py ---
-    print(f"\n  === Phase D: 最终评估 ===")
-    quality_factors = global_pool.get_quality_exprs()
+    # --- Phase D: importance 筛选 → 漏斗评估 → mined.py ---
+    print(f"\n  === Phase D: 最终评估 (漏斗模式) ===")
     all_pool_factors = global_pool.get_exprs()
     fp_stats = global_pool.stats()
     reg_stats = registry.stats()
 
-    print(f"  全局因子池: {fp_stats['size']} 个因子 (质量因子: {len(quality_factors)})")
+    print(f"  全局因子池: {fp_stats['size']} 个因子")
     print(f"  本次新增: {factors_admitted_this_session} 个因子")
     print(f"  方向状态: {reg_stats['by_status']}")
 
-    if quality_factors:
-        print(f"\n  质量因子列表:")
-        for name, expr in quality_factors:
+    # Step 1: Importance 筛选 (产出 imp_dict 供漏斗评分使用)
+    imp_dict: dict[str, float] = {}
+    screened_factors = []
+    if (all_pool_factors and factors_admitted_this_session > 0
+            and IMPORTANCE_SCREEN_ENABLED and not dry_run):
+        try:
+            from factor_lab.mining.backtest_runner import screen_by_importance
+            screened_factors, imp_dict = screen_by_importance(
+                all_pool_factors,
+                min_importance=IMPORTANCE_MIN_THRESHOLD,
+            )
+            # 更新通过筛选因子的 last_validated 时间戳
+            screened_names = {n for n, _ in screened_factors}
+            global_pool.update_validation(screened_names)
+            global_pool.save(GLOBAL_POOL_FILE)
+        except Exception as e:
+            print(f"  [importance] 筛选失败: {e}, 回退到 IC 质量筛选")
+            screened_factors = global_pool.get_quality_exprs()
+    elif all_pool_factors and not IMPORTANCE_SCREEN_ENABLED:
+        screened_factors = global_pool.get_quality_exprs()
+        print(f"  importance 筛选未启用, 回退到 IC 质量筛选: {len(screened_factors)} 因子")
+    else:
+        screened_factors = global_pool.get_quality_exprs()
+
+    if screened_factors:
+        print(f"\n  筛选后因子列表 ({len(screened_factors)}):")
+        for name, expr in screened_factors:
             print(f"    + {name}: {expr[:60]}")
 
-    # 有新增因子才做最终回测
+    # Step 2: 漏斗评估 (多池并行评分 + Top-N 回测)
     backtest = None
+    quality_factors = screened_factors
+    funnel_record = None
     if quality_factors and factors_admitted_this_session > 0 and not dry_run:
-        print(f"\n  === 全量 Rolling 回测 ({len(quality_factors)} 质量因子) ===")
+        t_funnel = time.time()
         try:
-            from factor_lab.mining.backtest_runner import run_comparison
-            backtest = run_comparison(quality_factors)
+            from factor_lab.mining.funnel import FactorFunnel
+
+            # 构建 icir_dict: 从 global_pool 的 PoolFactor 对象
+            icir_dict = {f.name: f.icir for f in global_pool.get_all()}
+
+            # 如果 imp_dict 为空 (importance 筛选被跳过), 用 ICIR 作为代理
+            if not imp_dict:
+                imp_dict = {name: abs(icir) for name, icir in icir_dict.items()}
+
+            funnel = FactorFunnel()
+            funnel_pools = funnel.run_funnel(
+                all_pool_factors, icir_dict, imp_dict,
+            )
+
+            if funnel_pools:
+                funnel_record = funnel.to_audit_record(
+                    funnel_pools, time.time() - t_funnel)
+                print(f"\n{funnel.summary_table(funnel_pools)}")
+
+                # 从回测结果中选最优池
+                best = funnel.best_pool(funnel_pools)
+                if best and best.backtest and not best.backtest.get("error"):
+                    backtest = best.backtest
+                    quality_factors = best.factors
+                    print(f"\n  最优池: {best.name} ({len(best.factors)} 因子, "
+                          f"Sharpe delta={backtest['improvement']['sharpe_delta']:+.3f})")
+                else:
+                    # 无池通过回测, fallback 到旧逻辑 (单路径)
+                    print(f"  [funnel] 无池通过回测, 回退到单路径模式")
+                    from factor_lab.mining.backtest_runner import run_comparison
+                    backtest = run_comparison(quality_factors)
+
         except Exception as e:
-            print(f"  [backtest] 回测失败: {e}")
-            backtest = {"error": str(e)}
+            print(f"  [funnel] 漏斗评估失败: {e}, 回退到单路径模式")
+            try:
+                from factor_lab.mining.backtest_runner import run_comparison
+                backtest = run_comparison(quality_factors)
+            except Exception as e2:
+                print(f"  [backtest] 回测失败: {e2}")
+                backtest = {"error": str(e2)}
 
     # 保存审计记录
     pool_stats = pool.stats()
@@ -1317,6 +1378,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         ],
         "non_redundant": [{"name": n, "expr": e} for n, e in quality_factors],
         "backtest": backtest,
+        "funnel": funnel_record,
         "pool_stats": pool_stats,
         "global_pool_size": fp_stats['size'],
         "direction_stats": reg_stats,
@@ -1345,18 +1407,36 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     beat_baseline = _check_beat_baseline(backtest)
     run_result["beat_baseline"] = beat_baseline
 
+    # LLM 使用量统计
+    llm_stats_str = ""
+    try:
+        from factor_lab.mining.llm_backend import LLMBackend
+        llm_stats = LLMBackend().stats()
+        if llm_stats.get("usage"):
+            usage_parts = [f"{k}={v}" for k, v in llm_stats["usage"].items() if v > 0]
+            if usage_parts:
+                llm_stats_str = f"\nLLM: {', '.join(usage_parts)}"
+                run_result["llm_usage"] = llm_stats
+    except Exception:
+        pass
+
     if beat_baseline and not dry_run:
         _accept_factors_to_mined(quality_factors, run_id)
         shadow_id = _create_shadow_for_run(run_id, backtest)
         msg = _build_daily_message(run_result, backtest, reg_stats)
+        if funnel_record:
+            best_name = funnel_record.get("best_pool", "?")
+            msg += f"\n\n漏斗最优池: {best_name}"
         if shadow_id:
-            msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
+            msg += f"\n已自动创建影子验证: {shadow_id} (20交易日)"
+        msg += llm_stats_str
         _push_feishu(msg)
     elif factors_admitted_this_session > 0 and not dry_run:
         msg = (f"📅 每日因子挖掘 #{run_id}\n"
                f"新增: {factors_admitted_this_session} 因子 | "
                f"全局池: {fp_stats['size']}\n"
-               f"{'回测未超越 M01' if backtest else '未执行回测 (无新质量因子)'}")
+               f"{'回测未超越 M01' if backtest else '未执行回测 (无新质量因子)'}"
+               f"{llm_stats_str}")
         _push_feishu(msg)
 
     # 打印总结
@@ -1368,6 +1448,9 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         print(f"  回测: Sharpe {backtest['candidate']['sharpe']:.3f} "
               f"(baseline {backtest['baseline']['sharpe']:.3f}, "
               f"delta {backtest['improvement']['sharpe_delta']:+.3f})")
+    if funnel_record:
+        print(f"  漏斗: {len(funnel_record['pools'])} 池评估, "
+              f"最优={funnel_record.get('best_pool', 'N/A')}")
     print(f"  耗时: {time.time() - t_start:.1f}s")
     print(f"{'='*60}")
 
