@@ -1,0 +1,24 @@
+adaptive_strategy: A_topk_adaptive
+adaptive_thresholds:
+- 0.3
+- 0.6
+close_cost: 0.0015
+deal_price: close
+initial_cash: 1000000
+instruments: csi300
+last_retrain: 2026-02
+model: LightGBM
+model_cache_dir: shadow/state/shadow_005/predictions
+model_id: M01
+model_tag: M01-LGB-D3v3r
+open_cost: 0.0005
+preset: alpha158_val_mined
+quality_cache_dir: shadow/state/shadow_005
+rebalance_every: 5
+rolling_config: D_expand_3v_3r
+rolling_json_dir: shadow/state/shadow_005
+state_dir: factor_lab/paper_trading
+stop_loss: 0.08
+test_end: '2026-06-30'
+test_start: '2024-01-01'
+topk: 12

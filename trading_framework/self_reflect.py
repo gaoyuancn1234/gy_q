@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-每日自我反思与迭代优化
-- 收集当天所有输入输出（聊天记录、操作日志、产出）
-- 调用 Claude 进行自我反思
-- 根据反思结果自动优化代码
-- 记录反思日志
-- 通过 daemon 重启 smart_bot 使改动生效
+每日综合反思系统
+- 收集系统运行日志 (精简)
+- 收集量化策略数据 (因子池/挖掘/shadow/持仓/模型配置)
+- 检索市场情报 (宏观新闻 + arXiv 论文)
+- 调用 Claude 进行综合反思 → 结构化 JSON
+- 保存行动计划 (Markdown) + 反思记录 (JSON)
+- 推送飞书 markdown 卡片简报
 """
 
 import json
@@ -26,14 +27,6 @@ MEMORY_DIR = BOT_DIR / "memory"
 LOGS_DIR = BOT_DIR / "logs"
 REFLECT_DIR = BOT_DIR / "reflections"
 REFLECT_DIR.mkdir(exist_ok=True)
-
-# 需要审查的源代码文件
-SOURCE_FILES = [
-    BOT_DIR / "smart_bot.py",
-    BOT_DIR / "daemon.py",
-    BOT_DIR / "daily_runner.py",
-    BOT_DIR / "monitor" / "intraday_monitor.py",
-]
 
 
 def collect_today_data() -> dict:
@@ -155,95 +148,338 @@ def collect_today_data() -> dict:
     return data
 
 
-def _build_reflection_prompt(today_data: dict, compact: bool = False) -> str:
-    """构建反思 prompt，compact 模式下缩短内容以降低耗时"""
-    if compact:
-        conv_limit, log_limit, snippet_limit = 2000, 500, 15
+def collect_strategy_data() -> dict:
+    """收集量化策略数据: 因子池、挖掘进展、shadow、持仓、模型配置"""
+    data = {}
+
+    # 1. 因子池
+    pool_file = BOT_DIR / "factor_lab" / "mining_results" / "global_factor_pool.json"
+    if pool_file.exists():
+        try:
+            pool = json.loads(pool_file.read_text(encoding='utf-8'))
+            factors = pool.get("factors", [])
+            # top10 by abs(ICIR)
+            sorted_factors = sorted(factors, key=lambda f: abs(f.get("icir", 0)), reverse=True)
+            top10 = [
+                {"name": f["name"], "icir": round(f.get("icir", 0), 3),
+                 "rank_ic": round(f.get("rank_ic", 0), 4), "direction": f.get("direction", "")}
+                for f in sorted_factors[:10]
+            ]
+            # 方向分布
+            direction_counts = {}
+            for f in factors:
+                d = f.get("direction", "unknown")
+                direction_counts[d] = direction_counts.get(d, 0) + 1
+            # 平均 IC/ICIR
+            ics = [f.get("rank_ic", 0) for f in factors if f.get("rank_ic")]
+            icirs = [f.get("icir", 0) for f in factors if f.get("icir")]
+            data["factor_pool"] = {
+                "pool_size": pool.get("global_pool_size", len(factors)),
+                "top10_by_icir": top10,
+                "direction_distribution": direction_counts,
+                "avg_rank_ic": round(sum(ics) / max(len(ics), 1), 4),
+                "avg_icir": round(sum(icirs) / max(len(icirs), 1), 3),
+                "pool_stats": pool.get("pool_stats", {}),
+            }
+        except Exception as e:
+            data["factor_pool"] = {"error": str(e)}
     else:
-        conv_limit, log_limit, snippet_limit = 5000, 1000, 30
+        data["factor_pool"] = {"error": "global_factor_pool.json 不存在"}
 
-    return f"""你是一个智能系统的自我反思模块。请根据今天的运行数据进行深度反思和优化建议。
+    # 2. 最近3个挖掘 run
+    runs_dir = BOT_DIR / "factor_lab" / "mining_results" / "runs"
+    if runs_dir.exists():
+        try:
+            run_files = sorted(runs_dir.glob("run_*.json"), reverse=True)[:3]
+            recent_runs = []
+            for rf in run_files:
+                run = json.loads(rf.read_text(encoding='utf-8'))
+                backtest = run.get("backtest", {})
+                recent_runs.append({
+                    "run_id": run.get("run_id", rf.stem),
+                    "date": run.get("date", ""),
+                    "mode": run.get("mode", ""),
+                    "factors_tested": run.get("factors_tested", 0),
+                    "factors_admitted": run.get("factors_admitted_this_session", 0),
+                    "global_pool_size": run.get("global_pool_size", 0),
+                    "promising_count": run.get("promising_count", 0),
+                    "backtest_sharpe_delta": backtest.get("sharpe_delta"),
+                    "total_time_min": round(run.get("total_time", 0) / 60, 1),
+                })
+            data["recent_runs"] = recent_runs
+        except Exception as e:
+            data["recent_runs"] = [{"error": str(e)}]
+    else:
+        data["recent_runs"] = []
 
-## 今日运行数据
+    # 3. Shadow 验证
+    shadow_reg = BOT_DIR / "shadow" / "registry.json"
+    if shadow_reg.exists():
+        try:
+            shadows = json.loads(shadow_reg.read_text(encoding='utf-8'))
+            data["shadows"] = {
+                sid: {
+                    "status": s.get("status", ""),
+                    "source": s.get("source", ""),
+                    "created_date": s.get("created_date", ""),
+                    "duration_days": s.get("duration_days", 0),
+                    "elapsed_days": s.get("elapsed_days", 0),
+                    "reason": s.get("reason", ""),
+                }
+                for sid, s in shadows.items()
+            }
+        except Exception as e:
+            data["shadows"] = {"error": str(e)}
+    else:
+        data["shadows"] = {}
 
-### 日期: {today_data['date']}
+    # 4. 实盘持仓
+    holdings_file = BOT_DIR / "portfolio" / "live_holdings.json"
+    if holdings_file.exists():
+        try:
+            h = json.loads(holdings_file.read_text(encoding='utf-8'))
+            positions = h.get("positions", {})
+            data["live_holdings"] = {
+                "initial_capital": h.get("initial_capital", 0),
+                "cash": h.get("cash", 0),
+                "position_count": len(positions),
+                "positions": [
+                    {"code": code, "name": p.get("name", ""), "shares": p.get("shares", 0),
+                     "cost_price": p.get("cost_price", 0), "entry_date": p.get("entry_date", "")}
+                    for code, p in positions.items()
+                ],
+                "last_signal_date": h.get("last_signal_date", ""),
+                "last_update": h.get("last_update", ""),
+                "rebalance_day_count": h.get("rebalance_day_count", 0),
+            }
+        except Exception as e:
+            data["live_holdings"] = {"error": str(e)}
+    else:
+        data["live_holdings"] = {"error": "live_holdings.json 不存在"}
 
-### 对话统计
-{json.dumps(today_data['conversations'], ensure_ascii=False, indent=2)[:conv_limit]}
+    # 5. 模型配置
+    config_file = BOT_DIR / "config" / "signal_config.yaml"
+    if config_file.exists():
+        try:
+            import yaml
+            with open(config_file, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f)
+            data["model_config"] = {
+                "model_id": cfg.get("model_id", ""),
+                "model_tag": cfg.get("model_tag", ""),
+                "model": cfg.get("model", ""),
+                "preset": cfg.get("preset", ""),
+                "rolling_config": cfg.get("rolling_config", ""),
+                "topk": cfg.get("topk", 0),
+                "rebalance_every": cfg.get("rebalance_every", 0),
+                "stop_loss": cfg.get("stop_loss", 0),
+                "last_retrain": cfg.get("last_retrain", ""),
+                "test_start": cfg.get("test_start", ""),
+                "test_end": cfg.get("test_end", ""),
+            }
+        except Exception as e:
+            data["model_config"] = {"error": str(e)}
+    else:
+        data["model_config"] = {"error": "signal_config.yaml 不存在"}
 
-### 机器人日志摘要
-{chr(10).join(today_data['bot_log_snippets'][:snippet_limit])}
+    return data
 
-### Daily Runner 日志
-{today_data['daily_runner_log'][:log_limit]}
 
-### 盘中监控日志
-{today_data['monitor_log'][:log_limit]}
+def collect_market_intelligence() -> dict:
+    """检索市场情报: 宏观新闻 + arXiv 论文"""
+    data = {"macro_news": [], "arxiv_papers": []}
 
-### Daemon 日志
-{today_data['daemon_log'][:500]}
+    # 1. 宏观新闻 (复用 news_sentinel)
+    try:
+        if str(BOT_DIR) not in sys.path:
+            sys.path.insert(0, str(BOT_DIR))
+        from news_sentinel import NewsSentinel
+        sentinel = NewsSentinel()
+        macro = sentinel.fetch_macro_news()
+        # 合并 CCTV + 财联社, 取最新 20 条
+        news_items = []
+        for n in macro.get("cctv", []):
+            news_items.append({"source": "CCTV", "title": n.get("title", "")})
+        for n in macro.get("cls", []):
+            news_items.append({"source": "财联社", "title": n.get("title", ""),
+                               "content": n.get("content", "")[:100]})
+        data["macro_news"] = news_items[:20]
+        print(f"  [market] 宏观新闻: {len(data['macro_news'])} 条")
+    except Exception as e:
+        print(f"  [market] 宏观新闻获取失败: {e}")
+        data["macro_news_error"] = str(e)
 
-### 实验盘日志
-{json.dumps(today_data.get('experiment_log', {}), ensure_ascii=False, indent=2)[:log_limit]}
+    # 2. arXiv 论文 (复用 paper_researcher.search_arxiv)
+    try:
+        from paper_researcher import search_arxiv
+        queries = [
+            "quantitative trading alpha factor",
+            "stock prediction machine learning",
+            "portfolio optimization deep learning",
+        ]
+        seen_ids = set()
+        all_papers = []
+        for q in queries:
+            try:
+                papers = search_arxiv(q, max_results=3)
+                for p in papers:
+                    aid = p.get("arxiv_id", "")
+                    if aid not in seen_ids:
+                        seen_ids.add(aid)
+                        all_papers.append({
+                            "title": p.get("title", ""),
+                            "arxiv_id": aid,
+                            "summary": p.get("summary", "")[:200],
+                            "date": p.get("date", ""),
+                        })
+                time.sleep(1)  # arXiv API 礼貌等待
+            except Exception as e:
+                print(f"  [market] arXiv 搜索 '{q}' 失败: {e}")
+        data["arxiv_papers"] = all_papers
+        print(f"  [market] arXiv 论文: {len(all_papers)} 篇 (去重)")
+    except Exception as e:
+        print(f"  [market] arXiv 搜索失败: {e}")
+        data["arxiv_papers_error"] = str(e)
 
-### 宏观分析
-{json.dumps(today_data.get('macro_analysis', {}), ensure_ascii=False, indent=2)[:500]}
+    return data
 
+
+def _build_reflection_prompt(system_data: dict, strategy_data: dict,
+                             market_intel: dict, compact: bool = False) -> str:
+    """构建综合反思 prompt"""
+    today = system_data.get("date", date.today().isoformat())
+
+    # 系统运行概况 (精简)
+    errors_text = "\n".join(system_data.get("errors", [])[:10]) or "(无错误)"
+    log_snippets = "\n".join(system_data.get("bot_log_snippets", [])[:15]) or "(无日志)"
+    conv_count = sum(c["message_count"] for c in system_data.get("conversations", []))
+
+    # 量化策略数据
+    pool = strategy_data.get("factor_pool", {})
+    pool_text = json.dumps(pool, ensure_ascii=False, indent=2)[:2000] if not pool.get("error") else pool["error"]
+
+    runs = strategy_data.get("recent_runs", [])
+    runs_text = json.dumps(runs, ensure_ascii=False, indent=2)[:1500] if runs else "(无挖掘记录)"
+
+    shadows = strategy_data.get("shadows", {})
+    shadows_text = json.dumps(shadows, ensure_ascii=False, indent=2)[:1000] if shadows else "(无 shadow)"
+
+    holdings = strategy_data.get("live_holdings", {})
+    holdings_text = json.dumps(holdings, ensure_ascii=False, indent=2)[:1500] if not holdings.get("error") else holdings["error"]
+
+    config = strategy_data.get("model_config", {})
+    config_text = json.dumps(config, ensure_ascii=False, indent=2)[:500] if not config.get("error") else config["error"]
+
+    # 市场情报
+    macro = market_intel.get("macro_news", [])
+    macro_text = "\n".join(
+        f"- [{n.get('source', '')}] {n.get('title', '')}" for n in macro
+    ) or "(无新闻)"
+
+    papers = market_intel.get("arxiv_papers", [])
+    papers_text = "\n".join(
+        f"- [{p.get('arxiv_id', '')}] {p.get('title', '')}\n  {p.get('summary', '')}"
+        for p in papers
+    ) or "(无论文)"
+
+    if compact:
+        pool_text = pool_text[:1000]
+        runs_text = runs_text[:800]
+        macro_text = "\n".join(macro_text.split("\n")[:10])
+        papers_text = "\n".join(papers_text.split("\n")[:10])
+
+    return f"""你是一位资深量化研究员兼系统架构师。请对以下量化交易系统进行每日综合反思。
+
+## 一、系统运行概况 (简要)
+
+### 日期: {today}
+### 对话数: {conv_count} 条
 ### 错误汇总
-{chr(10).join(today_data['errors'][:20])}
+{errors_text}
 
-## 反思要求
+### 关键日志
+{log_snippets}
 
-请从以下维度进行反思，输出 JSON 格式：
+## 二、量化策略现状
 
-1. **用户体验分析**: 用户的需求是否被很好地满足？有没有失败或超时的请求？
-2. **系统稳定性**: WebSocket 断连次数？错误率？重启次数？
-3. **性能分析**: Claude 调用超时情况？响应速度？
-4. **代码改进建议**: 具体可以改进的代码（给出文件路径和修改建议）
-5. **新功能想法**: 基于用户的使用模式，有什么新功能可以开发？
-6. **自我评分**: 今天整体表现打分 (1-10)
+### 当前模型配置
+{config_text}
+
+### 因子池
+{pool_text}
+
+### 近期挖掘进展 (最近3个run)
+{runs_text}
+
+### 影子验证状态
+{shadows_text}
+
+### 实盘持仓
+{holdings_text}
+
+## 三、市场环境
+
+### 宏观新闻
+{macro_text}
+
+### 最新研究论文
+{papers_text}
+
+## 反思任务
+
+请从以下维度进行综合反思，输出 JSON 格式：
+
+1. **系统健康** (1-2句概述)
+2. **策略绩效诊断**: 因子池质量如何？挖掘效率？模型是否需要重训？
+3. **因子分析**: 哪些方向表现强？哪些方向枯竭？有衰减迹象吗？
+4. **市场研判**: 宏观环境对策略的影响，是否需要调整？
+5. **研究方向**: 基于论文和市场环境，有什么值得探索的新方向？
+6. **行动计划**: 方向性建议 (不修改代码)，按优先级排列
+7. **优先级排序**: 最值得投入精力的1-2件事
 
 请严格输出以下 JSON 格式（不要输出其他内容）：
 ```json
 {{
-    "date": "{today_data['date']}",
+    "date": "{today}",
     "score": 8,
-    "summary": "今日整体表现概述（1-2句话）",
-    "user_experience": {{
-        "total_conversations": 0,
-        "failed_requests": 0,
-        "highlights": ["亮点1"],
-        "issues": ["问题1"]
+    "summary": "整体表现概述 (1-2句话)",
+    "system_health": {{
+        "status": "healthy/warning/critical",
+        "issues": ["问题描述"]
     }},
-    "stability": {{
-        "ws_disconnects": 0,
-        "errors_count": 0,
-        "restarts": 0,
-        "issues": ["稳定性问题"]
+    "strategy_diagnosis": {{
+        "factor_pool_quality": "因子池质量评估 (2-3句)",
+        "mining_efficiency": "挖掘效率分析 (2-3句)",
+        "risks": ["潜在风险1", "潜在风险2"]
     }},
-    "performance": {{
-        "avg_response_quality": "good/fair/poor",
-        "timeout_count": 0,
-        "issues": ["性能问题"]
+    "factor_analysis": {{
+        "strong_directions": ["表现好的方向"],
+        "weak_directions": ["枯竭的方向"],
+        "decay_signals": ["衰减迹象"],
+        "recommendations": ["因子相关建议"]
     }},
-    "code_improvements": [
+    "market_outlook": {{
+        "macro_assessment": "宏观环境评估 (2-3句)",
+        "impact_on_strategy": "对策略的影响",
+        "adjustments": ["建议调整"]
+    }},
+    "research_directions": [
         {{
-            "file": "smart_bot.py",
-            "description": "改进描述",
-            "priority": "high/medium/low",
-            "auto_fixable": true
-        }}
-    ],
-    "new_feature_ideas": [
-        {{
-            "title": "功能名",
-            "description": "功能描述",
+            "title": "方向名",
+            "rationale": "为什么值得探索 (2-3句)",
+            "related_papers": ["相关论文标题"],
             "effort": "small/medium/large"
         }}
     ],
-    "action_items": [
-        "明天要做的具体事项1"
-    ]
+    "action_plan": [
+        {{
+            "title": "计划标题",
+            "description": "详细描述 (3-5句, 具体可执行)",
+            "priority": "P0/P1/P2",
+            "category": "factor/model/data/infra/research"
+        }}
+    ],
+    "top_priorities": ["最值得投入精力的1-2件事"]
 }}
 ```"""
 
@@ -293,7 +529,15 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
 
     json_match = re.search(r'\{[\s\S]*\}', output)
     if json_match:
-        return json.loads(json_match.group())
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError as e:
+            return {
+                "score": 0,
+                "summary": "反思输出 JSON 解析失败",
+                "raw_output": output[:2000],
+                "error": f"JSON 解析失败: {e}"
+            }
     else:
         return {
             "score": 0,
@@ -303,21 +547,23 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
         }
 
 
-def run_reflection(today_data: dict) -> dict:
-    """调用 Claude 进行自我反思，超时后用精简内容重试一次"""
+def run_reflection(system_data: dict, strategy_data: dict,
+                   market_intel: dict) -> dict:
+    """调用 Claude 进行综合反思，超时后用精简内容重试一次"""
     max_attempts = 2
     timeouts = [10800, 3600]  # 第一次 3 小时，重试 1 小时
 
     for attempt in range(max_attempts):
         compact = (attempt > 0)
-        prompt = _build_reflection_prompt(today_data, compact=compact)
+        prompt = _build_reflection_prompt(system_data, strategy_data,
+                                          market_intel, compact=compact)
         timeout = timeouts[attempt]
 
         try:
             if attempt > 0:
                 print(f"  重试反思 (精简模式, 超时 {timeout // 60} 分钟)...")
             reflection = _call_claude_reflection(prompt, timeout)
-            reflection["date"] = today_data["date"]
+            reflection["date"] = system_data.get("date", date.today().isoformat())
             if "error" not in reflection or reflection.get("score", 0) > 0:
                 return reflection
             # 解析失败但没超时，直接返回
@@ -327,179 +573,129 @@ def run_reflection(today_data: dict) -> dict:
             if attempt < max_attempts - 1:
                 continue
             return {
-                "date": today_data['date'],
+                "date": system_data.get("date", date.today().isoformat()),
                 "score": 0,
                 "summary": "反思超时 (已重试)",
                 "error": f"Claude 调用超时 ({max_attempts} 次)"
             }
         except Exception as e:
             return {
-                "date": today_data['date'],
+                "date": system_data.get("date", date.today().isoformat()),
                 "score": 0,
                 "summary": f"反思失败: {e}",
                 "error": str(e)
             }
 
     return {
-        "date": today_data['date'],
+        "date": system_data.get("date", date.today().isoformat()),
         "score": 0,
         "summary": "反思失败",
         "error": "未知错误"
     }
 
 
-def apply_auto_fixes(reflection: dict) -> list:
-    """根据反思结果，对 auto_fixable 的改进项调用 Claude 自动修复
+def save_action_plan(reflection: dict):
+    """将行动计划保存为独立 Markdown 文件"""
+    today = reflection.get("date", date.today().isoformat())
+    plan_file = REFLECT_DIR / f"{today}_plan.md"
 
-    安全机制: git stash → 修复 → 成功保留 / 失败回滚
-    """
-    applied = []
-    improvements = reflection.get("code_improvements", [])
-    auto_fixes = [imp for imp in improvements if imp.get("auto_fixable") and imp.get("priority") in ("high", "medium")]
+    lines = [
+        f"# 每日反思行动计划 - {today}",
+        "",
+        f"**综合评分**: {reflection.get('score', 'N/A')}/10",
+        f"**概述**: {reflection.get('summary', 'N/A')}",
+        "",
+    ]
 
-    if not auto_fixes:
-        return applied
+    # 最高优先级
+    top = reflection.get("top_priorities", [])
+    if top:
+        lines.append("## 最高优先级")
+        for i, t in enumerate(top, 1):
+            lines.append(f"{i}. {t}")
+        lines.append("")
 
-    # 记录修复前的 HEAD commit, 用于超时/失败回滚
-    try:
-        head_before = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            capture_output=True, text=True, timeout=5, cwd=str(WORK_DIR)
-        ).stdout.strip()
-    except Exception:
-        head_before = None
+    # 系统健康
+    health = reflection.get("system_health", {})
+    if health:
+        lines.append(f"## 系统健康: {health.get('status', 'N/A')}")
+        for issue in health.get("issues", []):
+            lines.append(f"- {issue}")
+        lines.append("")
 
-    # stash 未提交改动 (保护用户的 WIP)
-    stashed = False
-    try:
-        stash_result = subprocess.run(
-            ['git', 'stash', 'push', '-m', 'self_reflect: pre-autofix'],
-            capture_output=True, text=True, timeout=10, cwd=str(WORK_DIR)
-        )
-        stashed = 'Saved working directory' in stash_result.stdout
-        if stashed:
-            print("  已暂存未提交改动 (git stash)")
-    except Exception:
-        pass
+    # 策略诊断
+    diag = reflection.get("strategy_diagnosis", {})
+    if diag:
+        lines.append("## 策略诊断")
+        if diag.get("factor_pool_quality"):
+            lines.append(f"**因子池质量**: {diag['factor_pool_quality']}")
+        if diag.get("mining_efficiency"):
+            lines.append(f"**挖掘效率**: {diag['mining_efficiency']}")
+        for r in diag.get("risks", []):
+            lines.append(f"- 风险: {r}")
+        lines.append("")
 
-    # 构建修复 prompt
-    fix_descriptions = "\n".join(
-        f"- [{imp['priority']}] {imp['file']}: {imp['description']}"
-        for imp in auto_fixes
-    )
+    # 因子分析
+    fa = reflection.get("factor_analysis", {})
+    if fa:
+        lines.append("## 因子分析")
+        if fa.get("strong_directions"):
+            lines.append(f"**强势方向**: {', '.join(fa['strong_directions'])}")
+        if fa.get("weak_directions"):
+            lines.append(f"**弱势方向**: {', '.join(fa['weak_directions'])}")
+        if fa.get("decay_signals"):
+            lines.append(f"**衰减信号**: {', '.join(fa['decay_signals'])}")
+        for rec in fa.get("recommendations", []):
+            lines.append(f"- {rec}")
+        lines.append("")
 
-    prompt = f"""你是一个代码优化助手。请根据以下反思结果，对代码进行安全的小规模改进。
+    # 市场研判
+    mo = reflection.get("market_outlook", {})
+    if mo:
+        lines.append("## 市场研判")
+        if mo.get("macro_assessment"):
+            lines.append(f"**宏观评估**: {mo['macro_assessment']}")
+        if mo.get("impact_on_strategy"):
+            lines.append(f"**策略影响**: {mo['impact_on_strategy']}")
+        for adj in mo.get("adjustments", []):
+            lines.append(f"- {adj}")
+        lines.append("")
 
-## 需要修复的项目
-{fix_descriptions}
+    # 研究方向
+    rds = reflection.get("research_directions", [])
+    if rds:
+        lines.append("## 研究方向")
+        for rd in rds:
+            lines.append(f"### {rd.get('title', '')} [{rd.get('effort', '')}]")
+            lines.append(f"{rd.get('rationale', '')}")
+            related = rd.get("related_papers", [])
+            if related:
+                lines.append(f"相关论文: {', '.join(related)}")
+            lines.append("")
 
-## 重要规则
-1. 只做安全的、不破坏现有功能的修改
-2. 不要修改核心业务逻辑
-3. 主要关注：错误处理、日志改进、性能优化、代码简化
-4. 每个修改都要有 git commit
-5. 工作目录: {WORK_DIR}
-6. smart_bot.py 位于 {BOT_DIR}/smart_bot.py
-7. 绝对不要修改 self_reflect.py 本身
+    # 行动计划
+    plans = reflection.get("action_plan", [])
+    if plans:
+        lines.append("## 行动计划")
+        # 按优先级分组
+        for priority in ["P0", "P1", "P2"]:
+            group = [p for p in plans if p.get("priority") == priority]
+            if group:
+                lines.append(f"### {priority}")
+                for p in group:
+                    cat = p.get("category", "")
+                    lines.append(f"- **[{cat}] {p.get('title', '')}**")
+                    lines.append(f"  {p.get('description', '')}")
+                lines.append("")
 
-请直接执行修改，不需要确认。修改完成后输出一个摘要，说明做了哪些改动。"""
-
-    fix_succeeded = False
-    try:
-        cmd = [
-            '/usr/local/bin/claude',
-            '--print',
-            '--dangerously-skip-permissions',
-            '-p', prompt
-        ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True,
-            timeout=1800,  # 30 分钟超时
-            cwd=str(WORK_DIR),
-            env=_CLEAN_ENV
-        )
-        output = result.stdout.strip()
-        if result.returncode == 0 and output:
-            applied.append({
-                "fixes_attempted": len(auto_fixes),
-                "output_summary": output[:1000],
-            })
-            fix_succeeded = True
-        else:
-            stderr = result.stderr.strip() if result.stderr else ""
-            applied.append({
-                "error": f"Claude exit={result.returncode}",
-                "stderr": stderr[:500],
-            })
-    except subprocess.TimeoutExpired:
-        print("  自动修复超时，回滚未提交的改动...")
-        applied.append({"error": "自动修复超时 (30min)"})
-    except Exception as e:
-        applied.append({"error": str(e)})
-
-    # 失败/超时时回滚到修复前的 commit
-    if not fix_succeeded and head_before:
-        try:
-            current_head = subprocess.run(
-                ['git', 'rev-parse', 'HEAD'],
-                capture_output=True, text=True, timeout=5, cwd=str(WORK_DIR)
-            ).stdout.strip()
-            if current_head != head_before:
-                print(f"  检测到半成品 commit，回退到 {head_before[:8]}")
-                subprocess.run(
-                    ['git', 'reset', '--hard', head_before],
-                    capture_output=True, text=True, timeout=10, cwd=str(WORK_DIR)
-                )
-        except Exception as e:
-            print(f"  回滚失败: {e}")
-
-    # 恢复 stash
-    if stashed:
-        try:
-            subprocess.run(
-                ['git', 'stash', 'pop'],
-                capture_output=True, text=True, timeout=10, cwd=str(WORK_DIR)
-            )
-            print("  已恢复暂存改动 (git stash pop)")
-        except Exception:
-            print("  警告: git stash pop 失败，请手动恢复")
-
-    return applied
+    plan_file.write_text("\n".join(lines), encoding='utf-8')
+    return str(plan_file)
 
 
-def restart_bot():
-    """通过给 daemon 发信号来重启 smart_bot"""
-    try:
-        pid_file = BOT_DIR / "daemon.pid"
-        if not pid_file.exists():
-            return "daemon 未运行，跳过重启"
-        pid = int(pid_file.read_text().strip())
-        # 给 daemon 进程发 SIGHUP，daemon 收到后重启 bot
-        # 如果 daemon 没有 SIGHUP handler，直接 kill bot 子进程让 daemon 自动重启
-        import signal as _signal
-
-        # 读取 bot 进程 PID (daemon 的子进程)
-        result = subprocess.run(
-            ['pgrep', '-P', str(pid)],
-            capture_output=True, text=True, timeout=5
-        )
-        bot_pids = result.stdout.strip().split('\n')
-        for bp in bot_pids:
-            bp = bp.strip()
-            if bp:
-                os.kill(int(bp), _signal.SIGTERM)
-        # daemon 会检测到 bot 退出并自动重启
-        return f"已终止 bot 进程 {bot_pids}，daemon 将自动重启"
-    except Exception as e:
-        return f"重启失败: {e}"
-
-
-def save_reflection(reflection: dict, auto_fix_results: list):
+def save_reflection(reflection: dict):
     """保存反思记录"""
     # 使用 reflection 中的日期 (数据收集时确定), 避免跨午夜日期漂移
     today = reflection.get("date", date.today().isoformat())
-    reflection["auto_fixes"] = auto_fix_results
     reflection["generated_at"] = datetime.now().isoformat()
 
     # 保存当日反思
@@ -514,14 +710,15 @@ def save_reflection(reflection: dict, auto_fix_results: list):
         try:
             with open(index_file, 'r', encoding='utf-8') as f:
                 index = json.load(f)
-        except:
+        except Exception:
             pass
 
     index[today] = {
         "score": reflection.get("score", 0),
         "summary": reflection.get("summary", ""),
-        "auto_fixes_count": len(auto_fix_results),
-        "action_items_count": len(reflection.get("action_items", [])),
+        "system_health": reflection.get("system_health", {}).get("status", ""),
+        "top_priorities": reflection.get("top_priorities", []),
+        "action_plan_count": len(reflection.get("action_plan", [])),
     }
 
     # 只保留最近90天
@@ -534,67 +731,165 @@ def save_reflection(reflection: dict, auto_fix_results: list):
     return str(reflect_file)
 
 
+def push_reflection_to_feishu(reflection: dict):
+    """推送反思简报到飞书 (markdown 卡片)"""
+    try:
+        if str(BOT_DIR) not in sys.path:
+            sys.path.insert(0, str(BOT_DIR))
+        from send_signal import get_client, USER_OPEN_ID
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+    except Exception as e:
+        print(f"  [feishu] 导入失败: {e}")
+        return False
+
+    if not USER_OPEN_ID:
+        print("  [feishu] 未配置 USER_OPEN_ID, 跳过推送")
+        return False
+
+    # 构建精简简报 markdown
+    today = reflection.get("date", "")
+    score = reflection.get("score", "N/A")
+    summary = reflection.get("summary", "")
+
+    health = reflection.get("system_health", {})
+    health_status = health.get("status", "N/A")
+    health_issues = health.get("issues", [])
+
+    diag = reflection.get("strategy_diagnosis", {})
+    mo = reflection.get("market_outlook", {})
+    top = reflection.get("top_priorities", [])
+    rds = reflection.get("research_directions", [])
+
+    md_parts = [
+        f"**评分**: {score}/10",
+        f"**概述**: {summary}",
+        "",
+        f"**系统状态**: {health_status}",
+    ]
+    if health_issues:
+        for issue in health_issues[:3]:
+            md_parts.append(f"- {issue}")
+
+    md_parts.append("")
+    if diag.get("factor_pool_quality"):
+        md_parts.append(f"**因子池**: {diag['factor_pool_quality'][:200]}")
+    if diag.get("risks"):
+        md_parts.append(f"**风险**: {'; '.join(diag['risks'][:3])}")
+
+    if mo.get("macro_assessment"):
+        md_parts.append(f"\n**市场**: {mo['macro_assessment'][:200]}")
+
+    if top:
+        md_parts.append("\n**最高优先级**:")
+        for i, t in enumerate(top, 1):
+            md_parts.append(f"{i}. {t}")
+
+    if rds:
+        md_parts.append("\n**新方向**:")
+        for rd in rds[:3]:
+            md_parts.append(f"- {rd.get('title', '')} [{rd.get('effort', '')}]")
+
+    md_content = "\n".join(md_parts)
+    # 飞书卡片内容限制
+    if len(md_content) > 4500:
+        md_content = md_content[:4500] + "\n...(已截断)"
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"每日反思简报 - {today}"},
+            "template": "purple"
+        },
+        "elements": [
+            {"tag": "markdown", "content": md_content},
+        ]
+    }
+
+    # 3 次重试
+    client = get_client()
+
+    for attempt in range(3):
+        try:
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("open_id") \
+                .request_body(CreateMessageRequestBody.builder()
+                    .receive_id(USER_OPEN_ID)
+                    .msg_type("interactive")
+                    .content(json.dumps(card, ensure_ascii=False))
+                    .build()) \
+                .build()
+            response = client.im.v1.message.create(request)
+            if response.success():
+                print(f"  [feishu] 反思简报已推送")
+                return True
+            else:
+                print(f"  [feishu] 推送失败 (attempt {attempt+1}): {response.code} - {response.msg}")
+        except Exception as e:
+            print(f"  [feishu] 推送异常 (attempt {attempt+1}): {e}")
+        if attempt < 2:
+            time.sleep(2)
+
+    print("  [feishu] 反思简报推送失败 (3次重试)")
+    return False
+
+
 def main():
-    print(f"[{datetime.now().isoformat()}] 开始每日自我反思...")
+    print(f"[{datetime.now().isoformat()}] 开始每日综合反思...")
 
-    # 1. 收集数据
-    print("  收集今日数据...")
-    today_data = collect_today_data()
-    conv_count = sum(c["message_count"] for c in today_data["conversations"])
-    print(f"  今日对话: {len(today_data['conversations'])} 用户, {conv_count} 条消息")
-    print(f"  错误数: {len(today_data['errors'])}")
+    # 1. 收集系统数据 (保留原有逻辑)
+    print("  收集系统运行数据...")
+    system_data = collect_today_data()
+    conv_count = sum(c["message_count"] for c in system_data["conversations"])
+    print(f"  今日对话: {len(system_data['conversations'])} 用户, {conv_count} 条消息")
+    print(f"  错误数: {len(system_data['errors'])}")
 
-    # 判断是否有实质性活动（排除仅有心跳/启动等日志的情况）
-    has_meaningful_logs = False
-    if today_data["bot_log_snippets"]:
-        meaningful_keywords = ['ERROR', 'Exception', '❌', '超时', '失败', 'Claude', '用户']
-        has_meaningful_logs = any(
-            any(kw in line for kw in meaningful_keywords)
-            for line in today_data["bot_log_snippets"]
-        )
+    # 2. 收集策略数据
+    print("  收集量化策略数据...")
+    strategy_data = collect_strategy_data()
+    pool_size = strategy_data.get("factor_pool", {}).get("pool_size", 0)
+    run_count = len(strategy_data.get("recent_runs", []))
+    shadow_count = len(strategy_data.get("shadows", {}))
+    pos_count = strategy_data.get("live_holdings", {}).get("position_count", 0)
+    print(f"  因子池: {pool_size}, 近期 run: {run_count}, shadow: {shadow_count}, 持仓: {pos_count}")
 
-    if conv_count == 0 and not today_data["errors"] and not has_meaningful_logs:
-        # 周末/节假日/无用户交互 — 记录但不调用 Claude 反思
+    # 3. 检索市场情报
+    print("  检索市场情报...")
+    market_intel = collect_market_intelligence()
+
+    # 4. 跳过判断 (放宽: 有因子池或有对话即反思)
+    has_strategy_data = pool_size > 0 or pos_count > 0
+    has_activity = conv_count > 0 or system_data["errors"]
+    if not has_strategy_data and not has_activity:
         is_weekend = date.today().weekday() >= 5
-        summary = "周末无活动" if is_weekend else "今日无活动"
+        summary = "周末无活动" if is_weekend else "今日无活动且无策略数据"
         print(f"  {summary}，跳过反思")
         save_reflection({
             "date": date.today().isoformat(),
-            "score": -1,  # -1 表示未评估（区别于实际评分 0）
+            "score": -1,
             "summary": summary,
-        }, [])
+        })
         return
 
-    # 2. 调用 Claude 反思
-    print("  调用 Claude 进行反思...")
-    reflection = run_reflection(today_data)
+    # 5. 调用 Claude 综合反思
+    print("  调用 Claude 进行综合反思...")
+    reflection = run_reflection(system_data, strategy_data, market_intel)
     score = reflection.get("score", 0)
     print(f"  反思完成，评分: {score}/10")
     print(f"  总结: {reflection.get('summary', 'N/A')}")
 
-    # 3. 自动修复（仅当有 auto_fixable 项时）
-    auto_fix_results = []
-    if reflection.get("code_improvements"):
-        auto_fixable = [imp for imp in reflection["code_improvements"]
-                       if imp.get("auto_fixable") and imp.get("priority") in ("high", "medium")]
-        if auto_fixable:
-            print(f"  发现 {len(auto_fixable)} 项可自动修复，开始修复...")
-            auto_fix_results = apply_auto_fixes(reflection)
-            print(f"  自动修复完成")
+    # 6. 保存行动计划 (Markdown)
+    plan_file = save_action_plan(reflection)
+    print(f"  行动计划已保存: {plan_file}")
 
-    # 4. 保存反思记录
-    reflect_file = save_reflection(reflection, auto_fix_results)
+    # 7. 保存反思记录 (JSON)
+    reflect_file = save_reflection(reflection)
     print(f"  反思记录已保存: {reflect_file}")
 
-    # 5. 如果有代码修改，重启 bot
-    if auto_fix_results and any(not r.get("error") for r in auto_fix_results):
-        print("  检测到代码修改，重启 smart_bot...")
-        restart_result = restart_bot()
-        print(f"  {restart_result}")
-    else:
-        print("  无代码修改，跳过重启")
+    # 8. 推送飞书简报
+    print("  推送飞书简报...")
+    push_reflection_to_feishu(reflection)
 
-    print(f"[{datetime.now().isoformat()}] 每日自我反思完成")
+    print(f"[{datetime.now().isoformat()}] 每日综合反思完成")
 
 
 if __name__ == "__main__":

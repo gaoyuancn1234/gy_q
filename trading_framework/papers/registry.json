@@ -1,0 +1,23 @@
+{
+  "paper_001": {
+    "arxiv_id": "2512.23515",
+    "title": "Alpha-R1: Alpha Screening with LLM Reasoning via Reinforcement Learning",
+    "url": "https://arxiv.org/abs/2512.23515",
+    "status": "reading",
+    "phase": "download",
+    "created_date": "2026-02-20",
+    "updated_date": "2026-02-20",
+    "branch": "paper/2512.23515",
+    "worktree_path": "/Users/jeric/Desktop/lab/qlib-papers/paper_001",
+    "pdf_path": "papers/pdfs/2512.23515.pdf",
+    "progress_summary": "TITLE: Alpha-R1: Alpha Screening with LLM Reasoning via Reinforcement Learning",
+    "phases_completed": [
+      "download",
+      "read"
+    ],
+    "notes": "",
+    "sessions": {
+      "read": "f02e9184-39d9-48cb-a398-e34ca18ed072"
+    }
+  }
+}
