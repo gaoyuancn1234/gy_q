@@ -879,6 +879,48 @@ def run_evolved_mining(dry_run: bool = False, smoke_test: bool = False):
     print(f"{'='*60}")
 
 
+def _build_synthetic_parent(d_entry: dict, d_idx: int,
+                            global_pool, session_pool) -> "Trajectory | None":
+    """从 global_pool 构造 synthetic parent (跨 session mutation)
+
+    前几天探索的方向在 global_pool 中有因子记录，
+    但当前 session 的 TrajectoryPool 中没有轨迹。
+    从 global_pool 找到该方向最佳因子，构造一个 Trajectory 供 mutation 使用。
+    """
+    from factor_lab.quanta.trajectory import Trajectory
+
+    direction_name = d_entry.get("direction", "")
+    best_factor = None
+    best_icir = 0.0
+
+    for pf in global_pool.get_all():
+        if pf.direction == direction_name and abs(pf.icir) > abs(best_icir):
+            best_factor = pf
+            best_icir = pf.icir
+
+    if not best_factor:
+        return None
+
+    traj = Trajectory(
+        direction_id=d_idx,
+        iteration=0,
+        phase="init",
+        parent_ids=[],
+    )
+    traj.hypothesis = best_factor.hypothesis
+    traj.direction = direction_name
+    traj.best_factor = {"name": best_factor.name, "expr": best_factor.expr}
+    traj.icir = best_factor.icir
+    traj.rank_ic = best_factor.rank_ic
+    traj.reward = abs(best_factor.rank_ic)
+
+    # 注册到 session pool 以便 direction_trace 可用
+    session_pool.add(traj)
+    print(f"    [synthetic] 从 global_pool 构建 parent: "
+          f"{best_factor.name} (ICIR={best_factor.icir:.4f})")
+    return traj
+
+
 def _try_admit_to_pool(traj, factor_pool, iteration):
     """尝试将轨迹的最佳因子加入池"""
     if traj and traj.best_factor and traj.failure_step == -1:
@@ -1261,11 +1303,16 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             d_idx = int(dir_id.split("_")[1])
             direction_trajs = [t for t in pool.get_successful()
                                if t.direction_id == d_idx]
-            if not direction_trajs:
-                print(f"    无可用 parent, 跳过")
-                continue
 
-            parent = max(direction_trajs, key=lambda t: t.reward)
+            if not direction_trajs:
+                # 前几天的方向: 从 global_pool 构造 synthetic parent
+                parent = _build_synthetic_parent(
+                    d_entry, d_idx, global_pool, pool)
+                if not parent:
+                    print(f"    无可用 parent (本session + global_pool均无), 跳过")
+                    continue
+            else:
+                parent = max(direction_trajs, key=lambda t: t.reward)
             print(f"    Parent: {parent.id} (ICIR={parent.icir:.4f})")
 
             traj = mutate_trajectory(parent, 1, pool, dry_run=dry_run,
@@ -1411,7 +1458,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     llm_stats_str = ""
     try:
         from factor_lab.mining.llm_backend import LLMBackend
-        llm_stats = LLMBackend().stats()
+        llm_stats = LLMBackend.shared().stats()
         if llm_stats.get("usage"):
             usage_parts = [f"{k}={v}" for k, v in llm_stats["usage"].items() if v > 0]
             if usage_parts:

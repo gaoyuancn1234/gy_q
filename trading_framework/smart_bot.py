@@ -741,18 +741,40 @@ class SmartBot:
         for i, chunk in enumerate(chunks):
             if total > 1:
                 chunk = f"{chunk}\n\n— ({i+1}/{total})"
+            self._send_lark_message(client, open_id, "text",
+                                    json.dumps({"text": chunk}))
+
+    def _send_lark_message(self, client, open_id: str, msg_type: str,
+                           content: str, max_retries: int = 3):
+        """发送飞书消息，失败时尝试重启 VPN 后重试"""
+        vpn_restarted = False
+        for attempt in range(max_retries):
             try:
                 req = CreateMessageRequest.builder() \
                     .receive_id_type("open_id") \
                     .request_body(CreateMessageRequestBody.builder()
                         .receive_id(open_id)
-                        .msg_type("text")
-                        .content(json.dumps({"text": chunk}))
+                        .msg_type(msg_type)
+                        .content(content)
                         .build()) \
                     .build()
-                client.im.v1.message.create(req)
+                resp = client.im.v1.message.create(req)
+                if resp.code == 0:
+                    return True
+                raise Exception(f"lark api code={resp.code} msg={resp.msg}")
             except Exception as e:
-                print(f"[发送失败] {e}")
+                print(f"[发送失败] 第{attempt+1}次: {e}")
+                if attempt < max_retries - 1:
+                    if not vpn_restarted:
+                        print("[VPN] 发送失败，尝试重启 LetsVPN...")
+                        self._restart_vpn()
+                        vpn_restarted = True
+                        time.sleep(10)
+                    else:
+                        time.sleep(3)
+                else:
+                    print(f"[发送失败] {max_retries}次全部失败，消息丢失: {content[:100]}")
+        return False
 
     def send_markdown(self, content: str, title: str = "", session: 'UserSession' = None):
         """发送 Markdown 卡片消息 (超长自动分段)"""
@@ -768,37 +790,29 @@ class SmartBot:
         chunks = self._split_text(content, MAX_CONTENT) if len(content) > MAX_CONTENT else [content]
 
         for i, chunk in enumerate(chunks):
-            try:
-                card = {
-                    "schema": "2.0",
-                    "config": {"wide_screen_mode": True},
-                    "body": {
-                        "direction": "vertical",
-                        "elements": [
-                            {"tag": "markdown", "content": chunk}
-                        ]
-                    }
+            card = {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "body": {
+                    "direction": "vertical",
+                    "elements": [
+                        {"tag": "markdown", "content": chunk}
+                    ]
                 }
-                chunk_title = title
-                if title and len(chunks) > 1:
-                    chunk_title = f"{title} ({i+1}/{len(chunks)})"
-                if chunk_title:
-                    card["header"] = {
-                        "title": {"tag": "plain_text", "content": chunk_title},
-                        "template": "blue"
-                    }
+            }
+            chunk_title = title
+            if title and len(chunks) > 1:
+                chunk_title = f"{title} ({i+1}/{len(chunks)})"
+            if chunk_title:
+                card["header"] = {
+                    "title": {"tag": "plain_text", "content": chunk_title},
+                    "template": "blue"
+                }
 
-                req = CreateMessageRequest.builder() \
-                    .receive_id_type("open_id") \
-                    .request_body(CreateMessageRequestBody.builder()
-                        .receive_id(open_id)
-                        .msg_type("interactive")
-                        .content(json.dumps(card))
-                        .build()) \
-                    .build()
-                client.im.v1.message.create(req)
-            except Exception as e:
-                print(f"[发送MD失败] {e}")
+            ok = self._send_lark_message(client, open_id, "interactive",
+                                         json.dumps(card))
+            if not ok:
+                # markdown 卡片发送失败，降级为纯文本
                 self.send_text(chunk, session)
 
     def upload_image(self, image_path: str, session: 'UserSession' = None) -> Optional[str]:
@@ -1262,6 +1276,7 @@ class SmartBot:
                                   'API Error', '401', 'unauthorized']
             max_retries = 3
             last_output = ""
+            vpn_restarted = False
 
             for attempt in range(max_retries):
                 proc = subprocess.Popen(
@@ -1285,13 +1300,22 @@ class SmartBot:
                     if session:
                         session.current_process = None
 
-                # 检测 API 错误，指数退避重试
+                # 检测 API 错误，尝试重启 VPN 后重试
                 if any(kw.lower() in last_output.lower() for kw in api_error_keywords):
                     print(f"[API错误] 第{attempt+1}次: {last_output[:200]}")
                     if attempt < max_retries - 1:
-                        wait = 2 ** attempt  # 1s, 2s
-                        print(f"[API重试] {wait}s 后重试...")
-                        time.sleep(wait)
+                        if not vpn_restarted:
+                            # 首次失败：尝试重启 VPN
+                            print("[VPN] 疑似 VPN 断连，尝试重启 LetsVPN...")
+                            self._restart_vpn()
+                            vpn_restarted = True
+                            print("[VPN] 等待 10s 让 VPN 建立连接...")
+                            time.sleep(10)
+                        else:
+                            # VPN 已重启过，短暂等待后重试
+                            wait = 5
+                            print(f"[API重试] VPN 已重启，{wait}s 后重试...")
+                            time.sleep(wait)
                         continue
                     # 3次全失败
                     return f"⚠️ Claude API 访问错误（已重试{max_retries}次），需要你处理：\n\n{last_output}"
@@ -1304,6 +1328,19 @@ class SmartBot:
             if session:
                 session.current_process = None
             return f"调用失败: {e}"
+
+    @staticmethod
+    def _restart_vpn():
+        """尝试重启 LetsVPN 以恢复网络连接"""
+        try:
+            subprocess.Popen(
+                'nohup /Applications/LetsVPN.app/Contents/MacOS/LetsVPN '
+                '>/tmp/letsvpn.out 2>/tmp/letsvpn.err &',
+                shell=True,
+            )
+            print("[VPN] LetsVPN 重启命令已执行")
+        except Exception as e:
+            print(f"[VPN] 重启失败: {e}")
 
     def _wait_bg_result(self, proc: subprocess.Popen, session: 'UserSession', complexity_desc: str):
         """后台线程等待超时任务完成，完成后主动推送结果给用户"""
@@ -1322,11 +1359,13 @@ class SmartBot:
                 output = stdout.strip() or stderr.strip()
                 if output:
                     print(f"[后台任务完成] {len(output)} 字符")
-                    # 检测 API 403 等错误，立即通知用户
+                    # 检测 API 403 等错误，尝试重启 VPN 后通知用户
                     if _is_api_error(output):
                         print(f"[后台任务API错误] {output[:200]}")
+                        print("[VPN] 后台任务 API 错误，尝试重启 LetsVPN...")
+                        self._restart_vpn()
                         self.send_text(
-                            f"⚠️ 后台任务遇到 API 访问错误，需要你处理：\n\n"
+                            f"⚠️ 后台任务遇到 API 访问错误（已尝试重启VPN），需要你处理：\n\n"
                             f"{output[:500]}\n\n"
                             f"（原始任务复杂度: {complexity_desc}）",
                             session

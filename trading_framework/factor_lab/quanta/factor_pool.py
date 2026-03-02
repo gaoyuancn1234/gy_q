@@ -30,6 +30,8 @@ class PoolFactor:
     direction: str = ""
     source_traj_id: str = ""
     iteration: int = 0
+    admitted_at: str | float = ""
+    last_validated: str | float = ""
 
 
 class FactorPool:
@@ -85,11 +87,13 @@ class FactorPool:
             self._factors.remove(worst)
 
         # 加入
+        from datetime import datetime
         self._factors.append(PoolFactor(
             name=name, expr=expr,
             rank_ic=rank_ic, icir=icir,
             hypothesis=hypothesis, direction=direction,
             source_traj_id=source_traj_id, iteration=iteration,
+            admitted_at=datetime.now().isoformat(),
         ))
         self._sort()
         return True, f"admitted (pool={self.size}/{self.capacity})"
@@ -212,6 +216,14 @@ class FactorPool:
                 quality.append((f.name, f.expr))
         return quality
 
+    def update_validation(self, validated_names: set[str]):
+        """更新通过 importance 筛选的因子的 last_validated 时间戳"""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        for f in self._factors:
+            if f.name in validated_names:
+                f.last_validated = now
+
     def stats(self) -> dict:
         rank_ics = [abs(f.rank_ic) for f in self._factors] if self._factors else [0]
         return {
@@ -234,6 +246,7 @@ class FactorPool:
                     "rank_ic": f.rank_ic, "icir": f.icir,
                     "hypothesis": f.hypothesis, "direction": f.direction,
                     "source_traj_id": f.source_traj_id, "iteration": f.iteration,
+                    "admitted_at": f.admitted_at, "last_validated": f.last_validated,
                 }
                 for f in self._factors
             ],
@@ -247,8 +260,11 @@ class FactorPool:
         with open(path) as f:
             data = json.load(f)
         self._total_attempted = data.get("total_attempted", 0)
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(PoolFactor)}
         self._factors = [
-            PoolFactor(**item) for item in data.get("factors", [])
+            PoolFactor(**{k: v for k, v in item.items() if k in valid_fields})
+            for item in data.get("factors", [])
         ]
 
     def _sort(self):
@@ -261,5 +277,45 @@ def _count_by_key(factors: list[PoolFactor], key: str) -> dict:
         val = getattr(f, key, 'unknown')
         counts[val] = counts.get(val, 0) + 1
     return counts
+
+
+def _compute_rank_corr(
+    factors: list[tuple[str, str]],
+    start_time: str = "2025-01-01",
+    end_time: str = "2025-12-31",
+) -> dict[tuple[str, str], float]:
+    """计算因子间的 Spearman rank correlation 矩阵
+
+    Args:
+        factors: [(name, expr), ...]
+
+    Returns:
+        {(name_a, name_b): corr_value} — key 按字母序排列
+    """
+    from qlib.data import D
+    import numpy as np
+
+    instruments = D.instruments("csi300")
+    fields = [expr for _, expr in factors]
+    names = [name for name, _ in factors]
+
+    df = D.features(instruments, fields,
+                    start_time=start_time, end_time=end_time)
+    df.columns = names
+
+    # 截面 rank → Spearman correlation
+    ranked = df.groupby(level=0).rank(pct=True)
+    corr_matrix = ranked.corr(method="pearson")
+
+    result: dict[tuple[str, str], float] = {}
+    for i, n1 in enumerate(names):
+        for j, n2 in enumerate(names):
+            if i >= j:
+                continue
+            key = tuple(sorted([n1, n2]))
+            val = corr_matrix.loc[n1, n2]
+            result[key] = float(val) if not np.isnan(val) else 0.0
+
+    return result
 
 

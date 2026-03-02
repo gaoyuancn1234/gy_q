@@ -265,6 +265,31 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
         env=_CLEAN_ENV
     )
     output = result.stdout.strip()
+    stderr = result.stderr.strip() if result.stderr else ""
+
+    # 检查 CLI 是否报错
+    if result.returncode != 0:
+        print(f"  [reflect] Claude CLI 退出码 {result.returncode}")
+        if stderr:
+            print(f"  [reflect] stderr: {stderr[:500]}")
+        return {
+            "score": 0,
+            "summary": f"Claude CLI 错误 (exit={result.returncode})",
+            "raw_output": output[:2000],
+            "stderr": stderr[:2000],
+            "error": f"returncode={result.returncode}: {stderr[:200]}"
+        }
+
+    if not output:
+        print(f"  [reflect] Claude 返回空输出")
+        if stderr:
+            print(f"  [reflect] stderr: {stderr[:500]}")
+        return {
+            "score": 0,
+            "summary": "Claude 返回空输出",
+            "stderr": stderr[:2000],
+            "error": f"空输出, stderr={stderr[:200]}"
+        }
 
     json_match = re.search(r'\{[\s\S]*\}', output)
     if json_match:
@@ -324,13 +349,38 @@ def run_reflection(today_data: dict) -> dict:
 
 
 def apply_auto_fixes(reflection: dict) -> list:
-    """根据反思结果，对 auto_fixable 的改进项调用 Claude 自动修复"""
+    """根据反思结果，对 auto_fixable 的改进项调用 Claude 自动修复
+
+    安全机制: git stash → 修复 → 成功保留 / 失败回滚
+    """
     applied = []
     improvements = reflection.get("code_improvements", [])
     auto_fixes = [imp for imp in improvements if imp.get("auto_fixable") and imp.get("priority") in ("high", "medium")]
 
     if not auto_fixes:
         return applied
+
+    # 记录修复前的 HEAD commit, 用于超时/失败回滚
+    try:
+        head_before = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=5, cwd=str(WORK_DIR)
+        ).stdout.strip()
+    except Exception:
+        head_before = None
+
+    # stash 未提交改动 (保护用户的 WIP)
+    stashed = False
+    try:
+        stash_result = subprocess.run(
+            ['git', 'stash', 'push', '-m', 'self_reflect: pre-autofix'],
+            capture_output=True, text=True, timeout=10, cwd=str(WORK_DIR)
+        )
+        stashed = 'Saved working directory' in stash_result.stdout
+        if stashed:
+            print("  已暂存未提交改动 (git stash)")
+    except Exception:
+        pass
 
     # 构建修复 prompt
     fix_descriptions = "\n".join(
@@ -350,9 +400,11 @@ def apply_auto_fixes(reflection: dict) -> list:
 4. 每个修改都要有 git commit
 5. 工作目录: {WORK_DIR}
 6. smart_bot.py 位于 {BOT_DIR}/smart_bot.py
+7. 绝对不要修改 self_reflect.py 本身
 
 请直接执行修改，不需要确认。修改完成后输出一个摘要，说明做了哪些改动。"""
 
+    fix_succeeded = False
     try:
         cmd = [
             '/usr/local/bin/claude',
@@ -368,13 +420,50 @@ def apply_auto_fixes(reflection: dict) -> list:
             env=_CLEAN_ENV
         )
         output = result.stdout.strip()
-        if output:
+        if result.returncode == 0 and output:
             applied.append({
                 "fixes_attempted": len(auto_fixes),
                 "output_summary": output[:1000],
             })
+            fix_succeeded = True
+        else:
+            stderr = result.stderr.strip() if result.stderr else ""
+            applied.append({
+                "error": f"Claude exit={result.returncode}",
+                "stderr": stderr[:500],
+            })
+    except subprocess.TimeoutExpired:
+        print("  自动修复超时，回滚未提交的改动...")
+        applied.append({"error": "自动修复超时 (30min)"})
     except Exception as e:
         applied.append({"error": str(e)})
+
+    # 失败/超时时回滚到修复前的 commit
+    if not fix_succeeded and head_before:
+        try:
+            current_head = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                capture_output=True, text=True, timeout=5, cwd=str(WORK_DIR)
+            ).stdout.strip()
+            if current_head != head_before:
+                print(f"  检测到半成品 commit，回退到 {head_before[:8]}")
+                subprocess.run(
+                    ['git', 'reset', '--hard', head_before],
+                    capture_output=True, text=True, timeout=10, cwd=str(WORK_DIR)
+                )
+        except Exception as e:
+            print(f"  回滚失败: {e}")
+
+    # 恢复 stash
+    if stashed:
+        try:
+            subprocess.run(
+                ['git', 'stash', 'pop'],
+                capture_output=True, text=True, timeout=10, cwd=str(WORK_DIR)
+            )
+            print("  已恢复暂存改动 (git stash pop)")
+        except Exception:
+            print("  警告: git stash pop 失败，请手动恢复")
 
     return applied
 
@@ -408,7 +497,8 @@ def restart_bot():
 
 def save_reflection(reflection: dict, auto_fix_results: list):
     """保存反思记录"""
-    today = date.today().isoformat()
+    # 使用 reflection 中的日期 (数据收集时确定), 避免跨午夜日期漂移
+    today = reflection.get("date", date.today().isoformat())
     reflection["auto_fixes"] = auto_fix_results
     reflection["generated_at"] = datetime.now().isoformat()
 
