@@ -80,12 +80,61 @@ REPLACE_IC_MIN = 0.03           # Stage 2.5 替换最低 IC (日频, 论文10min
 REPLACE_RATIO = 1.3             # Stage 2.5 替换倍数 (论文值)
 BATCH_DEDUP_AST = 0.7           # Stage 3 批内去重 AST 阈值
 
+# --- Phase D: Importance 筛选 ---
+IMPORTANCE_SCREEN_ENABLED = True    # 启用 importance 筛选
+IMPORTANCE_MIN_THRESHOLD = 0       # importance > 0 即保留 (模型至少用过一次)
+
 # --- Claude CLI 配置 ---
 CLAUDE_CLI = '/usr/local/bin/claude'
 CLAUDE_TIMEOUT = 600  # 秒 (一致性验证等复杂 prompt 可能需要较长时间)
 MAX_RETRY = 10         # LLM 调用最大重试次数 (论文 max_retry=30, 实际用 10)
 RETRY_WAIT = 5         # 重试等待秒数 (论文 retry_wait_seconds=15, 实际用 5)
 
+# --- 多 LLM 配置 (仅假设生成) ---
+LLM_PROVIDERS = [
+    {
+        "name": "claude",
+        "cli_path": "/usr/local/bin/claude",
+        "cli_args": ["--print", "--dangerously-skip-permissions",
+                     "--output-format", "text"],
+        "prompt_flag": "-p",
+        "env_remove": ["CLAUDECODE"],
+        "timeout": 600,
+        "daily_quota": 100,
+    },
+    {
+        "name": "gemini",
+        "cli_path": "/usr/local/bin/gemini",
+        "cli_args": [],
+        "prompt_flag": "-p",
+        "env_remove": [],
+        "timeout": 600,
+        "daily_quota": 50,
+    },
+    {
+        "name": "codex",
+        "cli_path": "/usr/local/bin/codex",
+        "cli_args": ["exec", "--ephemeral"],
+        "prompt_flag": "",
+        "output_mode": "file",   # codex exec -o tmpfile 输出最终回复
+        "env_remove": [],
+        "timeout": 600,
+        "daily_quota": 50,
+    },
+]
+
+LLM_HYPOTHESIS_ONLY = True  # 多 LLM 仅用于假设生成
+
+# --- 漏斗策略 (Phase D 多池并行评估) ---
+FUNNEL_STRATEGIES = {
+    "top_icir_10":   {"method": "top_icir",    "n": 10},
+    "top_icir_20":   {"method": "top_icir",    "n": 20},
+    "importance_10": {"method": "importance",  "n": 10},
+    "importance_20": {"method": "importance",  "n": 20},
+    "diverse_05":    {"method": "diverse",     "corr": 0.5, "n": 15},
+    "consensus":     {"method": "consensus",   "min_votes": 3},
+}
+FUNNEL_N_BACKTEST = 2  # 漏斗: 评分最高的 N 个池做全量回测
 
 # ============ Prompt 模板 (对齐论文 Jinja2 模板) ============
 

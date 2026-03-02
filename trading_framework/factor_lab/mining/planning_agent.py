@@ -1,26 +1,25 @@
-"""搜索方向规划 — Claude 生成多样化挖掘方向
+"""搜索方向规划 — 多 LLM 后端生成多样化挖掘方向
 
 用于演化式挖掘 (run_evolved_mining) 的第一步:
-Claude 分析现有因子库状况 + 近期表现 + 失败方向，生成 N 个多样化搜索方向。
+LLM 分析现有因子库状况 + 近期表现 + 失败方向，生成 N 个多样化搜索方向。
 """
 import json
 import re
-import subprocess
 import time
-from pathlib import Path
 
-WORK_DIR = Path(__file__).resolve().parent.parent.parent.parent  # repo root
-
-# 复用 quanta 的 Claude 配置
 from factor_lab.quanta.config import (
-    CLAUDE_CLI, CLAUDE_TIMEOUT, RETRY_WAIT, MAX_RETRY,
-    BASE_FEATURES, get_claude_env,
+    RETRY_WAIT, MAX_RETRY, BASE_FEATURES,
 )
+from factor_lab.mining.llm_backend import LLMBackend
+
+
+def _get_llm() -> LLMBackend:
+    return LLMBackend.shared()
 
 
 def plan_directions(context: str, n_directions: int = 5,
                     explored_summary: str = "") -> list[dict]:
-    """Claude 规划搜索方向
+    """LLM 规划搜索方向
 
     Args:
         context: Agent 记忆文本 (AGENT_CONTEXT.md)
@@ -82,31 +81,17 @@ def plan_directions(context: str, n_directions: int = 5,
 
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            cmd = [
-                CLAUDE_CLI,
-                '--print',
-                '--dangerously-skip-permissions',
-                '--output-format', 'text',
-                '-p', prompt,
-            ]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=CLAUDE_TIMEOUT, cwd=str(WORK_DIR),
-                env=get_claude_env(),
-            )
-            output = result.stdout.strip()
+            output = _get_llm().call(prompt)
             if output:
                 parsed = _parse_directions(output)
                 if parsed:
                     return parsed[:n_directions]
                 print(f"  [planning] 解析失败 (attempt {attempt}/{MAX_RETRY})")
             else:
-                print(f"  [planning] Claude 返回空输出 (attempt {attempt}/{MAX_RETRY})")
+                print(f"  [planning] LLM 返回空输出 (attempt {attempt}/{MAX_RETRY})")
 
-        except subprocess.TimeoutExpired:
-            print(f"  [planning] Claude CLI 超时 (attempt {attempt}/{MAX_RETRY})")
         except Exception as e:
-            print(f"  [planning] Claude CLI 调用失败: {e} (attempt {attempt}/{MAX_RETRY})")
+            print(f"  [planning] LLM 调用失败: {e} (attempt {attempt}/{MAX_RETRY})")
 
         if attempt < MAX_RETRY:
             time.sleep(RETRY_WAIT)
@@ -115,7 +100,7 @@ def plan_directions(context: str, n_directions: int = 5,
 
 
 def _parse_directions(output: str) -> list[dict]:
-    """从 Claude 输出解析方向列表"""
+    """从 LLM 输出解析方向列表"""
     for attempt in [
         lambda: json.loads(output),
         lambda: json.loads(re.search(r'```(?:json)?\s*\n(\[[\s\S]*?\])\s*\n```', output).group(1)),
@@ -138,7 +123,7 @@ def _parse_directions(output: str) -> list[dict]:
 
 
 def _fallback_directions(n: int) -> list[dict]:
-    """Claude 调用失败时的备选方向"""
+    """LLM 调用失败时的备选方向"""
     defaults = [
         {
             "direction": "日内波动非对称性",

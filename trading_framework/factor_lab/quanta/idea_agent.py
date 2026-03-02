@@ -1,4 +1,4 @@
-"""Agent Ai: 假说生成 (Claude CLI) — v3 Trace-aware
+"""Agent Ai: 假说生成 — v3 Trace-aware (多 LLM 后端)
 
 论文 Section 4.1 — Idea Agent 负责:
 1. 生成多样化初始假说 (Phase A)
@@ -9,20 +9,25 @@ v3 新增 (对齐论文 AlphaAgentHypothesisGen + MutationOperator + CrossoverOp
 4. Trace-aware 假说生成 (带历史上下文)
 5. 两阶段 mutation suffix (分析 + 引导)
 6. 两阶段 crossover suffix (分析 + 融合)
+
+v4: 假说生成改用 LLMBackend 多 LLM 轮询 (Claude/Gemini/Codex)。
+    mutation/crossover suffix 也走 LLMBackend (仍是假说生成范畴)。
 """
 import json
 import re
-import subprocess
 import time
 from pathlib import Path
 
 from .config import (
-    CLAUDE_CLI, CLAUDE_TIMEOUT, MAX_RETRY, RETRY_WAIT, HISTORY_LIMIT,
-    BASE_FEATURES, QLIB_OPERATORS, QLIB_CONSTRAINTS, get_claude_env,
+    MAX_RETRY, RETRY_WAIT, HISTORY_LIMIT,
+    BASE_FEATURES, QLIB_OPERATORS, QLIB_CONSTRAINTS,
 )
 from .trajectory import DirectionTrace, Trajectory
+from factor_lab.mining.llm_backend import LLMBackend
 
-WORK_DIR = Path(__file__).resolve().parent.parent.parent.parent  # repo root
+
+def _get_llm() -> LLMBackend:
+    return LLMBackend.shared()
 
 
 # ============ v3: Trace-aware 假说生成 ============
@@ -98,7 +103,7 @@ def generate_hypothesis_with_trace(direction_trace: DirectionTrace,
 }}
 ```"""
 
-    result = _call_claude(prompt, _parse_single_hypothesis)
+    result = _call_llm(prompt, _parse_single_hypothesis)
     if result:
         return result
     # Fallback: 返回基于 direction 的默认假说
@@ -142,7 +147,7 @@ def generate_mutation_suffix(parent: Trajectory,
 }}
 ```"""
 
-    result = _call_claude(prompt, _parse_single_hypothesis_flexible)
+    result = _call_llm(prompt, _parse_single_hypothesis_flexible)
     if not result:
         return ""
 
@@ -186,7 +191,7 @@ def generate_crossover_suffix(parents: list[Trajectory]) -> str:
 }}
 ```"""
 
-    result = _call_claude(prompt, _parse_single_hypothesis_flexible)
+    result = _call_llm(prompt, _parse_single_hypothesis_flexible)
     if not result:
         return ""
 
@@ -274,7 +279,7 @@ def generate_diverse_hypotheses(n: int = 10) -> list[dict]:
 
 注意: 每个假说的 (direction, mechanism, time_scale) 三元组应尽量不同。"""
 
-    return _call_claude(prompt, _parse_hypotheses)
+    return _call_llm(prompt, _parse_hypotheses)
 
 
 # ============ 保持原有 (v3 仍保留但不在 5 步循环中使用) ============
@@ -311,7 +316,7 @@ def mutate_hypothesis(original: dict, feedback: str) -> dict:
 }}
 ```"""
 
-    results = _call_claude(prompt, _parse_single_hypothesis)
+    results = _call_llm(prompt, _parse_single_hypothesis)
     if results:
         return results
     return original
@@ -353,7 +358,7 @@ def crossover_hypotheses(parents: list[dict], rewards: list[float]) -> dict:
 }}
 ```"""
 
-    results = _call_claude(prompt, _parse_single_hypothesis)
+    results = _call_llm(prompt, _parse_single_hypothesis)
     if results:
         return results
     return parents[0] if parents else {}
@@ -361,34 +366,21 @@ def crossover_hypotheses(parents: list[dict], rewards: list[float]) -> dict:
 
 # ============ Claude CLI 调用 ============
 
-def _call_claude(prompt: str, parser, timeout: int = CLAUDE_TIMEOUT):
-    """通用 Claude CLI 调用 (带重试)"""
+def _call_llm(prompt: str, parser):
+    """通用 LLM 调用 (通过 LLMBackend 多 provider 轮询 + 重试)"""
     empty = [] if parser == _parse_hypotheses else {}
 
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            cmd = [
-                CLAUDE_CLI,
-                '--print',
-                '--dangerously-skip-permissions',
-                '--output-format', 'text',
-                '-p', prompt,
-            ]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=timeout, cwd=str(WORK_DIR),
-                env=get_claude_env(),
-            )
-            output = result.stdout.strip()
+            output = _get_llm().call(prompt)
             if not output:
-                print(f"  [idea_agent] Claude 返回空输出 (attempt {attempt}/{MAX_RETRY})")
+                print(f"  [idea_agent] LLM 返回空输出 (attempt {attempt}/{MAX_RETRY})")
                 if attempt < MAX_RETRY:
                     time.sleep(RETRY_WAIT)
                     continue
                 return empty
 
             parsed = parser(output)
-            # 检查解析结果是否有效
             if parsed:
                 return parsed
             print(f"  [idea_agent] 解析失败, 重试 (attempt {attempt}/{MAX_RETRY})")
@@ -397,14 +389,8 @@ def _call_claude(prompt: str, parser, timeout: int = CLAUDE_TIMEOUT):
                 continue
             return empty
 
-        except subprocess.TimeoutExpired:
-            print(f"  [idea_agent] Claude CLI 超时 ({timeout}s, attempt {attempt}/{MAX_RETRY})")
-            if attempt < MAX_RETRY:
-                time.sleep(RETRY_WAIT)
-                continue
-            return empty
         except Exception as e:
-            print(f"  [idea_agent] Claude CLI 调用失败: {e} (attempt {attempt}/{MAX_RETRY})")
+            print(f"  [idea_agent] LLM 调用失败: {e} (attempt {attempt}/{MAX_RETRY})")
             if attempt < MAX_RETRY:
                 time.sleep(RETRY_WAIT)
                 continue

@@ -1,18 +1,16 @@
-"""Claude CLI 因子假说生成
+"""因子假说生成 — 多 LLM 后端
 
-调用 Claude CLI agent 生成新的量化因子假说。
+调用 LLMBackend (Claude/Gemini/Codex 轮询) 生成新的量化因子假说。
 支持: 多样化种子初始化 / Mutation 靶向修复 / Crossover 模式重组
 """
 import json
 import re
-import subprocess
-from pathlib import Path
 
-WORK_DIR = Path(__file__).resolve().parent.parent.parent.parent  # repo root
+from factor_lab.mining.llm_backend import LLMBackend
 
-from factor_lab.quanta.config import (
-    CLAUDE_CLI, CLAUDE_TIMEOUT, get_claude_env,
-)
+
+def _get_llm() -> LLMBackend:
+    return LLMBackend.shared()
 
 # 多样化种子方向 — cycle 轮转使用
 SEED_CATEGORIES = [
@@ -122,28 +120,12 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
 ```"""
 
     try:
-        cmd = [
-            CLAUDE_CLI,
-            '--print',
-            '--dangerously-skip-permissions',
-            '--output-format', 'text',
-            '-p', prompt,
-        ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True,
-            timeout=CLAUDE_TIMEOUT,
-            cwd=str(WORK_DIR),
-            env=get_claude_env(),
-        )
-        output = result.stdout.strip()
-        return _parse_hypotheses(output)
-
-    except subprocess.TimeoutExpired:
-        print(f"  [hypothesis] Claude CLI 超时 ({CLAUDE_TIMEOUT}s)")
+        output = _get_llm().call(prompt)
+        if output:
+            return _parse_hypotheses(output)
         return []
     except Exception as e:
-        print(f"  [hypothesis] Claude CLI 调用失败: {e}")
+        print(f"  [hypothesis] LLM 调用失败: {e}")
         return []
 
 
@@ -172,24 +154,13 @@ def _parse_hypotheses(output: str) -> list[dict]:
     return []
 
 
-def _call_claude_for_hypotheses(prompt: str, tag: str) -> list[dict]:
-    """调用 Claude CLI 生成假说 (共享逻辑)"""
+def _call_llm_for_hypotheses(prompt: str, tag: str) -> list[dict]:
+    """调用 LLMBackend 生成假说 (共享逻辑)"""
     try:
-        cmd = [
-            CLAUDE_CLI,
-            '--print',
-            '--dangerously-skip-permissions',
-            '--output-format', 'text',
-            '-p', prompt,
-        ]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=CLAUDE_TIMEOUT, cwd=str(WORK_DIR),
-            env=get_claude_env(),
-        )
-        return _parse_hypotheses(result.stdout.strip())
-    except subprocess.TimeoutExpired:
-        print(f"  {tag} Claude CLI 超时 ({CLAUDE_TIMEOUT}s)")
+        output = _get_llm().call(prompt)
+        if output:
+            return _parse_hypotheses(output)
+        print(f"  {tag} LLM 返回空输出")
         return []
     except Exception as e:
         print(f"  {tag} 调用失败: {e}")
@@ -295,7 +266,7 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
 ]
 ```"""
 
-    return _call_claude_for_hypotheses(prompt, "[mutation]")
+    return _call_llm_for_hypotheses(prompt, "[mutation]")
 
 
 # ---------------------------------------------------------------------------
@@ -369,4 +340,4 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
 ]
 ```"""
 
-    return _call_claude_for_hypotheses(prompt, "[crossover]")
+    return _call_llm_for_hypotheses(prompt, "[crossover]")

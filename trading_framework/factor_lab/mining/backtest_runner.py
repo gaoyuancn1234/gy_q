@@ -24,6 +24,33 @@ def _get_current_preset() -> str:
     except Exception:
         return 'alpha158_val'
 
+
+def _detect_effective_baseline() -> str:
+    """智能检测实际生产 baseline preset
+
+    逻辑:
+    1. 读 signal_config.yaml 的 preset (如 alpha158_val)
+    2. 检查 mined.py 是否有因子 → 有则升级到 {preset}_mined
+    3. 检查升级后的缓存文件是否存在 → 不存在则回退原 preset
+    """
+    base_preset = _get_current_preset()
+
+    # 检查 mined.py 是否有因子
+    try:
+        from factor_lab.factors.mined import MINED_FACTORS
+        has_mined = bool(MINED_FACTORS)
+    except (ImportError, AttributeError):
+        has_mined = False
+
+    if has_mined:
+        mined_preset = f"{base_preset}_mined"
+        mined_file = RESULTS_DIR / f"D_expand_3v_3r_{mined_preset}_LightGBM.json"
+        if mined_file.exists():
+            return mined_preset
+
+    return base_preset
+
+
 # 回测参数 (与 run_rolling_benchmark 一致)
 ROLLING_CONFIG_NAME = "D_expand_3v_3r"
 ROLLING_CONFIG = {
@@ -37,14 +64,15 @@ TEST_END = '2026-02-05'
 
 
 def _load_baseline() -> dict | None:
-    """从缓存读取 M01 baseline 结果 (动态读取当前 preset)"""
-    preset = _get_current_preset()
+    """从缓存读取 baseline 结果 (智能检测实际生产 preset)"""
+    preset = _detect_effective_baseline()
     baseline_file = RESULTS_DIR / f"D_expand_3v_3r_{preset}_LightGBM.json"
     if baseline_file.exists():
         with open(baseline_file) as f:
             data = json.load(f)
         overall = data.get("overall", {})
         if overall and overall.get("sharpe"):
+            print(f"  [baseline] 使用 {preset} (Sharpe={overall['sharpe']:.3f})")
             return overall
     return None
 
@@ -76,19 +104,21 @@ def screen_by_importance(
     if not candidate_factors:
         return [], {}
 
-    # 1. 构建因子列表: alpha158_val 的 extra + candidate_factors (去重)
-    preset = FACTOR_PRESETS["alpha158_val"]
-    extra = preset["extra_factors"]
+    # 1. 构建因子列表: 使用当前生产 baseline 的 extra + candidate_factors (去重)
+    effective_preset = _detect_effective_baseline()
+    base_preset_cfg = FACTOR_PRESETS.get(effective_preset,
+                                         FACTOR_PRESETS["alpha158_val"])
+    extra = base_preset_cfg["extra_factors"]
     if callable(extra):
         extra = extra()
     extra_names = {name for name, _ in extra}
-    # 去除与 alpha158_val extras 名字重复的候选因子，避免 LightGBM 列名冲突
+    # 去除与 baseline extras 名字重复的候选因子，避免 LightGBM 列名冲突
     deduped_candidates = [(n, e) for n, e in candidate_factors if n not in extra_names]
     if len(deduped_candidates) < len(candidate_factors):
         n_dup = len(candidate_factors) - len(deduped_candidates)
-        print(f"  [importance] 去除 {n_dup} 个与 alpha158_val 重名的候选因子")
+        print(f"  [importance] 去除 {n_dup} 个与 {effective_preset} 重名的候选因子")
     if not deduped_candidates:
-        print("  [importance] 所有候选因子与 alpha158_val 重名，跳过训练")
+        print(f"  [importance] 所有候选因子与 {effective_preset} 重名，跳过训练")
         return [], {}
     extended_factors = extra + deduped_candidates
 
@@ -195,9 +225,11 @@ def run_comparison(new_factors: list[tuple[str, str]],
     if not baseline:
         return {"error": "baseline 缓存不存在或 overall 为空，需运行: python -m factor_lab.run_rolling_benchmark --configs D_expand_3v_3r --presets alpha158_val --models LightGBM --force"}
 
-    # 2. 构建扩展因子列表: alpha158_val 的 extra + new_factors (去重)
-    preset = FACTOR_PRESETS["alpha158_val"]
-    extra = preset["extra_factors"]
+    # 2. 构建扩展因子列表: 使用与 baseline 一致的因子集 + new_factors (去重)
+    effective_preset = _detect_effective_baseline()
+    base_preset_cfg = FACTOR_PRESETS.get(effective_preset,
+                                         FACTOR_PRESETS["alpha158_val"])
+    extra = base_preset_cfg["extra_factors"]
     if callable(extra):
         extra = extra()
     extra_names = {name for name, _ in extra}
