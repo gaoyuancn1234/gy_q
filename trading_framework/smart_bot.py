@@ -1949,6 +1949,22 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
 
     def handle_quick_commands(self, text: str, session: 'UserSession' = None, image_path: str = None) -> bool:
         """处理快捷命令，返回是否已处理"""
+        # 简单问候 → 主动功能引导（不走 Claude）
+        greeting_keywords = {'你好', '在吗', 'hi', 'hello', '嗨', '早上好', '下午好', '晚上好', '早'}
+        if text.strip().lower() in greeting_keywords:
+            self.send_text(
+                "你好！我可以帮你：\n"
+                "• 「信号」查看今日调仓信号\n"
+                "• 「持仓」查看实盘持仓\n"
+                "• 「监控」盘中监控状态\n"
+                "• 「挖掘」因子挖掘进展\n"
+                "• 「影子」影子交易验证\n"
+                "• 「帮助」查看全部命令\n"
+                "或直接输入任何问题，我来帮你分析 😊",
+                session
+            )
+            return True
+
         # 帮助
         if text in ['帮助', 'help', '?']:
             self.send_text(
@@ -2909,9 +2925,9 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
                     consecutive += 1
                     self._record_disconnect(app_id)
 
-                    # 指数退避重连: 5s, 10s, 20s, ... 最大 300s
-                    backoff = min(5 * (2 ** (consecutive - 1)), 300)
-                    print(f"[WS] {backoff}s 后重连...")
+                    # 指数退避重连: 2s, 4s, 8s, 16s, 32s, 60s (封顶)
+                    backoff = min(2 * (2 ** (consecutive - 1)), 60)
+                    print(f"[WS] App {app_id} 断连第{consecutive}次, {backoff}s 后重连...")
                     await asyncio.sleep(backoff)
 
         async def _run_all():
