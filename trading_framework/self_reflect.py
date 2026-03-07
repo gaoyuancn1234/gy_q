@@ -508,13 +508,52 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
         print(f"  [reflect] Claude CLI 退出码 {result.returncode}")
         if stderr:
             print(f"  [reflect] stderr: {stderr[:500]}")
-        return {
-            "score": 0,
-            "summary": f"Claude CLI 错误 (exit={result.returncode})",
-            "raw_output": output[:2000],
-            "stderr": stderr[:2000],
-            "error": f"returncode={result.returncode}: {stderr[:200]}"
-        }
+        # OAuth token 过期时尝试自动刷新并重试
+        combined = (output + " " + stderr).lower()
+        if "auth" in combined or "token" in combined or "expired" in combined or "403" in combined or "401" in combined:
+            print("  [reflect] 检测到认证错误，尝试刷新 OAuth token...")
+            try:
+                subprocess.run(
+                    "echo '/exit' | /usr/local/bin/claude",
+                    shell=True, capture_output=True, timeout=30,
+                    env=_CLEAN_ENV
+                )
+                print("  [reflect] token 刷新完成，重试反思...")
+                retry = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=timeout, cwd=str(WORK_DIR), env=_CLEAN_ENV
+                )
+                if retry.returncode == 0 and retry.stdout.strip():
+                    output = retry.stdout.strip()
+                    stderr = retry.stderr.strip() if retry.stderr else ""
+                    print("  [reflect] 重试成功")
+                    # 跳过下面的 return，继续正常解析
+                else:
+                    print(f"  [reflect] 重试仍失败 (exit={retry.returncode})")
+                    return {
+                        "score": 0,
+                        "summary": f"Claude CLI 认证错误，自动刷新后仍失败 (exit={retry.returncode})",
+                        "raw_output": (retry.stdout or "")[:2000],
+                        "stderr": (retry.stderr or "")[:2000],
+                        "error": f"returncode={retry.returncode} after token refresh"
+                    }
+            except Exception as e:
+                print(f"  [reflect] token 刷新异常: {e}")
+                return {
+                    "score": 0,
+                    "summary": f"Claude CLI 错误 (exit={result.returncode})",
+                    "raw_output": output[:2000],
+                    "stderr": stderr[:2000],
+                    "error": f"returncode={result.returncode}: {stderr[:200]}"
+                }
+        else:
+            return {
+                "score": 0,
+                "summary": f"Claude CLI 错误 (exit={result.returncode})",
+                "raw_output": output[:2000],
+                "stderr": stderr[:2000],
+                "error": f"returncode={result.returncode}: {stderr[:200]}"
+            }
 
     if not output:
         print(f"  [reflect] Claude 返回空输出")
@@ -702,6 +741,15 @@ def save_reflection(reflection: dict):
     reflect_file = REFLECT_DIR / f"{today}.json"
     with open(reflect_file, 'w', encoding='utf-8') as f:
         json.dump(reflection, f, ensure_ascii=False, indent=2)
+
+    # 写入通知
+    try:
+        from notifications import write_notification
+        score = reflection.get("score", 0)
+        summary = reflection.get("summary", "")
+        write_notification("reflection", f"反思评分: {score}/10", summary)
+    except Exception:
+        pass
 
     # 更新反思索引
     index_file = REFLECT_DIR / "index.json"

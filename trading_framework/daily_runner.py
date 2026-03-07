@@ -453,6 +453,8 @@ def _check_auto_retrain(dry_run: bool = False) -> bool:
                 )
                 log.warning(alert)
                 push_feishu(alert, dry_run)
+                from notifications import write_notification
+                write_notification("signal", "重训突变回退", alert, "warn")
                 return True
 
         # 4. 安全，更新配置
@@ -471,11 +473,15 @@ def _check_auto_retrain(dry_run: bool = False) -> bool:
         )
         log.info(notify)
         push_feishu(notify, dry_run)
+        from notifications import write_notification
+        write_notification("signal", "自动重训完成", notify)
         return True
 
     except Exception as e:
         log.error(f"自动重训异常: {e}", exc_info=True)
         push_feishu(f"❌ 自动重训异常: {e}\n请手动检查", dry_run)
+        from notifications import write_notification
+        write_notification("signal", f"自动重训异常: {e}", str(e), "error")
         return False
 
 
@@ -504,6 +510,8 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
                    f"请先运行: python retrain_pipeline.py")
         log.error(msg)
         push_feishu(msg, dry_run)
+        from notifications import write_notification
+        write_notification("signal", "预测缓存不存在", msg, "error")
         return
 
     log.info("加载信号生成器...")
@@ -513,7 +521,10 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
     signal = sg.get_signal()
     if 'error' in signal:
         log.error(f"信号生成失败: {signal['error']}")
-        push_feishu(f"❌ ML信号生成失败: {signal['error']}", dry_run)
+        err_msg = f"❌ ML信号生成失败: {signal['error']}"
+        push_feishu(err_msg, dry_run)
+        from notifications import write_notification
+        write_notification("signal", "信号生成失败", err_msg, "error")
         return
 
     log.info(f"信号日期: {signal['date']}, 状态: {signal['regime']}, TopK: {signal['effective_topk']}")
@@ -543,6 +554,8 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
     if not prices:
         log.error("获取价格失败")
         push_feishu("❌ 获取实时价格失败，请检查 BaoStock 连接", dry_run)
+        from notifications import write_notification
+        write_notification("signal", "获取价格失败", "BaoStock 连接异常", "error")
         return
     if from_cache:
         log.warning("使用缓存价格 (BaoStock不可用)")
@@ -612,6 +625,8 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         message += "\n\n⚠️ 降级运行: " + " | ".join(degraded)
 
     push_feishu(message, dry_run)
+    from notifications import write_notification
+    write_notification("signal", "每日信号", message)
 
 
 def _run_shadow_updates(live_signal: dict, prices: dict,
@@ -663,6 +678,8 @@ def _run_shadow_updates(live_signal: dict, prices: dict,
             report = sm.get_expiry_report(sid)
             if report:
                 push_feishu(f"📊 {report}", dry_run)
+                from notifications import write_notification
+                write_notification("signal", f"Shadow到期: {sid}", report)
                 log.info(f"Shadow {sid} 已到期，发送对比报告")
 
         # 健康检查: 连续 3 天无更新的 shadow 告警
@@ -867,6 +884,8 @@ def morning_reflection_report(dry_run: bool = False):
 
     message = "\n".join(parts)
     push_feishu(message, dry_run)
+    from notifications import write_notification
+    write_notification("reflection", f"反思晨报: {score}/10", message)
     log.info(f"反思晨报已推送: {reflect_date}, 评分 {score}/10")
 
 
@@ -1111,10 +1130,16 @@ def main():
         _handle_experiment_commands(args)
         return
 
-    # 早间反思汇报
+    # 早间反思汇报 + 盘前国际行情
     if args.morning_report:
         log.info("推送早间反思汇报...")
         morning_reflection_report(dry_run=args.dry_run)
+        # 国际行情独立推送，即使反思报告为空也执行
+        try:
+            from market_monitor import generate_morning_alert
+            generate_morning_alert(dry_run=args.dry_run)
+        except Exception as e:
+            log.warning(f"国际行情监控失败: {e}")
         return
 
     log.info("=" * 50)

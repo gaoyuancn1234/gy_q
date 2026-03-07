@@ -1,36 +1,29 @@
 #!/usr/bin/env python3
 """
-智能飞书机器人 v3 (多用户隔离)
-- 每用户独立记忆/消息队列/Claude进程
+智能飞书机器人 v4 (Claude CLI session)
+- Claude CLI session resume 自动维护对话上下文
+- 每用户独立消息队列/状态
 - 消息队列处理（防止错位）
-- 智能等待（不盲目 sleep）
-- 记忆系统（重要记忆持久化，向量召回）
 """
 
 import os
 import sys
 import json
 import time
-import hashlib
 import threading
 import queue
 import re
-import shutil
 import subprocess
 import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from collections import deque
 
 from dotenv import load_dotenv
 import redis
-import numpy as np
-import faiss
-import onnxruntime as ort
-from tokenizers import Tokenizer as HFTokenizer
-from huggingface_hub import hf_hub_download
+
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
@@ -44,9 +37,6 @@ _CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in ('CLAUDECODE', 'CL
 
 WORK_DIR = Path(__file__).parent.parent
 BOT_DIR = Path(__file__).parent
-MEMORY_DIR = BOT_DIR / "memory"
-MEMORY_DIR.mkdir(exist_ok=True)
-
 load_dotenv(BOT_DIR / ".env", override=True)
 
 APPS = []
@@ -61,11 +51,6 @@ for i in range(1, 10):
 # 消息处理配置
 MESSAGE_BATCH_WAIT = 1.2  # 等待批量消息的时间(秒)
 MAX_WAIT_FOR_REPLY = 30   # 等待用户回复的最大时间(秒)
-
-# Embedding 模型配置 (多语言 Transformer, 支持中文)
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-EMBEDDING_DIM = 384  # 输出维度
-EMBEDDING_MAX_LEN = 128  # 最大 token 长度
 
 # Redis 配置
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -215,10 +200,10 @@ class TempFileStore:
 # 动态超时配置（秒）
 TIMEOUT_QUICK = 60        # 极简问答: 1分钟
 TIMEOUT_SIMPLE = 120      # 简单问答: 2分钟
-TIMEOUT_SCRIPT = 300      # 简单脚本: 5分钟
-TIMEOUT_MEDIUM = 600      # 中等任务: 10分钟
-TIMEOUT_ANALYSIS = 3600   # 复杂分析: 1小时
-TIMEOUT_COMPLEX = 3600    # 复杂代码任务: 1小时
+TIMEOUT_SCRIPT = 600      # 简单脚本: 10分钟
+TIMEOUT_MEDIUM = 1800     # 中等任务: 30分钟
+TIMEOUT_ANALYSIS = 10800  # 复杂分析: 3小时
+TIMEOUT_COMPLEX = 21600   # 复杂代码任务: 6小时
 
 # ============================================================
 # 数据结构
@@ -232,326 +217,6 @@ class Message:
     timestamp: float = field(default_factory=time.time)
     msg_id: str = ""
     image_path: str = ""  # 图片路径
-
-@dataclass
-class Memory:
-    """记忆单元"""
-    id: str
-    content: str
-    summary: str
-    importance: float  # 0-1
-    embedding: List[float] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-    last_accessed: float = field(default_factory=time.time)
-    access_count: int = 1
-
-# ============================================================
-# Transformer Embedding (ONNX Runtime)
-# ============================================================
-
-class TransformerEmbedder:
-    """基于 ONNX Runtime 的 Transformer 文本向量化"""
-
-    _instance = None
-
-    @classmethod
-    def get_instance(cls):
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def __init__(self):
-        print("[Embedding] 加载 Transformer 模型...")
-        try:
-            tok_path = hf_hub_download(EMBEDDING_MODEL, 'tokenizer.json')
-            onnx_path = hf_hub_download(EMBEDDING_MODEL, 'onnx/model.onnx')
-
-            self.tokenizer = HFTokenizer.from_file(tok_path)
-            # 自动检测 pad token (不同模型不同)
-            vocab = self.tokenizer.get_vocab()
-            if '<pad>' in vocab:
-                pad_id, pad_token = vocab['<pad>'], '<pad>'
-            elif '[PAD]' in vocab:
-                pad_id, pad_token = vocab['[PAD]'], '[PAD]'
-            else:
-                pad_id, pad_token = 0, '[PAD]'
-            self.tokenizer.enable_padding(pad_id=pad_id, pad_token=pad_token, length=EMBEDDING_MAX_LEN)
-            self.tokenizer.enable_truncation(max_length=EMBEDDING_MAX_LEN)
-
-            self.session = ort.InferenceSession(onnx_path)
-            self.dim = EMBEDDING_DIM
-            self.ready = True
-            print(f"[Embedding] 模型加载成功, dim={self.dim}")
-        except Exception as e:
-            print(f"[Embedding] 模型加载失败: {e}, 降级为 hash 模式")
-            self.ready = False
-            self.dim = EMBEDDING_DIM
-
-    def encode(self, text: str) -> np.ndarray:
-        """单条文本编码"""
-        return self.encode_batch([text])[0]
-
-    def encode_batch(self, texts: list) -> np.ndarray:
-        """批量编码，返回 (N, dim) 的归一化向量"""
-        if not self.ready:
-            return self._hash_fallback(texts)
-
-        try:
-            encodings = self.tokenizer.encode_batch(texts)
-            input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
-            attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
-            token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
-
-            outputs = self.session.run(None, {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'token_type_ids': token_type_ids
-            })
-
-            # Mean pooling
-            token_emb = outputs[0]
-            mask_exp = attention_mask[:, :, np.newaxis].astype(np.float32)
-            embeddings = np.sum(token_emb * mask_exp, axis=1) / (np.sum(mask_exp, axis=1) + 1e-9)
-
-            # L2 归一化
-            faiss.normalize_L2(embeddings)
-            return embeddings
-        except Exception as e:
-            print(f"[Embedding] 编码失败: {e}, 降级为 hash")
-            return self._hash_fallback(texts)
-
-    def _hash_fallback(self, texts: list) -> np.ndarray:
-        """降级：基于字符 hash 的简单编码"""
-        results = []
-        for text in texts:
-            vec = np.zeros(self.dim, dtype=np.float32)
-            for i, char in enumerate(text):
-                idx = hash(char) % self.dim
-                vec[idx] += 1.0 / (1 + i * 0.1)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            results.append(vec)
-        return np.array(results, dtype=np.float32)
-
-
-# ============================================================
-# 记忆系统 (Faiss 向量检索)
-# ============================================================
-
-class MemorySystem:
-    """记忆系统"""
-
-    def __init__(self, memory_dir: Path):
-        self.memory_dir = memory_dir
-        self.short_term_file = memory_dir / "short_term.json"
-        self.long_term_file = memory_dir / "long_term.json"
-        self.embeddings_file = memory_dir / "embeddings.npy"
-        self.index_file = memory_dir / "index.json"
-        self.faiss_index_file = memory_dir / "faiss.index"
-
-        self.short_term: deque = deque(maxlen=50)
-        self.long_term: Dict[str, Memory] = {}
-        self.embeddings: Optional[np.ndarray] = None
-        self.embedding_ids: List[str] = []
-
-        # Faiss 索引 (Inner Product = 余弦相似度，因为向量已归一化)
-        self.faiss_index: Optional[faiss.IndexFlatIP] = None
-
-        # Transformer embedder
-        self.embedder = TransformerEmbedder.get_instance()
-
-        self._load()
-
-    def _load(self):
-        """加载记忆"""
-        if self.short_term_file.exists():
-            try:
-                data = json.loads(self.short_term_file.read_text())
-                for item in data:
-                    self.short_term.append(Message(**item))
-            except Exception as e:
-                print(f"[记忆] 加载短期记忆失败: {e}")
-
-        if self.long_term_file.exists():
-            try:
-                data = json.loads(self.long_term_file.read_text())
-                for k, v in data.items():
-                    self.long_term[k] = Memory(**v)
-            except Exception as e:
-                print(f"[记忆] 加载长期记忆失败: {e}")
-
-        # 加载 Faiss 索引
-        if self.faiss_index_file.exists() and self.index_file.exists():
-            try:
-                self.faiss_index = faiss.read_index(str(self.faiss_index_file))
-                self.embedding_ids = json.loads(self.index_file.read_text())
-                # 同步加载 embeddings 备份
-                if self.embeddings_file.exists():
-                    self.embeddings = np.load(str(self.embeddings_file))
-                print(f"[记忆] Faiss 索引已加载: {self.faiss_index.ntotal} 条向量")
-            except Exception as e:
-                print(f"[记忆] 加载 Faiss 索引失败: {e}")
-                self.faiss_index = None
-
-        # 旧数据迁移：从 numpy 迁移到 Faiss
-        if self.faiss_index is None and self.embeddings_file.exists() and self.index_file.exists():
-            try:
-                old_embeddings = np.load(str(self.embeddings_file))
-                self.embedding_ids = json.loads(self.index_file.read_text())
-
-                if old_embeddings.shape[1] != EMBEDDING_DIM:
-                    # 维度不匹配(旧的128维)，需要用 Transformer 重新编码
-                    print(f"[记忆] 旧向量维度 {old_embeddings.shape[1]} != {EMBEDDING_DIM}，重新编码...")
-                    self._rebuild_embeddings()
-                else:
-                    # 维度匹配，直接建 Faiss 索引
-                    self.embeddings = old_embeddings.astype(np.float32)
-                    faiss.normalize_L2(self.embeddings)
-                    self.faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
-                    self.faiss_index.add(self.embeddings)
-                    self._save_faiss()
-                    print(f"[记忆] 从 numpy 迁移到 Faiss: {self.faiss_index.ntotal} 条向量")
-            except Exception as e:
-                print(f"[记忆] 迁移旧数据失败: {e}")
-
-        # 确保有空的 Faiss 索引
-        if self.faiss_index is None:
-            self.faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
-            print("[记忆] 创建空 Faiss 索引")
-
-    def _rebuild_embeddings(self):
-        """用 Transformer 重新编码所有长期记忆"""
-        if not self.long_term:
-            return
-
-        texts = []
-        ids = []
-        for mem_id, mem in self.long_term.items():
-            texts.append(mem.content)
-            ids.append(mem_id)
-
-        if not texts:
-            return
-
-        embeddings = self.embedder.encode_batch(texts)
-        self.embeddings = embeddings
-        self.embedding_ids = ids
-        self.faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
-        self.faiss_index.add(embeddings)
-
-        # 更新 Memory 对象中的 embedding
-        for i, mem_id in enumerate(ids):
-            self.long_term[mem_id].embedding = embeddings[i].tolist()
-
-        self._save_faiss()
-        print(f"[记忆] 重建完成: {len(ids)} 条记忆已重新编码")
-
-    def _save(self):
-        """保存记忆"""
-        try:
-            self.short_term_file.write_text(
-                json.dumps([asdict(m) for m in self.short_term], ensure_ascii=False, indent=2)
-            )
-            self.long_term_file.write_text(
-                json.dumps({k: asdict(v) for k, v in self.long_term.items()}, ensure_ascii=False, indent=2)
-            )
-            self._save_faiss()
-        except Exception as e:
-            print(f"[记忆] 保存失败: {e}")
-
-    def _save_faiss(self):
-        """保存 Faiss 索引和 embeddings"""
-        try:
-            if self.faiss_index is not None and self.faiss_index.ntotal > 0:
-                faiss.write_index(self.faiss_index, str(self.faiss_index_file))
-                self.index_file.write_text(json.dumps(self.embedding_ids))
-                # 同时保存 numpy 备份
-                if self.embeddings is not None:
-                    np.save(str(self.embeddings_file), self.embeddings)
-        except Exception as e:
-            print(f"[记忆] 保存 Faiss 索引失败: {e}")
-
-    def add_message(self, msg: Message):
-        """添加消息到短期记忆"""
-        self.short_term.append(msg)
-        self._save()
-
-    def get_recent_context(self, n: int = 10) -> List[Message]:
-        """获取最近n轮对话"""
-        return list(self.short_term)[-n*2:]
-
-    def add_long_term(self, content: str, summary: str, importance: float, embedding: List[float] = None):
-        """添加长期记忆（自动 Transformer 编码 + Faiss 索引）"""
-        mem_id = hashlib.md5(content.encode()).hexdigest()[:12]
-        now = time.time()
-
-        # 如果没有提供 embedding，用 Transformer 自动生成
-        if embedding is None or len(embedding) != EMBEDDING_DIM:
-            vec = self.embedder.encode(content)
-            embedding = vec.tolist()
-
-        memory = Memory(
-            id=mem_id,
-            content=content,
-            summary=summary,
-            importance=importance,
-            embedding=embedding,
-            created_at=now,
-            last_accessed=now,
-            access_count=1
-        )
-        self.long_term[mem_id] = memory
-
-        # 添加到 Faiss 索引
-        vec = np.array(embedding, dtype=np.float32).reshape(1, -1)
-        faiss.normalize_L2(vec)
-        self.faiss_index.add(vec)
-        self.embedding_ids.append(mem_id)
-
-        # 同步 numpy 备份
-        if self.embeddings is None:
-            self.embeddings = vec
-        else:
-            self.embeddings = np.vstack([self.embeddings, vec])
-
-        self._save()
-        print(f"[记忆] 保存长期记忆: {summary[:30]}... (Faiss 索引: {self.faiss_index.ntotal})")
-        return mem_id
-
-    def recall(self, query_embedding: List[float], top_k: int = 5) -> List[Memory]:
-        """Faiss 向量召回"""
-        if self.faiss_index is None or self.faiss_index.ntotal == 0:
-            return []
-
-        query_vec = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
-        faiss.normalize_L2(query_vec)
-
-        # Faiss 搜索
-        k = min(top_k, self.faiss_index.ntotal)
-        scores, indices = self.faiss_index.search(query_vec, k)
-
-        results = []
-        for i in range(k):
-            idx = indices[0][i]
-            score = scores[0][i]
-            if idx < 0 or score < 0.1:
-                continue
-            if idx < len(self.embedding_ids):
-                mem_id = self.embedding_ids[idx]
-                if mem_id in self.long_term:
-                    mem = self.long_term[mem_id]
-                    mem.last_accessed = time.time()
-                    mem.access_count += 1
-                    results.append(mem)
-
-        if results:
-            self._save()
-        return results
-
-    def get_important_memories(self, threshold: float = 0.7) -> List[Memory]:
-        """获取重要记忆"""
-        return [m for m in self.long_term.values() if m.importance >= threshold]
 
 # ============================================================
 # 消息队列处理器
@@ -614,19 +279,52 @@ class MessageQueue:
             return len(self.pending) > 0
 
 # ============================================================
-# 用户会话 (每用户独立状态)
+# Claude CLI Session 管理 (单一共享 session)
 # ============================================================
 
-# 已知用户 open_id（用于旧记忆迁移）
-KNOWN_USER_OPEN_ID = os.environ.get("FEISHU_USER_OPEN_ID", "")
+class ClaudeSession:
+    """Claude CLI session 管理 — 所有用户共享同一个 session"""
+
+    SESSION_FILE = BOT_DIR / "claude_session_id.txt"
+
+    def __init__(self):
+        self.session_id: Optional[str] = None
+        self.lock = threading.Lock()
+        self._load_session_id()
+
+    def _load_session_id(self):
+        if self.SESSION_FILE.exists():
+            sid = self.SESSION_FILE.read_text().strip()
+            if sid:
+                self.session_id = sid
+                print(f"  • Claude session: {sid[:20]}...")
+
+    def _save_session_id(self):
+        self.SESSION_FILE.write_text(self.session_id or "")
+
+    def update(self, session_id: str):
+        """更新 session_id 并持久化"""
+        if session_id and session_id != self.session_id:
+            self.session_id = session_id
+            self._save_session_id()
+
+    def reset(self):
+        """重置 session（resume 失败时调用）"""
+        self.session_id = None
+        self.SESSION_FILE.unlink(missing_ok=True)
+        print("[ClaudeSession] session 已重置，下次将创建新 session")
+
+
+# ============================================================
+# 用户会话 (每用户独立状态)
+# ============================================================
 
 class UserSession:
     """封装单个用户的所有状态"""
 
-    def __init__(self, open_id: str, memory_dir: Path):
+    def __init__(self, open_id: str):
         self.open_id = open_id
         self.lark_client: Optional[lark.Client] = None  # 由 on_message/on_card 注入
-        self.memory = MemorySystem(memory_dir)
         self.msg_queue = MessageQueue()
         self.processing_lock = threading.Lock()
         self.is_processing = False
@@ -665,46 +363,14 @@ class UserSession:
 class SessionManager:
     """线程安全的会话注册表，按 open_id 懒创建"""
 
-    def __init__(self, base_memory_dir: Path):
-        self.base_memory_dir = base_memory_dir
+    def __init__(self):
         self._sessions: Dict[str, UserSession] = {}
         self._lock = threading.Lock()
-        self._migrate_old_memory()
-
-    def _migrate_old_memory(self):
-        """将旧的扁平 memory/ 文件迁移到已知用户子目录"""
-        flat_files = [
-            "short_term.json", "long_term.json",
-            "embeddings.npy", "faiss.index", "index.json"
-        ]
-        # 检查是否存在需要迁移的扁平文件
-        has_flat = any((self.base_memory_dir / f).exists() for f in flat_files)
-        if not has_flat:
-            return
-
-        target_dir = self.base_memory_dir / KNOWN_USER_OPEN_ID
-        if target_dir.exists() and any(target_dir.iterdir()):
-            # 目标目录已有文件，跳过迁移
-            return
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        migrated = []
-        for fname in flat_files:
-            src = self.base_memory_dir / fname
-            dst = target_dir / fname
-            if src.exists():
-                shutil.move(str(src), str(dst))
-                migrated.append(fname)
-
-        if migrated:
-            print(f"[迁移] 旧记忆已迁移到 {target_dir.name}/: {', '.join(migrated)}")
 
     def get_or_create(self, open_id: str) -> UserSession:
         with self._lock:
             if open_id not in self._sessions:
-                mem_dir = self.base_memory_dir / open_id
-                mem_dir.mkdir(parents=True, exist_ok=True)
-                self._sessions[open_id] = UserSession(open_id, mem_dir)
+                self._sessions[open_id] = UserSession(open_id)
                 print(f"[会话] 创建新用户会话: {open_id[:20]}...")
             return self._sessions[open_id]
 
@@ -716,7 +382,8 @@ class SmartBot:
     """智能飞书机器人（多用户隔离）"""
 
     def __init__(self):
-        self.session_mgr = SessionManager(MEMORY_DIR)
+        self.session_mgr = SessionManager()
+        self.claude_session = ClaudeSession()
         self.tmp_store = TempFileStore()
         self.tmp_store.cleanup_disk()  # 启动时清理残留
         self.processed_msg_ids: set = set()  # 内存降级用（Redis 不可用时）
@@ -1036,50 +703,6 @@ class SmartBot:
         self.send_text(question, session)
         return msg_queue.wait_for_reply(timeout=timeout)
 
-    def get_embedding(self, text: str) -> List[float]:
-        """Transformer 文本向量化 (all-MiniLM-L6-v2, 384维)"""
-        embedder = TransformerEmbedder.get_instance()
-        return embedder.encode(text).tolist()
-
-    def build_context(self, user_input: str, session: 'UserSession' = None) -> str:
-        """构建上下文"""
-        memory = session.memory if session else MemorySystem(MEMORY_DIR)
-        parts = []
-
-        # 重要记忆
-        important = memory.get_important_memories(threshold=0.8)
-        if important:
-            parts.append("【重要记忆】")
-            for mem in important[:3]:
-                parts.append(f"- {mem.summary}")
-
-        # 相关记忆
-        query_embedding = self.get_embedding(user_input)
-        related = memory.recall(query_embedding, top_k=3)
-        if related:
-            parts.append("\n【相关记忆】")
-            for mem in related:
-                parts.append(f"- {mem.summary}")
-
-        # 最近对话 (完整内容, 不截断)
-        recent = memory.get_recent_context(n=5)
-        if recent:
-            parts.append("\n【最近对话】")
-            for msg in recent[-8:]:
-                role = "用户" if msg.role == "user" else "助手"
-                parts.append(f"{role}: {msg.content}")
-
-        # 待确认操作 (让 Claude 理解当前上下文)
-        if session:
-            pending = session.get_pending_actions()
-            if pending:
-                parts.append("\n【待确认操作】")
-                for aid, action in pending.items():
-                    parts.append(f"- {action.get('type', '?')}: {json.dumps(action.get('data', {}), ensure_ascii=False)}")
-                parts.append("用户可能在回应这些待确认操作 (确认/取消/表达不满等)。")
-
-        return "\n".join(parts)
-
     def estimate_task_complexity(self, user_input: str, session: 'UserSession' = None) -> tuple:
         """
         调用 Claude CLI 智能体判断任务复杂度，返回 (超时秒数, 复杂度描述)
@@ -1090,22 +713,14 @@ class SmartBot:
         level_map = {
             1: (TIMEOUT_QUICK, "快速问答(1分钟)"),
             2: (TIMEOUT_SIMPLE, "简单任务(2分钟)"),
-            3: (TIMEOUT_SCRIPT, "脚本任务(5分钟)"),
-            4: (TIMEOUT_MEDIUM, "中等任务(10分钟)"),
-            5: (TIMEOUT_ANALYSIS, "分析任务(1小时)"),
-            6: (TIMEOUT_COMPLEX, "复杂任务(1小时)"),
+            3: (TIMEOUT_SCRIPT, "脚本任务(10分钟)"),
+            4: (TIMEOUT_MEDIUM, "中等任务(30分钟)"),
+            5: (TIMEOUT_ANALYSIS, "分析任务(3小时)"),
+            6: (TIMEOUT_COMPLEX, "复杂任务(6小时)"),
         }
 
-        # 构建最近对话上下文（帮助理解追问类消息）
+        # Claude CLI session 自动维护对话上下文，此处不再手动注入
         recent_context = ""
-        if session and session.memory:
-            recent = session.memory.get_recent_context(n=4)
-            if recent:
-                lines = []
-                for msg in recent[-8:]:
-                    role = "用户" if msg.role == "user" else "助手"
-                    lines.append(f"{role}: {msg.content[:300]}")
-                recent_context = "\n".join(lines)
 
         try:
             context_block = ""
@@ -1209,76 +824,63 @@ class SmartBot:
         return (TIMEOUT_SCRIPT, "脚本任务(5分钟) (fallback: 默认)")
 
     def call_claude(self, user_input: str, session: 'UserSession' = None, image_path: str = None) -> str:
-        """调用 Claude - 让 Claude 直接执行操作，动态超时"""
-        context = self.build_context(user_input, session)
+        """调用 Claude CLI (共享 session + resume)"""
+        timeout = TIMEOUT_COMPLEX
 
-        # 估算任务复杂度和超时时间（传入 session 以获取上下文）
-        timeout, complexity_desc = self.estimate_task_complexity(user_input, session)
-        print(f"[超时设置] {complexity_desc} -> {timeout}秒")
-
-        # 如果有上次结果，加入上下文
-        if session and session.last_result:
-            context += f"\n\n上一个任务的结果:\n{session.last_result[:500]}"
-
+        # 构建消息前缀 (动态上下文)
         user_id = session.open_id if session else "unknown"
-        system_prompt = f"""你是一个主动的量化交易助手，直接帮用户完成任务。
+        parts = [f"[用户ID: {user_id}]"]
 
-{context}
+        # 待确认操作
+        if session:
+            pending = session.get_pending_actions()
+            if pending:
+                parts.append("[待确认操作]")
+                for aid, action in pending.items():
+                    parts.append(f"- {action.get('type', '?')}: {json.dumps(action.get('data', {}), ensure_ascii=False)}")
+                parts.append("用户可能在回应这些待确认操作。")
 
-工作目录: {WORK_DIR}
-当前用户ID: {user_id}
-
-历史文件查看：用户之前发送的图片等临时文件存储在 Redis 中（保留90天）。
-  列出最近10个: python {BOT_DIR}/redis_files.py list {user_id}
-  翻页(第11-20个): python {BOT_DIR}/redis_files.py list {user_id} 10 10
-  按文件名搜索: python {BOT_DIR}/redis_files.py search {user_id} <关键词>
-  提取某个文件: python {BOT_DIR}/redis_files.py get {user_id} <file_id>
-  提取后会输出磁盘路径，你可以用 Read 工具查看该文件。
-  当用户提到"之前的图片"、"上次的截图"等，先用 list 或 search 查找。
-
-论文调研系统:
-- 如果用户想搜索/调研某篇论文，用 python -c "from paper_researcher import search_arxiv; ..." 搜索 arXiv
-- 找到后，你必须:
-  1. 简要说明论文核心思想和方法 (2-3句话)
-  2. 结合我们的框架评估复现价值，给出明确推荐 (推荐复现/部分借鉴/不推荐)
-  3. 在回复末尾附上动作标签: [PAPER_SEARCH:arXiv链接]，系统会自动创建确认卡片
-- 我们框架的关键能力 (用于评估论文增量价值):
-  - 因子: alpha158_val(210因子) + QuantaAlpha挖掘因子(68因子), 总278因子
-  - 模型: LightGBM, Rolling D_expand_3v_3r 训练
-  - 当前SOTA: CSI300 Sharpe 2.180, Return 106%, MDD -12%
-  - 已有: 因子自动挖掘(FactorMiner) + 影子验证 + 新闻情绪哨兵 + 盘中监控
-- 评估维度: ①性能是否超越我们SOTA ②方法新颖性 ③工程落地可行性(我们是macOS本地环境,无GPU)
-- 如果用户对搜索结果不满意 (如"都不对"、"不是这个")，帮他澄清需求，不要强行推荐
-- 如果用户想取消待确认操作，在回复末尾附上: [CANCEL_ACTION]
-- 已有论文: python paper_researcher.py --status
-
-规则：
-1. 直接执行任务，不要问"是否需要"，不要等确认
-2. 用户说"画图"就直接写代码、执行、生成图片
-3. 生成图片后，在回复中写明图片路径，格式：[IMAGE:/path/to/image.png]
-4. 如果用户发送了图片，仔细分析图片内容
-5. 回复简洁，中文，告诉用户做了什么
-6. 动作标签 ([PAPER_SEARCH:...] 等) 只在需要时添加，系统会自动解析并执行
-7. 如果用户发送的图片是成交记录/交割单截图（含成交价和数量），或者是持仓截图（显示当前持有股票列表），且用户的意图是确认交易/更新持仓（如"就这些了"、"成交了"、"买好了"、发截图不说话也算），在回复末尾添加: [TRADE_UPDATE]
-   系统会自动解析截图并与当前持仓对比，生成更新确认卡片。注意：行情图、K线图、资讯截图等不触发。"""
-
+        # 近期系统通知
         try:
-            # 如果有图片，在 prompt 中加入图片路径让 Claude 读取
-            if image_path and Path(image_path).exists():
-                prompt = f"{system_prompt}\n\n用户发送了图片，路径: {image_path}\n请先用 Read 工具查看这张图片，然后回答用户问题。\n\n用户: {user_input}"
-                print(f"[Claude] 需要读取图片: {image_path}")
-            else:
-                prompt = f"{system_prompt}\n\n用户: {user_input}"
+            from notifications import read_recent
+            recent = read_recent(hours=24, max_items=10)
+            if recent:
+                parts.append("\n[近期系统通知]")
+                for n in recent:
+                    marker = {"info": "📋", "warn": "⚠️", "error": "❌"}.get(n["level"], "📋")
+                    parts.append(f"{marker} [{n['category']}] {n['title']} ({n['ts'][-8:-3]})")
+                    if n["level"] != "info":
+                        parts.append(f"  {n['body'][:200]}")
+        except Exception:
+            pass
 
-            cmd = ['/usr/local/bin/claude', '--print', '--dangerously-skip-permissions', '-p', prompt]
+        # 图片
+        if image_path and Path(image_path).exists():
+            parts.append(f"\n用户发送了图片，路径: {image_path}")
+            parts.append("请先用 Read 工具查看这张图片，然后回答用户问题。")
+            print(f"[Claude] 需要读取图片: {image_path}")
 
-            api_error_keywords = ['403', 'forbidden', 'Failed to authenticate',
-                                  'API Error', '401', 'unauthorized']
-            max_retries = 3
-            last_output = ""
-            vpn_restarted = False
+        parts.append(f"\n[用户 {user_id[:8]}]: {user_input}")
+        message = "\n".join(parts)
 
+        api_error_keywords = ['403', 'forbidden', 'Failed to authenticate',
+                              'API Error', '401', 'unauthorized']
+        max_retries = 3
+        last_output = ""
+        vpn_restarted = False
+
+        self.claude_session.lock.acquire()
+        acquired = True
+        try:
             for attempt in range(max_retries):
+                # 构建命令
+                cmd = ['/usr/local/bin/claude', '-p',
+                       '--dangerously-skip-permissions',
+                       '--output-format', 'json']
+                if self.claude_session.session_id:
+                    cmd.extend(['--resume', self.claude_session.session_id])
+                cmd.append(message)
+
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1288,36 +890,55 @@ class SmartBot:
                     session.current_process = proc
                 try:
                     stdout, stderr = proc.communicate(timeout=timeout)
-                    last_output = stdout.strip() or stderr.strip() or "无响应"
+                    raw = stdout.strip() or stderr.strip() or ""
                 except subprocess.TimeoutExpired:
-                    # 不杀进程，启动后台线程继续等待结果
                     print(f"[超时] {timeout}秒已到，任务转入后台继续执行")
                     if session:
                         session.current_process = None
-                    self._wait_bg_result(proc, session, complexity_desc)
-                    return f"⏳ 任务较复杂（{complexity_desc}），已转入后台继续执行，完成后会自动发送结果。"
+                    # 释放锁再启动后台线程
+                    self.claude_session.lock.release()
+                    acquired = False
+                    self._wait_bg_result(proc, session, "统一6小时")
+                    return "⏳ 任务较复杂，已转入后台继续执行，完成后会自动发送结果。"
                 finally:
                     if session:
                         session.current_process = None
 
-                # 检测 API 错误，尝试重启 VPN 后重试
+                # 解析 JSON 输出
+                result_text = raw
+                try:
+                    data = json.loads(raw)
+                    result_text = data.get("result", raw)
+                    new_sid = data.get("session_id", "")
+                    if new_sid:
+                        self.claude_session.update(new_sid)
+                    if data.get("is_error"):
+                        result_text = f"⚠️ Claude 错误: {result_text}"
+                except json.JSONDecodeError:
+                    pass  # 非 JSON 输出，原样使用
+
+                last_output = result_text or "无响应"
+
+                # resume 失败检测：首次尝试且有 session_id
+                if (attempt == 0 and self.claude_session.session_id
+                        and proc.returncode != 0 and not result_text):
+                    print(f"[resume失败] 重置 session，重试...")
+                    self.claude_session.reset()
+                    continue
+
+                # API 错误检测 + VPN 重启重试
                 if any(kw.lower() in last_output.lower() for kw in api_error_keywords):
                     print(f"[API错误] 第{attempt+1}次: {last_output[:200]}")
                     if attempt < max_retries - 1:
                         if not vpn_restarted:
-                            # 首次失败：尝试重启 VPN
                             print("[VPN] 疑似 VPN 断连，尝试重启 LetsVPN...")
                             self._restart_vpn()
                             vpn_restarted = True
                             print("[VPN] 等待 10s 让 VPN 建立连接...")
                             time.sleep(10)
                         else:
-                            # VPN 已重启过，短暂等待后重试
-                            wait = 5
-                            print(f"[API重试] VPN 已重启，{wait}s 后重试...")
-                            time.sleep(wait)
+                            time.sleep(5)
                         continue
-                    # 3次全失败
                     return f"⚠️ Claude API 访问错误（已重试{max_retries}次），需要你处理：\n\n{last_output}"
 
                 print(f"[Claude输出长度] {len(last_output)} 字符")
@@ -1328,6 +949,9 @@ class SmartBot:
             if session:
                 session.current_process = None
             return f"调用失败: {e}"
+        finally:
+            if acquired:
+                self.claude_session.lock.release()
 
     @staticmethod
     def _restart_vpn():
@@ -1345,7 +969,6 @@ class SmartBot:
     def _wait_bg_result(self, proc: subprocess.Popen, session: 'UserSession', complexity_desc: str):
         """后台线程等待超时任务完成，完成后主动推送结果给用户"""
         def _is_api_error(text: str) -> bool:
-            """检测是否为 API 认证/访问错误"""
             error_indicators = ['403', 'forbidden', 'Request not allowed',
                                 'Failed to authenticate', 'API Error',
                                 '401', 'unauthorized', 'rate_limit']
@@ -1354,27 +977,37 @@ class SmartBot:
 
         def _wait():
             try:
-                # 最多再等30分钟
                 stdout, stderr = proc.communicate(timeout=1800)
-                output = stdout.strip() or stderr.strip()
-                if output:
-                    print(f"[后台任务完成] {len(output)} 字符")
-                    # 检测 API 403 等错误，尝试重启 VPN 后通知用户
-                    if _is_api_error(output):
-                        print(f"[后台任务API错误] {output[:200]}")
-                        print("[VPN] 后台任务 API 错误，尝试重启 LetsVPN...")
-                        self._restart_vpn()
-                        self.send_text(
-                            f"⚠️ 后台任务遇到 API 访问错误（已尝试重启VPN），需要你处理：\n\n"
-                            f"{output[:500]}\n\n"
-                            f"（原始任务复杂度: {complexity_desc}）",
-                            session
-                        )
-                        return
-                    session.last_result = output[:500]
-                    self.process_response(output, session)
-                else:
+                raw = stdout.strip() or stderr.strip()
+                if not raw:
                     self.send_text("后台任务已完成，但没有产生输出。", session)
+                    return
+
+                # 解析 JSON 输出，提取 result 和 session_id
+                output = raw
+                try:
+                    data = json.loads(raw)
+                    output = data.get("result", raw)
+                    new_sid = data.get("session_id", "")
+                    if new_sid:
+                        with self.claude_session.lock:
+                            self.claude_session.update(new_sid)
+                except json.JSONDecodeError:
+                    pass
+
+                print(f"[后台任务完成] {len(output)} 字符")
+                if _is_api_error(output):
+                    print(f"[后台任务API错误] {output[:200]}")
+                    self._restart_vpn()
+                    self.send_text(
+                        f"⚠️ 后台任务遇到 API 访问错误（已尝试重启VPN），需要你处理：\n\n"
+                        f"{output[:500]}\n\n"
+                        f"（原始任务复杂度: {complexity_desc}）",
+                        session
+                    )
+                    return
+                session.last_result = output[:500]
+                self.process_response(output, session)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 self.send_text("后台任务执行超过30分钟，已终止。", session)
@@ -1384,96 +1017,6 @@ class SmartBot:
 
         t = threading.Thread(target=_wait, daemon=True)
         t.start()
-
-    def evaluate_and_save_memory(self, user_text: str, assistant_response: str, session: 'UserSession' = None):
-        """异步调用 Claude CLI agent 评估对话是否值得记忆，并浓缩存入长期记忆"""
-        memory = session.memory if session else None
-        if not memory:
-            return
-        try:
-            # 取最近的对话上下文
-            recent = memory.get_recent_context(n=3)
-            recent_ctx = ""
-            if recent:
-                for msg in recent[-4:]:
-                    role = "用户" if msg.role == "user" else "助手"
-                    recent_ctx += f"{role}: {msg.content[:100]}\n"
-
-            # 获取已有长期记忆的摘要，用于去重
-            existing_summaries = ""
-            if memory.long_term:
-                summaries = [m.summary for m in list(memory.long_term.values())[-20:]]
-                existing_summaries = "\n".join(f"- {s}" for s in summaries)
-
-            prompt = f"""你是一个通用记忆评估 agent。分析下面的对话，判断是否包含值得长期记住的信息。
-
-【最近上下文】
-{recent_ctx}
-【本轮对话】
-用户: {user_text[:300]}
-助手: {assistant_response[:300]}
-
-{"【已有记忆（避免重复）】" + chr(10) + existing_summaries if existing_summaries else ""}
-
-请判断这段对话是否包含以下任何一类值得记忆的信息：
-1. 用户偏好与习惯（工作方式、技术偏好、沟通风格、个人喜好等）
-2. 用户个人信息（身份、账号、配置、环境等关键事实）
-3. 重要决策与结论（用户做出的决定、达成的共识、分析结论）
-4. 关键知识（学到的经验教训、问题的解决方案、有价值的发现）
-5. 项目/任务上下文（项目目标、架构决策、待办事项、进度里程碑）
-6. 用户明确要求记住的任何内容
-
-去重规则：如果【已有记忆】中已包含相同或高度相似的信息，不要重复记忆。只记录新增或更新的信息。
-
-如果有值得记忆的信息，请严格按以下 JSON 格式输出（可以输出多条）：
-{{"memories": [{{"content": "具体内容", "summary": "一句话摘要", "importance": 0.8}}]}}
-
-importance 评分标准：0.6=一般有用, 0.7=比较重要, 0.8=重要, 0.9=非常重要, 0.95=关键信息
-
-如果没有值得记忆的信息（闲聊、简单问答、重复内容），输出：
-{{"memories": []}}
-
-只输出 JSON，不要其他文字。"""
-
-            cmd = ['/usr/local/bin/claude', '--print', '--dangerously-skip-permissions', '-p', prompt]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30, cwd=str(WORK_DIR), env=_CLEAN_ENV
-            )
-            output = result.stdout.strip()
-            if not output:
-                return
-
-            # 提取 JSON（处理可能的 markdown 包裹）
-            json_match = re.search(r'\{.*\}', output, re.DOTALL)
-            if not json_match:
-                print(f"[记忆评估] 未找到有效 JSON")
-                return
-
-            data = json.loads(json_match.group())
-            memories = data.get("memories", [])
-
-            if not memories:
-                print(f"[记忆评估] 本轮对话无需记忆")
-                return
-
-            for mem in memories:
-                content = mem.get("content", "")
-                summary = mem.get("summary", content[:50])
-                importance = float(mem.get("importance", 0.7))
-                if content and importance >= 0.6:
-                    memory.add_long_term(
-                        content=content,
-                        summary=summary,
-                        importance=importance
-                    )
-                    print(f"[记忆评估] 已存入: {summary[:40]} (重要度: {importance})")
-
-        except json.JSONDecodeError as e:
-            print(f"[记忆评估] JSON 解析失败: {e}")
-        except subprocess.TimeoutExpired:
-            print(f"[记忆评估] 超时，跳过")
-        except Exception as e:
-            print(f"[记忆评估] 异常: {e}")
 
     def execute_command(self, cmd: str, session: 'UserSession' = None):
         """执行命令 - 动态超时"""
@@ -1804,7 +1347,7 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
         # 系统有但截图中没有 → 卖出 (清仓)
         for code, pos in current_positions.items():
             if code not in screenshot_map:
-                trades.append({"action": "sell", "code": code, "shares": pos['shares'], "price": pos.get('avg_cost', 0), "name": pos.get('name', code)})
+                trades.append({"action": "sell", "code": code, "shares": pos['shares'], "price": pos.get('cost_price', pos.get('avg_cost', 0)), "name": pos.get('name', code)})
 
         return trades
 
@@ -2541,8 +2084,6 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             session.is_processing = True
 
         try:
-            # 记录用户消息
-            session.memory.add_message(Message(role="user", content=text))
             session.current_task = text[:30]
 
             # 存储图片到 session (跨消息关联, 5分钟窗口)
@@ -2574,18 +2115,6 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
 
             # 保存结果供后续任务参考
             session.last_result = response[:500]
-
-            # 记录助手回复
-            clean_response = re.sub(r'\[IMAGE:[^\]]*\]', '', response).strip()
-            if clean_response:
-                session.memory.add_message(Message(role="assistant", content=clean_response))
-
-            # 异步评估记忆（不阻塞主流程）
-            threading.Thread(
-                target=self.evaluate_and_save_memory,
-                args=(text, clean_response[:300], session),
-                daemon=True
-            ).start()
 
         finally:
             with session.processing_lock:
@@ -2842,12 +2371,11 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
     def run(self):
         """启动机器人（多 App 并行）"""
         print("=" * 50)
-        print("智能飞书机器人 v3 (多用户隔离 + 多App)")
+        print("智能飞书机器人 v4 (Claude CLI session)")
         print("=" * 50)
         print()
-        print("✓ 会话管理器已就绪 (按用户隔离记忆/队列/进程)")
-        print(f"  • 记忆目录: {MEMORY_DIR}")
-        print(f"  • Embedding 模型: {EMBEDDING_MODEL} (dim={EMBEDDING_DIM})")
+        print("✓ 会话管理器已就绪 (Claude CLI session resume)")
+        print(f"  • Claude session: {self.claude_session.session_id or '(新建)'}")
         print(f"  • 临时文件: Redis (TTL={TEMP_FILE_TTL}s)" if self.tmp_store.available else "  • 临时文件: 磁盘（Redis 不可用）")
         print(f"  • App 数量: {len(APPS)}")
         print()

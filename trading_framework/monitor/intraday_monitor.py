@@ -482,6 +482,8 @@ def run_single_check(dry_run: bool = False) -> dict:
             log.info(f"[DRY RUN] 告警消息:\n{message}")
         else:
             push_feishu(message)
+            from notifications import write_notification
+            write_notification("monitor", f"盘中告警({len(alerts)}条)", message, "warn")
         log.info(f"触发 {len(alerts)} 条告警")
     else:
         log.info(f"检查完成，无新告警 (持仓{len(positions)}只, 已触发{len(alerted)}条)")
@@ -592,6 +594,8 @@ def _send_closing_summary(dry_run: bool):
         log.info(f"[DRY RUN] 收盘总结:\n{message}")
     else:
         push_feishu(message)
+        from notifications import write_notification
+        write_notification("monitor", "收盘总结", message)
     log.info("收盘总结已发送")
 
 

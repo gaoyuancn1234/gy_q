@@ -37,6 +37,12 @@ trading_framework/
 ├── monitor/
 │   ├── intraday_monitor.py  # 盘中监控 (Sina实时行情, 止损/异动/订单提醒)
 │   └── monitor_state.json   # 监控状态 (每日自动重置)
+├── notifications/         # 系统通知文件夹 (各子系统写入, smart_bot读取)
+│   ├── __init__.py            # write_notification() / read_recent()
+│   ├── mining/                # 因子挖掘通知 (factor_miner)
+│   ├── signal/                # 信号/重训/shadow 通知 (daily_runner)
+│   ├── reflection/            # 反思通知 (self_reflect)
+│   └── monitor/               # 盘中监控告警 (intraday_monitor)
 ├── shadow_manager.py      # 影子交易验证系统
 ├── shadow/                # 影子验证数据
 │   ├── registry.json          # 候选注册表
@@ -136,6 +142,13 @@ promote → 旧基线自动创建反转影子 (status=reverse_shadow, 20天)
 - 宏观情绪: bearish=-4 TopK / neutral=0 / bullish=+2 TopK
 - 个股过滤: 被调查/ST/诉讼/制裁/退市/违规/业绩暴雷 → 移除并递补
 - 生命周期: active → completed/rejected
+
+### 系统通知
+- 各子系统在推送飞书的同时写入 `notifications/{category}/{date}.jsonl`
+- smart_bot 的 Claude 会话自动注入最近 24 小时的通知摘要
+- 通知文件 7 天后自动清理
+- 格式: `{"ts": "...", "level": "info|warn|error", "title": "...", "body": "..."}`
+- 分类: mining(因子挖掘) / signal(信号/重训/shadow) / reflection(反思) / monitor(盘中监控)
 
 ### 飞书命令
 - `信号` - 生成ML调仓信号

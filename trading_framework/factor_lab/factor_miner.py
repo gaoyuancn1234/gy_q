@@ -422,6 +422,8 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
         if shadow_id:
             msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
         _push_feishu(msg)
+        from notifications import write_notification
+        write_notification("mining", f"因子晋升: #{run_id}", msg)
     elif promising_factors and not dry_run:
         # 有 promising 但未 beat baseline，也发一条简要通知
         names = [f["name"] for f in promising_factors if not f.get("is_redundant")]
@@ -430,6 +432,8 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
                    f"发现 {len(names)} 个非冗余因子: {', '.join(names[:5])}\n"
                    f"{'回测未超越 M01' if backtest else '未执行回测'}")
             _push_feishu(msg)
+            from notifications import write_notification
+            write_notification("mining", f"发现非冗余因子: #{run_id}", msg)
 
     # 打印总结
     print(f"\n{'='*60}")
@@ -858,6 +862,8 @@ def run_evolved_mining(dry_run: bool = False, smoke_test: bool = False):
         if shadow_id:
             msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
         _push_feishu(msg)
+        from notifications import write_notification
+        write_notification("mining", f"演化因子晋升: #{run_id}", msg)
     elif admitted and not dry_run:
         names = [n for n, _ in admitted[:5]]
         msg = (f"🧬 演化式因子挖掘 #{run_id}\n"
@@ -865,6 +871,8 @@ def run_evolved_mining(dry_run: bool = False, smoke_test: bool = False):
                f"因子: {', '.join(names)}\n"
                f"{'回测未超越 M01' if backtest else '未执行回测'}")
         _push_feishu(msg)
+        from notifications import write_notification
+        write_notification("mining", f"演化非冗余因子: #{run_id}", msg)
 
     # 打印总结
     print(f"\n{'='*60}")
@@ -1334,14 +1342,15 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     print(f"  本次新增: {factors_admitted_this_session} 个因子")
     print(f"  方向状态: {reg_stats['by_status']}")
 
-    # Step 1: Importance 筛选 (产出 imp_dict 供漏斗评分使用)
-    imp_dict: dict[str, float] = {}
+    # Step 1: Importance 筛选 (产出 gain_imp_dict + perm_imp_dict 供漏斗评分使用)
+    gain_imp_dict: dict[str, float] = {}
+    perm_imp_dict: dict[str, float] = {}
     screened_factors = []
     if (all_pool_factors and factors_admitted_this_session > 0
             and IMPORTANCE_SCREEN_ENABLED and not dry_run):
         try:
             from factor_lab.mining.backtest_runner import screen_by_importance
-            screened_factors, imp_dict = screen_by_importance(
+            screened_factors, gain_imp_dict, perm_imp_dict = screen_by_importance(
                 all_pool_factors,
                 min_importance=IMPORTANCE_MIN_THRESHOLD,
             )
@@ -1375,13 +1384,13 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             # 构建 icir_dict: 从 global_pool 的 PoolFactor 对象
             icir_dict = {f.name: f.icir for f in global_pool.get_all()}
 
-            # 如果 imp_dict 为空 (importance 筛选被跳过), 用 ICIR 作为代理
-            if not imp_dict:
-                imp_dict = {name: abs(icir) for name, icir in icir_dict.items()}
+            # 如果 gain_imp_dict 为空 (importance 筛选被跳过), 用 ICIR 作为代理
+            if not gain_imp_dict:
+                gain_imp_dict = {name: abs(icir) for name, icir in icir_dict.items()}
 
             funnel = FactorFunnel()
             funnel_pools = funnel.run_funnel(
-                all_pool_factors, icir_dict, imp_dict,
+                all_pool_factors, icir_dict, gain_imp_dict, perm_imp_dict,
             )
 
             if funnel_pools:
@@ -1411,6 +1420,21 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
                 print(f"  [backtest] 回测失败: {e2}")
                 backtest = {"error": str(e2)}
 
+    # 计算 beat_baseline + LLM 统计 (在写审计记录之前)
+    beat_baseline = _check_beat_baseline(backtest)
+
+    llm_stats_str = ""
+    llm_stats = None
+    try:
+        from factor_lab.mining.llm_backend import LLMBackend
+        llm_stats = LLMBackend.shared().stats()
+        if llm_stats.get("usage"):
+            usage_parts = [f"{k}={v}" for k, v in llm_stats["usage"].items() if v > 0]
+            if usage_parts:
+                llm_stats_str = f"\nLLM: {', '.join(usage_parts)}"
+    except Exception:
+        pass
+
     # 保存审计记录
     pool_stats = pool.stats()
     run_result = {
@@ -1426,12 +1450,15 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         "non_redundant": [{"name": n, "expr": e} for n, e in quality_factors],
         "backtest": backtest,
         "funnel": funnel_record,
+        "beat_baseline": beat_baseline,
         "pool_stats": pool_stats,
         "global_pool_size": fp_stats['size'],
         "direction_stats": reg_stats,
         "factors_admitted_this_session": factors_admitted_this_session,
         "total_time": round(time.time() - t_start, 1),
     }
+    if llm_stats_str:  # 仅在有实际 LLM 调用时才记录
+        run_result["llm_usage"] = llm_stats
 
     run_file = RUNS_DIR / f"{run_id}.json"
     run_file.write_text(
@@ -1451,22 +1478,6 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
         print(f"  经验记忆已更新 (从 {len(all_trajs)} 条轨迹提炼)")
 
     # 通知 + mined.py + shadow
-    beat_baseline = _check_beat_baseline(backtest)
-    run_result["beat_baseline"] = beat_baseline
-
-    # LLM 使用量统计
-    llm_stats_str = ""
-    try:
-        from factor_lab.mining.llm_backend import LLMBackend
-        llm_stats = LLMBackend.shared().stats()
-        if llm_stats.get("usage"):
-            usage_parts = [f"{k}={v}" for k, v in llm_stats["usage"].items() if v > 0]
-            if usage_parts:
-                llm_stats_str = f"\nLLM: {', '.join(usage_parts)}"
-                run_result["llm_usage"] = llm_stats
-    except Exception:
-        pass
-
     if beat_baseline and not dry_run:
         _accept_factors_to_mined(quality_factors, run_id)
         shadow_id = _create_shadow_for_run(run_id, backtest)
@@ -1478,6 +1489,8 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
             msg += f"\n已自动创建影子验证: {shadow_id} (20交易日)"
         msg += llm_stats_str
         _push_feishu(msg)
+        from notifications import write_notification
+        write_notification("mining", f"每日挖掘晋升: #{run_id}", msg)
     elif factors_admitted_this_session > 0 and not dry_run:
         msg = (f"📅 每日因子挖掘 #{run_id}\n"
                f"新增: {factors_admitted_this_session} 因子 | "
@@ -1485,6 +1498,8 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
                f"{'回测未超越 M01' if backtest else '未执行回测 (无新质量因子)'}"
                f"{llm_stats_str}")
         _push_feishu(msg)
+        from notifications import write_notification
+        write_notification("mining", f"每日挖掘: #{run_id}", msg)
 
     # 打印总结
     print(f"\n{'='*60}")

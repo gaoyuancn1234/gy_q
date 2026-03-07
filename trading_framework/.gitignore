@@ -7,3 +7,22 @@ archive/
 *.log
 *.pid
 _tmp_*
+
+# Runtime state files (never track — branch switch will overwrite production data)
+shadow/registry.json
+shadow/prev_prices.json
+shadow/configs/
+shadow/daily_log/
+shadow/state/
+experiment/registry.json
+experiment/daily_log/
+experiment/news_cache/
+portfolio/holdings.json
+portfolio/live_holdings.json
+portfolio/price_cache.json
+monitor/monitor_state.json
+claude_session_id.txt
+notifications/mining/
+notifications/signal/
+notifications/reflection/
+notifications/monitor/
