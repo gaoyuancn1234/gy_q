@@ -2,32 +2,26 @@
 
 由 factor_miner --accept 命令自动写入。
 不要手动编辑此文件。
+
+--- 2026-08-30 清空记录 ---
+原有 22 个因子 (run_006 七个 + run_010 十五个) 已全部移除，归档于
+factor_lab/factors/mined.py.rejected_20260830。
+
+移除原因: 样本外检验失败。
+  样本内 (2024-01-01~2026-02-05，即挖掘的评估期):
+      alpha158_val 1.643 → alpha158_val_mined 1.765   (+7.4%)
+  样本外 (2026-02-06~2026-08-21，挖掘从未见过):
+      alpha158_val 0.351 → alpha158_val_mined 0.306   (-12.9%)
+
+符号反转说明样本内的优势来自选择偏差 —— 这些因子当初正是因为在
+2024-01~2026-02 表现好才被选中，而挖掘的评估期与基准测试期完全相同
+(quanta/config.py ROLLING_EVAL_TEST_* == run_rolling_benchmark.TEST_*)，
+使得"跑赢基线"的判定本身就是样本内的。
+
+该结构性缺陷已在 quanta/config.py 中修复 (为挖掘划出 holdout 区间)。
 """
 
-MINED_FACTORS = [
-    ('QA_SELLPRESS_RATIO', 'Div(Sum(Mul($volume, Less($close, Ref($close, 1))), 10), Sum($volume, 10) + 1e-8)'),  # accepted from run_006
-    ('QA_VOL_PRICE_DIVERGENCE_SLOPE', 'Sub(Div(Slope($volume, 10), Std($volume, 10) + 1e-8), Div(Slope($close, 10), Std($close, 10) + 1e-8))'),  # accepted from run_006
-    ('QA_SHADOW_ASYMMETRY', 'Mean(Div($close - $low, $high - $low + 1e-8), 10)'),  # accepted from run_006
-    ('QA_CHANNEL_TURN_MOMENTUM', 'Mul(Div(Sub($close, Min($low, 10)), Sub(Max($high, 10), Min($low, 10)) + 1e-8), Div(Mean($turn, 5), Mean($turn, 10) + 1e-8))'),  # accepted from run_006
-    ('QA_VOL_CONCENTRATION_DRIFT', 'Mul(Sub(Div(Max($volume, 5), Mean($volume, 5) + 1e-8), Div(Max($volume, 20), Mean($volume, 20) + 1e-8)), Slope($close, 5))'),  # accepted from run_006
-    ('QA_QUIET_VOL_SURGE_20', 'Div(Corr(Div(Sub($high,$low),$close+1e-8),Div($volume,Mean($volume,20)+1e-8),20),Std(Div(Sub($high,$low),$close+1e-8),20)+1e-8)'),  # accepted from run_006
-    ('QA_PVCORR_DELTA_VOL', 'Mul(Delta(Corr($close, $volume, 5), 10), Div(Std($close, 5), Std($close, 20) + 1e-8))'),  # accepted from run_006
-    ('QA_UPDAY_VOL_RATIO', 'Div(Mean(Mul(Greater($close,Ref($close,1)),$volume),20),Mean($volume,20)+1e-8)'),  # accepted from run_010
-    ('QA_UPDOWN_VOL_DIFF_10', 'Mean(Mul(Greater(Delta($close,1),0),Power(Delta($close,1),2)),10)'),  # accepted from run_010
-    ('QA_UPVOL_SPREAD_NORM', 'Div(Mean(If(Greater($close, Ref($close, 1)), Sub($high, $low), 0), 20), Mean(Sub($high, $low), 20) + 1e-8)'),  # accepted from run_010
-    ('QA_VOL_HIGHLOW_ASYM', 'Mean(Mul($volume, Div($close - $low, $high - $low + 1e-8)), 10)'),  # accepted from run_010
-    ('QA_MULTI_PERIOD_SIGN_CONSENSUS', 'Add(Add(Sign(Div($close, Ref($close, 5)) - 1), Sign(Div($close, Ref($close, 10)) - 1)), Sign(Div($close, Ref($close, 20)) - 1))'),  # accepted from run_010
-    ('QA_COMPRESSION_BREAKOUT', 'Mul(Div(Sub(Min($high, 20), Max($low, 20)), Max(Sub($high, $low), 20) + 1e-8), Div(Sub($close, Mean($close, 20)), Std($close, 20) + 1e-8))'),  # accepted from run_010
-    ('QA_ASYMMETRIC_REBOUND_STRENGTH', 'Div(Div($close - Min($low, 20), Ref($close, 20) + 1e-8), Div(Max($high, 20) - $close, Ref($close, 20) + 1e-8) + 1e-8)'),  # accepted from run_010
-    ('QA_VWAP_ESCAPE_VELOCITY', 'Div(Sub($close, Mean(Div($amount, Add($volume, 1e-8)), 15)), Std(Sub($close, Div($amount, Add($volume, 1e-8))), 15) + 1e-8)'),  # accepted from run_010
-    ('QA_VWAP_RANGE_POS', 'Mean(Div(Sub(Div($amount, $volume + 1e-8), $low), Sub($high, $low) + 1e-8), 20)'),  # accepted from run_010
-    ('QA_INTRADAY_PATH_ASYM', 'Mean(Div(Sub(IdxMax($high,10), IdxMin($low,10)), 10 + 1e-8), 5)'),  # accepted from run_010
-    ('QA_MOMENTUM_DECAY_NORMED', 'Div(Sub(Mean($close, 5), Mean($close, 20)), Std($close, 20) + 1e-8)'),  # accepted from run_010
-    ('QA_VOL_DISPERSION_MEAN_REV', 'Mul(Div(Std($volume, 5), Mean($volume, 5) + 1e-8), Mul(Div(Sub(Mean($close, 20), $close), Std($close, 20) + 1e-8), Div(Mean($volume, 5), Mean($volume, 20) + 1e-8)))'),  # accepted from run_010
-    ('QA_VWAP_GRAVITY_DRIFT', 'Sub(Div(Sum($amount,5),Sum($volume,5)+1e-8),Div(Sum($amount,20),Sum($volume,20)+1e-8))'),  # accepted from run_010
-    ('QA_VOLCONC_PRICEMOM_DIV', 'Mul(Div(Sum(Greater($volume, Mean($volume, 20)), 5), 5 + 1e-8), Mul(Sign(Div($close, Ref($close, 10) + 1e-8) - 1), -1))'),  # accepted from run_010
-    ('QA_LIQUIDITY_RESILIENCE_RATIO', 'Div(Div($high - $low, $close + 1e-8), Ref(Div($high - $low, $close + 1e-8), Sub(20, IdxMax($volume, 20))) + 1e-8)'),  # accepted from run_010
-]
+MINED_FACTORS = []
 
 
 def get_all_exprs():

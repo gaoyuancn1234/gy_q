@@ -13,7 +13,10 @@ warnings.filterwarnings('ignore')
 os.environ['QLIB_LOG_LEVEL'] = 'WARNING'
 
 import multiprocessing
-multiprocessing.set_start_method('fork', force=True)
+try:
+    multiprocessing.set_start_method('fork', force=True)
+except (ValueError, RuntimeError):
+    pass  # Windows 无 fork，使用默认 spawn
 import qlib
 from qlib.constant import REG_CN
 qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region=REG_CN)

@@ -20,6 +20,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
+from cli_paths import CLAUDE_BIN
 
 PROJECT_DIR = Path(__file__).resolve().parent
 PAPERS_DIR = PROJECT_DIR / "papers"
@@ -421,7 +422,7 @@ class PaperResearcher:
 
         # 构建命令
         cmd = [
-            '/usr/local/bin/claude', '--print',
+            CLAUDE_BIN, '--print',
             '--dangerously-skip-permissions',
             '--output-format', 'stream-json',
             '--verbose',

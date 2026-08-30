@@ -11,7 +11,7 @@ STRATEGY_TYPE = 'ml'
 # ============ ML 实盘配置 (STRATEGY_TYPE='ml' 时生效) ============
 ML_CONFIG = {
     'signal_config': 'config/signal_config.yaml',
-    'live_capital': 100000,
+    'live_capital': 200000,   # 2026-08-30: 10万 -> 20万 (与 signal_config.initial_cash 一致)
 }
 
 # ============ 因子实验室配置 ============

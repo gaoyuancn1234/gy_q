@@ -91,7 +91,7 @@ def run_backtest(pred, topk=TOPK, n_drop=N_DROP):
         "start_time": TEST_START, "end_time": TEST_END,
         "account": 100_000_000, "benchmark": "SH000300",
         "exchange_kwargs": {
-            "freq": "day", "limit_threshold": 0.095, "deal_price": "open",
+            "freq": "day", "limit_threshold": 0.095, "deal_price": "close",  # 2026-08-30 由 open 改为 close (对齐生产 signal_config)
             "open_cost": 0.0005, "close_cost": 0.0015, "min_cost": 5, "trade_unit": 100,
         },
     }
@@ -375,7 +375,10 @@ def main():
 
     # 初始化 Qlib
     import multiprocessing
-    multiprocessing.set_start_method('fork', force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
     import qlib
     from qlib.constant import REG_CN
     qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region=REG_CN)

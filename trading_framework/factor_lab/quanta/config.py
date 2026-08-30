@@ -2,6 +2,7 @@
 
 对齐论文开源实现: https://github.com/QuantaAlpha/QuantaAlpha
 """
+from cli_paths import CLAUDE_BIN, GEMINI_BIN, CODEX_BIN
 
 # --- 挖掘规模 (v4: 放大搜索空间) ---
 N_DIRECTIONS = 10       # 初始方向数 (v4: 10, 覆盖更广搜索空间)
@@ -54,11 +55,40 @@ TEST_END = '2025-12-26'
 BASE_FEATURES = ['$open', '$high', '$low', '$close', '$volume', '$amount', '$turn']
 
 # --- Rolling Eval (对齐生产 SOTA: D_expand_3v_3r 全窗口) ---
+#
+# ⚠ 挖掘评估期必须与最终验收期分离 (2026-08-30 修复)
+#
+# 旧配置 ROLLING_EVAL_TEST_END = '2026-02-05' 与 run_rolling_benchmark.TEST_END
+# 完全相同，意味着挖掘在"最终评测的同一段数据"上筛选因子 —— 被选中的因子
+# 必然在该段样本内占优，"跑赢基线"的判定失去意义。
+#
+# 实证后果 (run_006/run_010 挖出的 22 个因子):
+#   样本内 (= 挖掘评估期)  Sharpe 1.643 → 1.765  (+7.4%)
+#   样本外 (挖掘未见过)    Sharpe 0.351 → 0.306  (-12.9%)
+# 符号反转 → 已全部从 mined.py 移除。
+#
+# 现在: 挖掘只在 MINING 区间内评估；MINING_HOLDOUT_START 之后的数据留作
+# 验收，挖掘过程绝不可触碰。接受因子前须在 holdout 上复核:
+#   python -m factor_lab.run_rolling_benchmark \
+#       --presets alpha158_val alpha158_val_mined \
+#       --test-start 2026-02-06 --test-end 2026-08-21 --tag holdout
 ROLLING_EVAL_LITE = True          # 启用 rolling eval (替代单次训练回测)
-ROLLING_EVAL_WINDOWS = 20         # 窗口数上限 (设足够大, 实际由 test period 决定 ~9 窗口)
+ROLLING_EVAL_WINDOWS = 20         # 窗口数上限 (设足够大, 实际由 test period 决定)
 ROLLING_EVAL_CONFIG = "D_expand_3v_3r"  # 对齐生产 SOTA (扩展窗口)
 ROLLING_EVAL_TEST_START = '2024-01-01'
-ROLLING_EVAL_TEST_END = '2026-02-05'  # 与 run_rolling_benchmark.TEST_END 对齐
+ROLLING_EVAL_TEST_END = '2026-02-05'   # 挖掘评估期上界 (不含之后数据)
+
+# 验收 holdout: 挖掘不得使用此日期及之后的任何数据
+MINING_HOLDOUT_START = '2026-02-06'
+
+# 导入时自检: 挖掘评估期若越过 holdout 边界, 立刻失败而不是静默产生
+# 样本内结论 (这正是 2026-08-30 之前的状态)
+if ROLLING_EVAL_TEST_END >= MINING_HOLDOUT_START:
+    raise ValueError(
+        f"挖掘评估期 ROLLING_EVAL_TEST_END={ROLLING_EVAL_TEST_END} 越过了验收 "
+        f"holdout 边界 MINING_HOLDOUT_START={MINING_HOLDOUT_START}。\n"
+        "这会让挖掘在验收数据上筛选因子，'跑赢基线'的判定将失去意义。"
+    )
 
 # --- Evolved Mining (演化式挖掘) ---
 EVOLVED_N_DIRECTIONS = 8          # 搜索方向数 (smoke: 3)
@@ -85,7 +115,7 @@ IMPORTANCE_SCREEN_ENABLED = True    # 启用 importance 筛选
 IMPORTANCE_MIN_THRESHOLD = 0       # importance > 0 即保留 (模型至少用过一次)
 
 # --- Claude CLI 配置 ---
-CLAUDE_CLI = '/usr/local/bin/claude'
+CLAUDE_CLI = CLAUDE_BIN
 CLAUDE_TIMEOUT = 600  # 秒 (一致性验证等复杂 prompt 可能需要较长时间)
 MAX_RETRY = 10         # LLM 调用最大重试次数 (论文 max_retry=30, 实际用 10)
 RETRY_WAIT = 5         # 重试等待秒数 (论文 retry_wait_seconds=15, 实际用 5)
@@ -94,7 +124,7 @@ RETRY_WAIT = 5         # 重试等待秒数 (论文 retry_wait_seconds=15, 实�
 LLM_PROVIDERS = [
     {
         "name": "claude",
-        "cli_path": "/usr/local/bin/claude",
+        "cli_path": CLAUDE_BIN,
         "cli_args": ["--print", "--dangerously-skip-permissions",
                      "--output-format", "text"],
         "prompt_flag": "-p",
@@ -104,7 +134,7 @@ LLM_PROVIDERS = [
     },
     {
         "name": "gemini",
-        "cli_path": "/usr/local/bin/gemini",
+        "cli_path": GEMINI_BIN,
         "cli_args": [],
         "prompt_flag": "-p",
         "env_remove": [],
@@ -113,7 +143,7 @@ LLM_PROVIDERS = [
     },
     {
         "name": "codex",
-        "cli_path": "/usr/local/bin/codex",
+        "cli_path": CODEX_BIN,
         "cli_args": ["exec", "--ephemeral"],
         "prompt_flag": "",
         "output_mode": "file",   # codex exec -o tmpfile 输出最终回复

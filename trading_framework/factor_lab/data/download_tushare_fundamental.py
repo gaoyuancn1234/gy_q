@@ -14,7 +14,10 @@ from datetime import timedelta
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import multiprocessing
-multiprocessing.set_start_method('fork', force=True)
+try:
+    multiprocessing.set_start_method('fork', force=True)
+except (ValueError, RuntimeError):
+    pass  # Windows 无 fork，使用默认 spawn
 
 import numpy as np
 import pandas as pd

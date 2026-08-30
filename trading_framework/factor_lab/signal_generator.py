@@ -179,6 +179,8 @@ class SignalGenerator:
         if len(valid_q) > 0:
             q_val = float(valid_q.iloc[-1])
 
+        health = self._check_signal_health(day_signal, target_date)
+
         return {
             'date': target_date.strftime('%Y-%m-%d'),
             'regime': regime,
@@ -187,6 +189,65 @@ class SignalGenerator:
             'target_stocks': target_stocks,
             'scores': scores,
             'current_window': self._find_current_window(target_date),
+            'health': health,
+        }
+
+    # 退化模型的判定阈值
+    MIN_SCORE_STD_RATIO = 0.25   # 当日分数标准差 / 历史中位数，低于此视为退化
+    MIN_UNIQUE_RATIO = 0.5       # 唯一分数占股票数比例
+    MIN_BEST_ITER = 20           # LightGBM 早停轮数下限
+
+    def _check_signal_health(self, day_signal, target_date) -> dict:
+        """信号健康检查 — 拦截退化模型产生的无效信号
+
+        背景 (2026-08-30): Window 11 的 LightGBM 在第 3 轮就早停 (阈值 80)，
+        因为验证期 2026 Q2 的 IC 为负，模型学不到任何有效模式。3 棵树的模型
+        产生几乎扁平的预测: 300 只股票只有 123 个不同分数、标准差 0.0023
+        (历史约 0.05，仅 1/30)，TopK 里 8 只并列同分 —— 选哪只本质是随机。
+        Window 8 (验证期 2025 Q3, IC 亦为负) 同样发生过 (best_iter=4)。
+
+        原先系统对此毫无察觉，会照常把随机名单推送出去。
+        """
+        import numpy as np
+        issues = []
+
+        n = len(day_signal)
+        std = float(day_signal.std())
+        n_uniq = int(day_signal.nunique())
+
+        # 与历史比较: 取全部预测按日标准差的中位数作基准
+        try:
+            all_std = self._predictions.groupby(level=0).std()
+            base_std = float(all_std.median())
+        except Exception:
+            base_std = None
+
+        if base_std and base_std > 0 and std < base_std * self.MIN_SCORE_STD_RATIO:
+            issues.append(f"分数标准差异常收缩: {std:.5f} (历史中位数 {base_std:.5f})")
+        if n and n_uniq < n * self.MIN_UNIQUE_RATIO:
+            issues.append(f"分数区分度不足: {n} 只股票仅 {n_uniq} 个不同分数")
+
+        # 该日所属窗口的 best_iteration
+        best_iter = None
+        try:
+            info = self.load_rolling_info()
+            for w in info.get('windows', []):
+                if w['pred_start'] <= target_date.strftime('%Y-%m-%d') <= w['pred_end']:
+                    best_iter = w.get('best_iteration')
+                    break
+        except Exception:
+            pass
+        if best_iter is not None and best_iter < self.MIN_BEST_ITER:
+            issues.append(f"模型早停轮数过低: best_iter={best_iter} "
+                          f"(阈值 {self.MIN_BEST_ITER})，模型未学到有效模式")
+
+        return {
+            'ok': not issues,
+            'issues': issues,
+            'score_std': std,
+            'n_unique': n_uniq,
+            'n_stocks': n,
+            'best_iteration': best_iter,
         }
 
     def get_rebalance_instructions(self, current_positions: dict,

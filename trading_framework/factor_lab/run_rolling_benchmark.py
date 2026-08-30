@@ -39,6 +39,21 @@ sys.path.insert(0, str(PROJECT_DIR))
 # 测试区间 (与 benchmark_models.py 一致)
 TEST_START = '2024-01-01'
 TEST_END = '2026-02-05'
+RESULT_SUFFIX = ''   # 由 --tag 设置，区分不同测试期的结果文件
+# 成交价: 'close'=次日收盘 (默认), 'open'=次日开盘。由 --deal-price 覆盖。
+#
+# 2026-08-30 由 open 改为 close，理由 (one-switch 实验，其余变量全部固定):
+#     open  Sharpe 1.643  超额 27.11%
+#     close Sharpe 1.332  超额 11.90%   ← 超额腰斩
+# 开盘价是实盘最难兑现的价格 (集合竞价冲击大、滑点高)，按开盘价成交属乐观
+# 假设；且生产配置 signal_config.yaml 本就是 deal_price: close，研究口径
+# 必须与之一致，否则挖掘会用生产不采用的执行假设去评判因子。
+DEAL_PRICE = 'close'
+# 已使用过的 tag，用于把带 tag 的结果排除出默认对比表。
+# 新增 tag 时必须登记在这里，否则不同测试期/口径的结果会混进同一张表 ——
+# 表头写着当前区间、数字却来自别的区间，极易误判。
+KNOWN_TAGS = ('holdout', 'closeprice', 'openprice',
+              'windowcmp', 'winseg1', 'seg2pred', 'pre2024')
 
 # 回测参数 (与 benchmark_models.py 一致)
 TOPK = 12
@@ -58,6 +73,16 @@ ROLLING_CONFIGS = {
         "train_years": 4,
         "valid_months": 3,
         "retrain_months": 6,
+        "expanding": False,
+    },
+    "F_2yr_3v_3r": {
+        "description": "2年滑动训练, 3个月验证, 3个月重训 (2026-08-30 新增)",
+        # 加入原因: 窗口越短表现越好的趋势 (2024-01~2026-02 测试期):
+        #   D_expand 1.332 -> A_4yr 1.609 -> C_3yr 1.943
+        # 需要探明拐点在哪，否则不知道 3 年是最优还是仍未触底。
+        "train_years": 2,
+        "valid_months": 3,
+        "retrain_months": 3,
         "expanding": False,
     },
     "C_3yr_3v_3r": {
@@ -236,7 +261,7 @@ def run_backtest(pred):
         "start_time": TEST_START, "end_time": TEST_END,
         "account": 100_000_000, "benchmark": "SH000300",
         "exchange_kwargs": {
-            "freq": "day", "limit_threshold": 0.095, "deal_price": "open",
+            "freq": "day", "limit_threshold": 0.095, "deal_price": DEAL_PRICE,
             "open_cost": 0.0005, "close_cost": 0.0015, "min_cost": 5, "trade_unit": 100,
         },
     }
@@ -279,6 +304,8 @@ def run_rolling_single(preset: str, model_name: str,
         结果字典, 或 None (已有结果且非 force)
     """
     suffix = f"_{variant}" if variant != "default" else ""
+    if RESULT_SUFFIX:
+        suffix += f"_{RESULT_SUFFIX}"
     result_file = RESULTS_DIR / f"{config_name}_{preset}_{model_name}{suffix}.json"
 
     if result_file.exists() and not force:
@@ -388,6 +415,14 @@ def run_rolling_single(preset: str, model_name: str,
 
     print(f"\n  总预测样本: {len(combined_pred)}")
 
+    # 落盘预测: 事后做 IC/归因分析必需 (原先只在内存中用完即弃，
+    # 想查"某段时间为何表现差"就得整轮重训)
+    pred_dir = RESULTS_DIR / "predictions"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    pred_path = pred_dir / f"{config_name}_{preset}_{model_name}{suffix}.pkl"
+    combined_pred.to_pickle(pred_path)
+    print(f"  预测已保存: {pred_path.name}")
+
     # 回测
     print("  运行回测...")
     bt_result = run_backtest(combined_pred)
@@ -427,7 +462,9 @@ def print_comparison_table(all_results: list[dict]):
     print("                     Rolling Training Benchmark 对比表")
     print("=" * 110)
     print(f"测试区间: {TEST_START} ~ {TEST_END} | 基准: 沪深300")
-    print(f"策略: TopkDropout (topk={TOPK}, n_drop={N_DROP}) | 成交价: 次日开盘 (T+1)")
+    _dp = "次日开盘" if DEAL_PRICE == "open" else "次日收盘"
+    print(f"策略: TopkDropout (topk={TOPK}, n_drop={N_DROP}) | "
+          f"成交价: {_dp} ({DEAL_PRICE}, T+1)")
     print()
 
     # 按 Sharpe 降序排列
@@ -476,16 +513,29 @@ def print_comparison_table(all_results: list[dict]):
 
 
 def load_all_results() -> list[dict]:
-    """加载所有已有结果"""
+    """加载当前测试期对应的结果
+
+    只读与 RESULT_SUFFIX 匹配的文件：否则切换测试期(--test-start/--test-end)
+    时会把旧测试期的结果混进对比表，表头写着新区间、数字却是旧的，
+    极易误判。
+    """
     results = []
-    if RESULTS_DIR.exists():
-        for f in sorted(RESULTS_DIR.glob("*.json")):
-            with open(f) as fp:
-                results.append(json.load(fp))
+    if not RESULTS_DIR.exists():
+        return results
+    for f in sorted(RESULTS_DIR.glob("*.json")):
+        stem = f.stem
+        if RESULT_SUFFIX:
+            if not stem.endswith(f"_{RESULT_SUFFIX}"):
+                continue
+        elif any(stem.endswith(f"_{t}") for t in KNOWN_TAGS):
+            continue  # 默认测试期不应混入带 tag 的结果
+        with open(f) as fp:
+            results.append(json.load(fp))
     return results
 
 
 def main():
+    global TEST_START, TEST_END, RESULT_SUFFIX, DEAL_PRICE
     parser = argparse.ArgumentParser(description="Rolling Training Benchmark")
     parser.add_argument('--configs', nargs='+', default=DEFAULT_CONFIGS,
                         choices=list(ROLLING_CONFIGS.keys()),
@@ -499,7 +549,27 @@ def main():
                         help="强制重跑已有结果")
     parser.add_argument('--report-only', action='store_true',
                         help="只打印对比表, 不跑实验")
+    parser.add_argument('--test-start', default=None,
+                        help=f"覆盖测试期起点 (默认 {TEST_START})，用于样本外holdout检验")
+    parser.add_argument('--test-end', default=None,
+                        help=f"覆盖测试期终点 (默认 {TEST_END})")
+    parser.add_argument('--tag', default='',
+                        help="结果文件名后缀，避免覆盖默认测试期的结果")
+    parser.add_argument('--deal-price', default=None, choices=['open', 'close'],
+                        help="成交价 (默认 open=次日开盘)。one-switch 实验用: "
+                             "固定其他所有变量，只切换此项以隔离执行假设的影响")
     args = parser.parse_args()
+
+    if args.deal_price:
+        DEAL_PRICE = args.deal_price
+
+    # 覆盖测试区间（挖掘的评估期 = 默认测试期，故重测默认期属样本内；
+    # 用 --test-start/--test-end 指定挖掘未见过的区间才是真正的样本外检验）
+    if args.test_start:
+        TEST_START = args.test_start
+    if args.test_end:
+        TEST_END = args.test_end
+    RESULT_SUFFIX = args.tag
 
     if args.report_only:
         all_results = load_all_results()
@@ -511,7 +581,10 @@ def main():
 
     # 初始化 Qlib
     import multiprocessing
-    multiprocessing.set_start_method('fork', force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
 
     import qlib
     from qlib.constant import REG_CN
@@ -558,10 +631,19 @@ def main():
                     }
                     all_results.append(error_result)
 
-    # 打印对比表 (包含之前的结果)
+    # 本次运行的失败必须显式暴露，不能被"打印历史结果"掩盖
+    failed = [r for r in all_results if r.get("error")]
+
+    # 打印对比表 (只含当前测试期的结果)
     all_results = load_all_results()
     if all_results:
         print_comparison_table(all_results)
+
+    if failed:
+        print(f"\n⚠ 本次运行有 {len(failed)} 个任务失败，上表不含它们的结果:")
+        for r in failed:
+            print(f"    {r['config_name']} / {r['preset']} / {r['model']}: {r['error']}")
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@ import sys
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
+from cli_paths import CLAUDE_BIN
 
 BOT_DIR = Path(__file__).parent
 WORK_DIR = BOT_DIR.parent
@@ -487,7 +488,7 @@ def _build_reflection_prompt(system_data: dict, strategy_data: dict,
 def _call_claude_reflection(prompt: str, timeout: int) -> dict:
     """单次调用 Claude 反思，返回解析后的 dict 或包含 error 的 dict"""
     cmd = [
-        '/usr/local/bin/claude',
+        CLAUDE_BIN,
         '--print',
         '--dangerously-skip-permissions',
         '--output-format', 'text',
@@ -514,7 +515,7 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
             print("  [reflect] 检测到认证错误，尝试刷新 OAuth token...")
             try:
                 subprocess.run(
-                    "echo '/exit' | /usr/local/bin/claude",
+                    f"echo '/exit' | {CLAUDE_BIN}",
                     shell=True, capture_output=True, timeout=30,
                     env=_CLEAN_ENV
                 )

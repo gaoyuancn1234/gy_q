@@ -7,7 +7,7 @@ Qlib 模型大比武 - 统一 Benchmark
 训练: 2019-01-01 ~ 2023-06-30
 验证: 2023-07-01 ~ 2023-12-31
 测试: 2024-01-01 ~ 2026-02-05
-回测: TopkDropoutStrategy, topk=12, n_drop=3, deal_price=open (T+1)
+回测: TopkDropoutStrategy, topk=12, n_drop=3, deal_price=close (T+1)
 """
 import sys
 import time
@@ -117,7 +117,7 @@ def run_backtest(pred):
         "start_time": TEST_START, "end_time": TEST_END,
         "account": 100_000_000, "benchmark": "SH000300",
         "exchange_kwargs": {
-            "freq": "day", "limit_threshold": 0.095, "deal_price": "open",
+            "freq": "day", "limit_threshold": 0.095, "deal_price": "close",  # 2026-08-30 由 open 改为 close (对齐生产 signal_config)
             "open_cost": 0.0005, "close_cost": 0.0015, "min_cost": 5, "trade_unit": 100,
         },
     }
@@ -558,7 +558,7 @@ def main():
     print(f"训练: {TRAIN_START} ~ {TRAIN_END}")
     print(f"验证: {VALID_START} ~ {VALID_END}")
     print(f"测试: {TEST_START} ~ {TEST_END}")
-    print(f"策略: TopK={TOPK}, N_drop={N_DROP}, deal_price=open (T+1)")
+    print(f"策略: TopK={TOPK}, N_drop={N_DROP}, deal_price=close (T+1)")
     print(f"DL参数: step={DL_STEP}, hidden={DL_HIDDEN}, epochs={DL_EPOCHS}, batch={DL_BATCH}")
     if done:
         print(f"已完成: {', '.join(sorted(done))} (跳过)")

@@ -19,5 +19,59 @@
     "sessions": {
       "read": "f02e9184-39d9-48cb-a398-e34ca18ed072"
     }
+  },
+  "paper_002": {
+    "arxiv_id": "2606.20625",
+    "title": "",
+    "url": "https://arxiv.org/abs/2606.20625",
+    "source": "arxiv",
+    "status": "pending",
+    "phase": "download",
+    "created_date": "2026-08-30",
+    "updated_date": "2026-08-30",
+    "branch": "paper/2606.20625",
+    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\paper_002",
+    "pdf_path": "papers\\pdfs\\2606.20625.pdf",
+    "progress_summary": "PDF 已下载, worktree 已创建",
+    "phases_completed": [
+      "download"
+    ],
+    "notes": "开源 github.com/jarrettyu/AlphaMemo — 针对挖掘的冗余搜索与过拟合(confidence-gated memory + veto)"
+  },
+  "paper_003": {
+    "arxiv_id": "2605.23959",
+    "title": "",
+    "url": "https://arxiv.org/abs/2605.23959",
+    "source": "arxiv",
+    "status": "pending",
+    "phase": "download",
+    "created_date": "2026-08-30",
+    "updated_date": "2026-08-30",
+    "branch": "paper/2605.23959",
+    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\paper_003",
+    "pdf_path": "papers\\pdfs\\2605.23959.pdf",
+    "progress_summary": "PDF 已下载, worktree 已创建",
+    "phases_completed": [
+      "download"
+    ],
+    "notes": "决策时点泄漏 one-switch 基准 — 直接对应开盘价vs收盘价的执行假设问题(最高优先级)"
+  },
+  "paper_004": {
+    "arxiv_id": "2502.16789",
+    "title": "",
+    "url": "https://arxiv.org/abs/2502.16789",
+    "source": "arxiv",
+    "status": "pending",
+    "phase": "download",
+    "created_date": "2026-08-30",
+    "updated_date": "2026-08-30",
+    "branch": "paper/2502.16789",
+    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\paper_004",
+    "pdf_path": "papers\\pdfs\\2502.16789.pdf",
+    "progress_summary": "PDF 已下载, worktree 已创建",
+    "phases_completed": [
+      "download"
+    ],
+    "notes": "AlphaAgent: 正则化探索对抗 alpha decay — 针对挖掘过拟合"
   }
 }

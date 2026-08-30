@@ -286,8 +286,18 @@ class CapitalBacktester:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='资金规模对策略表现的影响验证')
+    parser.add_argument('--capitals', nargs='+', default=['10w'],
+                        choices=['10w', '100w', '1y'],
+                        help='要回测的资金档位 (默认: 10w 实盘规模)')
+    args = parser.parse_args()
+
     import multiprocessing
-    multiprocessing.set_start_method('fork', force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
 
     import qlib
     from qlib.data import D
@@ -322,12 +332,13 @@ def main():
     prices = prices.swaplevel().sort_index()
     print(f"  完成 ({time.time()-t0:.1f}s)")
 
-    # 运行回测
-    capitals = [
-        (100_000, '10万 (实盘)'),
-        (1_000_000, '100万 (Exp009)'),
-        (100_000_000, '1亿 (标准回测)'),
-    ]
+    # 运行回测 — 默认只测实盘规模 10万; --capitals 可指定其他档位
+    ALL_CAPITALS = {
+        '10w':  (100_000, '10万 (实盘)'),
+        '100w': (1_000_000, '100万 (Exp009)'),
+        '1y':   (100_000_000, '1亿 (标准回测)'),
+    }
+    capitals = [ALL_CAPITALS[k] for k in args.capitals]
 
     results = {}
     print(f"\n[2/3] 运行回测 ({start} ~ {end})...")
@@ -416,10 +427,11 @@ def main():
 
     print("-" * 70)
 
-    # 衰减分析
-    base = results['1亿 (标准回测)']
-    print("\n衰减分析 (相对 1亿 标准回测):")
-    for _, label in capitals[:2]:
+    # 衰减分析 — 以本次跑的最大资金档为基准（可能只跑了部分档位）
+    base_label = capitals[-1][1]
+    base = results[base_label]
+    print(f"\n衰减分析 (相对 {base_label}):")
+    for _, label in capitals[:-1]:
         r = results[label]
         sharpe_loss = r['sharpe'] - base['sharpe']
         ret_loss = r['total_return'] - base['total_return']
@@ -432,8 +444,9 @@ def main():
         print(f"    MDD:     {r['max_drawdown']:.1%} vs {base['max_drawdown']:.1%} "
               f"({mdd_diff:+.1%})")
 
-    # 10万跳过的高价股详情
-    skip_lot_10w = [s for s in results['10万 (实盘)']['skip_events']
+    # 最小资金档跳过的高价股详情（整手约束在小资金下最明显）
+    small_label = capitals[0][1]
+    skip_lot_10w = [s for s in results[small_label]['skip_events']
                     if s['reason'] == 'lot_size_constraint']
     if skip_lot_10w:
         # 统计被跳过最多的股票
@@ -441,7 +454,7 @@ def main():
         skip_counter = Counter(s['inst'] for s in skip_lot_10w)
         top_skipped = skip_counter.most_common(10)
 
-        print(f"\n10万资金最常被跳过的股票 (整手约束, 共{len(skip_lot_10w)}次):")
+        print(f"\n{small_label} 最常被跳过的股票 (整手约束, 共{len(skip_lot_10w)}次):")
         for inst, count in top_skipped:
             # 找到该股票最近一次的价格
             prices_list = [s['price'] for s in skip_lot_10w if s['inst'] == inst]

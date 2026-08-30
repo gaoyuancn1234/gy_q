@@ -8,8 +8,17 @@
 
 import os
 import sys
+
+# Windows 控制台默认非 UTF-8 编码（如 GBK），print 中文/emoji 会 UnicodeEncodeError 崩溃
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import json
 import time
+import shutil
 import threading
 import queue
 import re
@@ -47,6 +56,17 @@ for i in range(1, 10):
         APPS.append({"app_id": app_id, "app_secret": app_secret})
     else:
         break
+
+# Claude CLI 可执行文件路径（跨平台自动探测，可用 CLAUDE_BIN 环境变量覆盖）
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
+
+# 授权用户白名单（逗号分隔的 open_id）。
+# 机器人会以 --dangerously-skip-permissions 执行 Claude，等同于把本机的
+# 任意命令执行权交给发消息的人，因此未列入白名单的用户一律拒绝。
+# 留空 = 拒绝所有人（首次使用时给自己发条消息，控制台会打印你的 open_id）。
+ALLOWED_OPEN_IDS = {
+    x.strip() for x in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",") if x.strip()
+}
 
 # 消息处理配置
 MESSAGE_BATCH_WAIT = 1.2  # 等待批量消息的时间(秒)
@@ -758,14 +778,15 @@ class SmartBot:
             })
 
             cmd = [
-                '/usr/local/bin/claude', '--print', '--dangerously-skip-permissions',
+                CLAUDE_BIN, '--print', '--dangerously-skip-permissions',
                 '--output-format', 'json',
                 '--model', 'haiku',
                 '--json-schema', json_schema,
                 '-p', prompt
             ]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15, cwd=str(WORK_DIR), env=_CLEAN_ENV
+                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=15, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
 
@@ -874,7 +895,7 @@ class SmartBot:
         try:
             for attempt in range(max_retries):
                 # 构建命令
-                cmd = ['/usr/local/bin/claude', '-p',
+                cmd = [CLAUDE_BIN, '-p',
                        '--dangerously-skip-permissions',
                        '--output-format', 'json']
                 if self.claude_session.session_id:
@@ -884,6 +905,7 @@ class SmartBot:
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    encoding='utf-8', errors='replace',
                     cwd=str(WORK_DIR), env=_CLEAN_ENV
                 )
                 if session:
@@ -955,14 +977,18 @@ class SmartBot:
 
     @staticmethod
     def _restart_vpn():
-        """尝试重启 LetsVPN 以恢复网络连接"""
+        """尝试重启 VPN 以恢复网络连接
+
+        命令由 .env 的 VPN_RESTART_CMD 提供（原先硬编码 macOS 的 LetsVPN 路径，
+        在 Windows 上会静默失败却仍打印成功）。未配置时跳过。
+        """
+        cmd = os.environ.get("VPN_RESTART_CMD", "").strip()
+        if not cmd:
+            print("[VPN] 未配置 VPN_RESTART_CMD，跳过重启")
+            return
         try:
-            subprocess.Popen(
-                'nohup /Applications/LetsVPN.app/Contents/MacOS/LetsVPN '
-                '>/tmp/letsvpn.out 2>/tmp/letsvpn.err &',
-                shell=True,
-            )
-            print("[VPN] LetsVPN 重启命令已执行")
+            subprocess.Popen(cmd, shell=True)
+            print("[VPN] 重启命令已执行")
         except Exception as e:
             print(f"[VPN] 重启失败: {e}")
 
@@ -1027,7 +1053,8 @@ class SmartBot:
         try:
             result = subprocess.run(
                 cmd, shell=True, cwd=str(WORK_DIR),
-                capture_output=True, text=True, timeout=timeout
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=timeout
             )
             output = result.stdout or result.stderr or "完成"
 
@@ -1269,11 +1296,12 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
 7. 只输出一个 JSON，不要其他文字"""
 
             cmd = [
-                '/usr/local/bin/claude', '--print', '--dangerously-skip-permissions',
+                CLAUDE_BIN, '--print', '--dangerously-skip-permissions',
                 '-p', f"{read_cmds}\n\n{prompt}"
             ]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120, cwd=str(WORK_DIR), env=_CLEAN_ENV
+                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=120, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
 
@@ -2045,10 +2073,11 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
 
         try:
             result = subprocess.run(
-                ['/usr/local/bin/claude', '--print', '--dangerously-skip-permissions',
+                [CLAUDE_BIN, '--print', '--dangerously-skip-permissions',
                  '--output-format', 'json', '--json-schema', schema,
                  '-p', prompt],
-                capture_output=True, text=True, timeout=15, env=_CLEAN_ENV
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=15, env=_CLEAN_ENV
             )
             output = result.stdout.strip()
             data = json.loads(output)
@@ -2121,6 +2150,22 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
                 session.is_processing = False
             session.current_task = ""
 
+    def _is_authorized(self, open_id: str, source: str) -> bool:
+        """白名单校验 — 未授权用户不得触发 Claude 执行
+
+        白名单为空时拒绝所有人，并打印 open_id 便于首次配置。
+        """
+        if open_id in ALLOWED_OPEN_IDS:
+            return True
+
+        if not ALLOWED_OPEN_IDS:
+            print(f"\n⚠ [{source}] 未配置白名单，已拒绝。若这是你本人，请在 .env 中设置:")
+            print(f"    FEISHU_ALLOWED_OPEN_IDS={open_id}")
+            print("  然后重启机器人。\n")
+        else:
+            print(f"⚠ [{source}] 拒绝未授权用户: {open_id}")
+        return False
+
     def _handle_message(self, data, lark_client: lark.Client):
         """消息事件处理（由各 App 的 handler 闭包调用）"""
         try:
@@ -2141,6 +2186,8 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
 
             # 获取用户ID，创建/获取会话，注入 lark_client
             open_id = data.event.sender.sender_id.open_id
+            if not self._is_authorized(open_id, "消息"):
+                return
             session = self.session_mgr.get_or_create(open_id)
             session.lark_client = lark_client
 
@@ -2263,6 +2310,8 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             action_id = value.get('id', '')
 
             open_id = data.event.operator.open_id
+            if not self._is_authorized(open_id, "按钮"):
+                return
             session = self.session_mgr.get_or_create(open_id)
             session.lark_client = lark_client
             print(f"\n[按钮] [{open_id[:12]}] {action}, ID: {action_id}")
@@ -2417,6 +2466,12 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
             self._ws_clients.append(ws_client)
             print(f"  ✓ App {app_id} 已注册")
 
+        print()
+        if ALLOWED_OPEN_IDS:
+            print(f"✓ 白名单已启用 ({len(ALLOWED_OPEN_IDS)} 个授权用户)")
+        else:
+            print("⚠ 未配置白名单 (FEISHU_ALLOWED_OPEN_IDS)，将拒绝所有消息")
+            print("  给机器人发条消息，控制台会打印你的 open_id")
         print()
         print("✓ 启动成功")
         print("  • 发送「信号」生成ML调仓信号")

@@ -1550,7 +1550,10 @@ def _build_daily_message(run_result: dict, backtest: dict, reg_stats: dict) -> s
 
 
 def main():
-    multiprocessing.set_start_method("fork", force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
 
     parser = argparse.ArgumentParser(description="自动因子挖掘")
     # 模式选择 (互斥)

@@ -128,7 +128,7 @@ def _update_daily_predictions() -> bool:
         result = subprocess.run(
             [sys.executable, '-c',
              'import multiprocessing; '
-             'multiprocessing.set_start_method("fork", force=True); '
+             '"fork" in multiprocessing.get_all_start_methods() and multiprocessing.set_start_method("fork", force=True); '
              'import sys; sys.path.insert(0, "."); '
              f'from retrain_pipeline import extend_rolling_predictions; '
              f'pred = extend_rolling_predictions("{test_end}"); '
@@ -247,7 +247,7 @@ def _update_shadow_predictions(dry_run: bool = False):
 
                 script = (
                     'import multiprocessing; '
-                    'multiprocessing.set_start_method("fork", force=True); '
+                    '"fork" in multiprocessing.get_all_start_methods() and multiprocessing.set_start_method("fork", force=True); '
                     'import sys; sys.path.insert(0, "."); '
                     'import retrain_pipeline as rp; '
                     f'rp.CONFIG_NAME = "{rc}"; '
@@ -529,6 +529,23 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
 
     log.info(f"信号日期: {signal['date']}, 状态: {signal['regime']}, TopK: {signal['effective_topk']}")
 
+    # 信号健康检查 — 模型退化时必须拦截，不能把随机名单当交易信号推出去。
+    # 2026-08-30 实例: Window 11 的 LightGBM 第 3 轮即早停 (验证期 IC 为负)，
+    # 3 棵树的模型让 300 只股票只剩 123 个不同分数、标准差为历史的 1/30，
+    # TopK 中 8 只并列同分。系统当时对此毫无察觉，会照常推送。
+    _health = signal.get('health') or {}
+    if _health and not _health.get('ok', True):
+        detail = "\n".join(f"  • {i}" for i in _health.get('issues', []))
+        err_msg = (f"🚨 模型退化，已拦截本次信号推送\n\n"
+                   f"信号日期: {signal['date']}\n{detail}\n\n"
+                   f"该信号的选股排序不可信，请勿据此交易。\n"
+                   f"建议检查最近一次 rolling 训练的 best_iteration。")
+        log.error(f"信号健康检查未通过: {_health.get('issues')}")
+        push_feishu(err_msg, dry_run)
+        from notifications import write_notification
+        write_notification("signal", "模型退化-信号已拦截", err_msg, "error")
+        return
+
     # 信号时效性检查: 超过2个交易日标记为 stale
     signal_stale = False
     try:
@@ -562,6 +579,15 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         if degraded is None:
             degraded = []
         degraded.append("价格来自缓存(BaoStock不可用)")
+
+    # 记录每日净值 — 波动率目标要靠这个序列估计已实现波动率。
+    # 必须在生成调仓指令之前记录，否则当日敞口用不上今天的波动信息。
+    try:
+        from portfolio.live_portfolio import record_nav
+        _nav = record_nav(holdings, prices)
+        log.info(f"组合净值: {_nav:,.0f}")
+    except Exception as e:
+        log.warning(f"净值记录失败 (不影响调仓): {e}")
 
     # 判断是否为调仓日 (每 5 个交易日)
     rebalance_every = 5
@@ -1211,5 +1237,8 @@ def main():
 
 if __name__ == '__main__':
     import multiprocessing
-    multiprocessing.set_start_method('fork', force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
     main()

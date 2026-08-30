@@ -77,7 +77,7 @@ def run_experiment(preset_name: str, model_name: str = "lightgbm",
         "start_time": test_start, "end_time": test_end,
         "account": 100_000_000, "benchmark": "SH000300",
         "exchange_kwargs": {
-            "freq": "day", "limit_threshold": 0.095, "deal_price": "open",
+            "freq": "day", "limit_threshold": 0.095, "deal_price": "close",  # 2026-08-30 由 open 改为 close (对齐生产 signal_config)
             "open_cost": 0.0005, "close_cost": 0.0015, "min_cost": 5, "trade_unit": 100,
         },
     }

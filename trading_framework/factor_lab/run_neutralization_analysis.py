@@ -715,7 +715,10 @@ def generate_report(exposure: dict, attribution: dict,
 
 def main():
     import multiprocessing
-    multiprocessing.set_start_method('fork', force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
 
     parser = argparse.ArgumentParser(description='实验007: 行业/市值中性化分析')
     parser.add_argument('--topk', type=int, default=TOPK, help='TopK 选股数量')

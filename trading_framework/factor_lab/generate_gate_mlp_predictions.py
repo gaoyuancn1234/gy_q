@@ -40,7 +40,10 @@ def main():
     pred_dir.mkdir(parents=True, exist_ok=True)
 
     import multiprocessing
-    multiprocessing.set_start_method('fork', force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
     import qlib
     qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region='cn')
 

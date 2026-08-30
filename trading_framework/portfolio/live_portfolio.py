@@ -236,6 +236,84 @@ def calculate_affordable_allocation(targets: list, prices: dict,
     return allocation
 
 
+# ============ 净值记录与波动率目标 ============
+
+TRADING_DAYS = 242
+
+
+def compute_nav(holdings: dict, prices: dict) -> float:
+    """按当前价计算组合总净值 (现金 + 持仓市值)"""
+    nav = holdings.get('cash', 0.0)
+    for code, pos in holdings.get('positions', {}).items():
+        px = prices.get(code) or pos.get('cost_price', 0)
+        nav += pos.get('shares', 0) * px
+    return float(nav)
+
+
+def record_nav(holdings: dict, prices: dict, date: str = None) -> float:
+    """记录每日净值 (vol targeting 需要净值序列来估计已实现波动率)
+
+    同一天重复调用只保留最后一次。序列上限 500 个交易日。
+    """
+    nav = compute_nav(holdings, prices)
+    date = date or datetime.now().strftime('%Y-%m-%d')
+    hist = holdings.setdefault('nav_history', [])
+    if hist and hist[-1].get('date') == date:
+        hist[-1]['nav'] = nav
+    else:
+        hist.append({'date': date, 'nav': nav})
+    if len(hist) > 500:
+        del hist[:-500]
+    return nav
+
+
+def _get_vol_target_config() -> dict:
+    """从 signal_config.yaml 读取波动率目标配置 (缺失/损坏时安全关闭)"""
+    try:
+        import yaml
+        cfg_path = PROJECT_DIR / "config" / "signal_config.yaml"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        nd = cfg.get('n_drop')
+        return {
+            'vol_target': cfg.get('vol_target'),
+            'vol_window': int(cfg.get('vol_window', 20)),
+            'vol_min_exposure': float(cfg.get('vol_min_exposure', 0.2)),
+            'n_drop': int(nd) if nd is not None else None,
+        }
+    except Exception as e:
+        print(f"[live_portfolio] 读取风控配置失败，已回退到无风控行为: {e}")
+        return {'vol_target': None, 'n_drop': None}
+
+
+def compute_exposure(holdings: dict, target_vol: float,
+                     window: int = 20, min_exposure: float = 0.2) -> tuple:
+    """按已实现波动率计算权益敞口
+
+    诊断依据: TopK 等权是固定风险敞口，市场波动翻倍时组合风险随之翻倍。
+    2026-02~08 正是如此 —— 选股能力未衰减 (超额日均 +0.09%，与 2024 相当)，
+    但组合日波动从 1.14% 升至 2.15%，导致 Sharpe 崩塌。
+
+    Returns:
+        (exposure, realized_vol) — 历史不足时返回 (1.0, None)
+    """
+    if not target_vol:
+        return 1.0, None
+    hist = holdings.get('nav_history', [])
+    if len(hist) < window + 1:
+        return 1.0, None
+    navs = [h['nav'] for h in hist[-(window + 1):]]
+    rets = [navs[i] / navs[i - 1] - 1 for i in range(1, len(navs)) if navs[i - 1] > 0]
+    if len(rets) < window:
+        return 1.0, None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    vol = (var ** 0.5) * (TRADING_DAYS ** 0.5)
+    if vol <= 1e-9:
+        return 1.0, None
+    return float(min(1.0, max(min_exposure, target_vol / vol))), float(vol)
+
+
 # ============ 持仓操作 ============
 
 def load_live_holdings() -> dict:
@@ -420,10 +498,26 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
     current_set = set(holdings['positions'].keys())
     names = get_stock_names()
 
-    # 计算卖出
-    to_sell = current_set - target_set
-    to_hold = current_set & target_set
-    to_buy_codes = [c for c in signal['target_stocks'] if c not in current_set]
+    # 计算卖出 — 受 n_drop 换手限制
+    #
+    # 原实现是全量换手 (current_set - target_set)，在 5 日调仓下几乎每次换掉
+    # 全部持仓。回测显示这会吃掉绝大部分收益: 10万资金 2.5 年约 1734 笔交易，
+    # 双边成本 0.05%+0.15% 累积 ≈ 1.4 万 (本金的 14%)。
+    #   全量换手  Sharpe 0.24(段1) / 0.48(2024-26)
+    #   n_drop=2  Sharpe 1.27(段1) / 1.16(2024-26)
+    _n_drop = _get_vol_target_config().get('n_drop')
+    _all_out = current_set - target_set
+    if _n_drop is not None and _all_out:
+        scores = signal.get('scores') or {}
+        # 分数最低的先卖; 不在分数表里的视为最差 (信号已不覆盖该股)
+        ranked_out = sorted(_all_out, key=lambda c: scores.get(c, float('-inf')))
+        to_sell = set(ranked_out[:_n_drop])
+    else:
+        to_sell = _all_out
+    to_hold = current_set - to_sell
+    # 只买入被腾出的坑位数，保持持仓数稳定
+    _free = max(0, topk - len(to_hold))
+    to_buy_codes = [c for c in signal['target_stocks'] if c not in current_set][:_free]
 
     model_ver = get_model_version()
     lines = [
@@ -453,8 +547,23 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
             lines.append(f"  {qlib_to_display(code)} {shares}股 ×{price:.2f} ≈ {amount:,.0f}")
         lines.append("")
 
-    # 买入 (考虑资金约束)
+    # 买入 (考虑资金约束 + 波动率目标)
     available_cash = holdings['cash'] + sell_total
+
+    # 波动率目标: 市场波动放大时按比例收缩敞口，其余留现金
+    _vt = _get_vol_target_config()
+    if _vt.get('vol_target'):
+        exposure, realized = compute_exposure(
+            holdings, _vt['vol_target'],
+            window=_vt.get('vol_window', 20),
+            min_exposure=_vt.get('vol_min_exposure', 0.2))
+        if exposure < 1.0:
+            available_cash *= exposure
+            lines.append(f"【风控】实现波动 {realized:.1%} > 目标 "
+                         f"{_vt['vol_target']:.0%}，敞口降至 {exposure:.0%}，"
+                         f"可用资金 {available_cash:,.0f}")
+            lines.append("")
+
     if to_buy_codes:
         alloc = calculate_affordable_allocation(
             to_buy_codes, prices, available_cash

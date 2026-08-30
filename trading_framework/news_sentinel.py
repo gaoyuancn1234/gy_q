@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from cli_paths import CLAUDE_BIN
 
 PROJECT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = PROJECT_DIR / "experiment" / "news_cache"
@@ -314,7 +315,7 @@ class NewsSentinel:
         """调用 Claude CLI 并解析 JSON 输出"""
         try:
             cmd = [
-                '/usr/local/bin/claude',
+                CLAUDE_BIN,
                 '--print',
                 '--dangerously-skip-permissions',
                 '--output-format', 'text',

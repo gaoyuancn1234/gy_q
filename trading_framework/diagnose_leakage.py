@@ -3,6 +3,7 @@
 import multiprocessing
 import sys
 from pathlib import Path
+import qlib_compat  # noqa: F401  (设置 MLFLOW_ALLOW_FILE_STORE)
 
 
 def main():
@@ -199,5 +200,8 @@ def main():
 
 
 if __name__ == '__main__':
-    multiprocessing.set_start_method('fork', force=True)
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except (ValueError, RuntimeError):
+        pass  # Windows 无 fork，使用默认 spawn
     main()

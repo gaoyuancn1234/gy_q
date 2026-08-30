@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from cli_paths import CLAUDE_BIN
 
 MINING_DIR = Path(__file__).resolve().parent.parent / "mining_results"
 
@@ -58,7 +59,7 @@ def _claude_fallback_provider() -> LLMProvider:
     """Claude 默认 provider (永远可用)"""
     return LLMProvider(
         name="claude",
-        cli_path="/usr/local/bin/claude",
+        cli_path=CLAUDE_BIN,
         cli_args=["--print", "--dangerously-skip-permissions",
                   "--output-format", "text"],
         prompt_flag="-p",

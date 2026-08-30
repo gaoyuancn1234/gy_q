@@ -287,7 +287,7 @@ class QlibEngine:
             "exchange_kwargs": {
                 "freq": "day",
                 "limit_threshold": 0.095,
-                "deal_price": "open",   # T+1: 信号当日收盘后生成，次日开盘价成交
+                "deal_price": "close",  # T+1: 信号当日收盘后生成，次日收盘价成交 (2026-08-30 由 open 改)
                 "open_cost": 0.0005,
                 "close_cost": 0.0015,
                 "min_cost": 5,
