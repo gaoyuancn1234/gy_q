@@ -35,10 +35,11 @@
 (2025 年 -7.42%)。全期超额仅 +2.41% —— 价值主要在**更小回撤**，不在更高收益。
 
 ## 凭证管理
-- 凭证在 `trading_framework/.env`。
-- **注意: 2026-08-30 起 `.env` 已按用户要求提交进 git**(私有仓库
-  github.com/gaoyuancn1234/gy_q)。若仓库转为 Public / 加协作者 / 被 fork，
-  需去 open.feishu.cn 重置应用凭证。
+- 凭证在 `trading_framework/.env`(已 .gitignore，**不入 git**)。
+  模板见 `.env.example`。
+- 2026-08-30 曾尝试把真实 `.env` 提交，被 GitHub secret scanning 拦截
+  (Lark Application Secret)，已从历史中移除。**不要再尝试提交** —— git
+  历史永久，密钥进入后即便删除文件仍可还原。
 - 环境变量: `FEISHU_APP_ID_1/2`, `FEISHU_APP_SECRET_1/2`,
   `FEISHU_ALLOWED_OPEN_IDS`(白名单，留空则拒绝所有人), `VPN_RESTART_CMD`
 
@@ -52,7 +53,8 @@ trading_framework/
 ├── send_signal.py         # 发送调仓指令到飞书
 ├── cli_paths.py           # 外部CLI路径跨平台解析 (CLAUDE_BIN 等)
 ├── qlib_compat.py         # MLflow 3.x 兼容垫片 (导入即生效)
-├── .env                   # 凭证（2026-08-30 起已入 git，见"凭证管理"）
+├── .env                   # 凭证（不入 git）
+├── .env.example           # 凭证模板（入 git）
 ├── config/
 │   ├── settings.py        # STRATEGY_TYPE='ml', ML_CONFIG
 │   └── signal_config.yaml # ML信号配置 (rolling/preset/topk)
