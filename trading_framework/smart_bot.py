@@ -77,6 +77,28 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 TEMP_FILE_TTL = int(os.environ.get("TEMP_FILE_TTL", 86400))  # 默认 24 小时
 MSG_DEDUP_TTL = 3600  # 消息去重 key 保留 1 小时
 
+# API 错误识别。
+# 原实现用裸子串匹配 ['403', '401', 'forbidden', ...] 扫描整个回答，
+# 正常内容里出现 "历史并集 1403 只" 就命中 '403'，把成功的结果误判成
+# API 错误 —— 触发 VPN 重启并重试，三次都命中时用户拿到的是错误提示
+# 而不是答案。改为要求错误语境（带词边界的状态码或明确的错误短语），
+# 并且只在调用确实失败时才做这项检查。
+_API_ERROR_RE = re.compile(
+    r'(?:api\s*error'
+    r'|failed\s+to\s+authenticate'
+    r'|\bunauthorized\b'
+    r'|\bforbidden\b'
+    r'|\brate[\s_-]?limit'
+    r'|(?:http|status(?:\s*code)?|error)\s*[:\s]\s*(?:401|403|429|5\d{2})\b'
+    r'|\b(?:401|403|429)\s+(?:unauthorized|forbidden|too\s+many|error))',
+    re.IGNORECASE
+)
+
+
+def looks_like_api_error(text: str) -> bool:
+    """判断输出是否为 API 访问错误（需配合"调用确实失败"一起使用）"""
+    return bool(_API_ERROR_RE.search(text or ""))
+
 # ============================================================
 # Redis 临时文件存储
 # ============================================================
@@ -782,10 +804,11 @@ class SmartBot:
                 '--output-format', 'json',
                 '--model', 'haiku',
                 '--json-schema', json_schema,
-                '-p', prompt
             ]
+            # prompt 走 stdin，不作为 argv 传递。详见 call_claude 中的说明。
             result = subprocess.run(
-                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                cmd, input=prompt,
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
                 timeout=15, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
@@ -884,8 +907,6 @@ class SmartBot:
         parts.append(f"\n[用户 {user_id[:8]}]: {user_input}")
         message = "\n".join(parts)
 
-        api_error_keywords = ['403', 'forbidden', 'Failed to authenticate',
-                              'API Error', '401', 'unauthorized']
         max_retries = 3
         last_output = ""
         vpn_restarted = False
@@ -900,10 +921,16 @@ class SmartBot:
                        '--output-format', 'json']
                 if self.claude_session.session_id:
                     cmd.extend(['--resume', self.claude_session.session_id])
-                cmd.append(message)
 
+                # prompt 必须走 stdin，不能作为 argv 传递。
+                # Windows 上 CLAUDE_BIN 解析到 claude.CMD（批处理），CreateProcess
+                # 会经 cmd.exe 执行，argv 里的换行符会截断命令行 —— 多行 prompt
+                # 只有第一行送达，用户的实际问题被静默丢弃，Claude 收到的仅是
+                # "[用户ID: ...]" 一行，于是回复 "有什么需要帮忙的？"。
+                # stdin 是字节流，不经 cmd.exe 解析，同时规避 8191 字符命令行上限。
                 proc = subprocess.Popen(
                     cmd,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     encoding='utf-8', errors='replace',
                     cwd=str(WORK_DIR), env=_CLEAN_ENV
@@ -911,7 +938,7 @@ class SmartBot:
                 if session:
                     session.current_process = proc
                 try:
-                    stdout, stderr = proc.communicate(timeout=timeout)
+                    stdout, stderr = proc.communicate(input=message, timeout=timeout)
                     raw = stdout.strip() or stderr.strip() or ""
                 except subprocess.TimeoutExpired:
                     print(f"[超时] {timeout}秒已到，任务转入后台继续执行")
@@ -928,6 +955,7 @@ class SmartBot:
 
                 # 解析 JSON 输出
                 result_text = raw
+                is_error_flag = False
                 try:
                     data = json.loads(raw)
                     result_text = data.get("result", raw)
@@ -935,6 +963,7 @@ class SmartBot:
                     if new_sid:
                         self.claude_session.update(new_sid)
                     if data.get("is_error"):
+                        is_error_flag = True
                         result_text = f"⚠️ Claude 错误: {result_text}"
                 except json.JSONDecodeError:
                     pass  # 非 JSON 输出，原样使用
@@ -948,8 +977,12 @@ class SmartBot:
                     self.claude_session.reset()
                     continue
 
-                # API 错误检测 + VPN 重启重试
-                if any(kw.lower() in last_output.lower() for kw in api_error_keywords):
+                # API 错误检测 + VPN 重启重试。
+                # 必须先确认调用真的失败：成功的回答里出现 "历史并集 1403 只"
+                # 之类的内容不该被当成 403 错误 —— 曾因此把正确结果丢弃、
+                # 触发 VPN 重启并重试。
+                call_failed = proc.returncode != 0 or is_error_flag
+                if call_failed and looks_like_api_error(last_output):
                     print(f"[API错误] 第{attempt+1}次: {last_output[:200]}")
                     if attempt < max_retries - 1:
                         if not vpn_restarted:
@@ -994,13 +1027,6 @@ class SmartBot:
 
     def _wait_bg_result(self, proc: subprocess.Popen, session: 'UserSession', complexity_desc: str):
         """后台线程等待超时任务完成，完成后主动推送结果给用户"""
-        def _is_api_error(text: str) -> bool:
-            error_indicators = ['403', 'forbidden', 'Request not allowed',
-                                'Failed to authenticate', 'API Error',
-                                '401', 'unauthorized', 'rate_limit']
-            text_lower = text.lower()
-            return any(indicator.lower() in text_lower for indicator in error_indicators)
-
         def _wait():
             try:
                 stdout, stderr = proc.communicate(timeout=1800)
@@ -1022,7 +1048,8 @@ class SmartBot:
                     pass
 
                 print(f"[后台任务完成] {len(output)} 字符")
-                if _is_api_error(output):
+                # 同 call_claude：先确认调用真的失败，再看是否像 API 错误
+                if proc.returncode != 0 and looks_like_api_error(output):
                     print(f"[后台任务API错误] {output[:200]}")
                     self._restart_vpn()
                     self.send_text(
@@ -1214,6 +1241,19 @@ class SmartBot:
                 self.send_text(f"❌ ML 信号错误: {signal['error']}", session)
                 return
 
+            # 健康闸门 (2026-09-03 补): 此前只有 daily_runner 的定时推送会检查，
+            # 手动发「信号」这条路不查 —— 模型退化时定时推送被拦下，
+            # 手动查询却照样返回那份随机名单 (实测: 300 只股票仅 18 个不同分数，
+            # TopK 8 里只有 2 个不同分数)。两条路必须用同一道闸。
+            _health = signal.get('health') or {}
+            if _health and not _health.get('ok', True):
+                detail = "\n".join(f"  • {i}" for i in _health.get('issues', []))
+                self.send_text(
+                    f"🔴 信号健康检查未通过，本次不提供调仓建议\n\n{detail}\n\n"
+                    f"模型可能已退化，其预测分数缺乏区分度，据此调仓等同随机。\n"
+                    f"建议检查最近一次 rolling 训练的 best_iteration。", session)
+                return
+
             holdings = load_live_holdings()
             all_instruments = list(set(
                 list(holdings.get('positions', {}).keys()) + signal['target_stocks']
@@ -1297,10 +1337,11 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
 
             cmd = [
                 CLAUDE_BIN, '--print', '--dangerously-skip-permissions',
-                '-p', f"{read_cmds}\n\n{prompt}"
             ]
+            # prompt 走 stdin，不作为 argv 传递。详见 call_claude 中的说明。
             result = subprocess.run(
-                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                cmd, input=f"{read_cmds}\n\n{prompt}",
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
                 timeout=120, cwd=str(WORK_DIR), env=_CLEAN_ENV
             )
             output = result.stdout.strip()
@@ -1585,14 +1626,14 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
             try:
                 state_file = BOT_DIR / "monitor" / "monitor_state.json"
                 if not state_file.exists():
-                    self.send_text("📡 盘中监控: 今日未启动\n(launchd 每天 9:25 自动启动)", session)
+                    self.send_text("📡 盘中监控: 今日未启动\n(任务计划 TradingSystem-IntradayMonitor 每天 9:25 自动启动)", session)
                 else:
                     with open(state_file, 'r', encoding='utf-8') as f:
                         state = json.load(f)
                     from datetime import date as _date
                     today = _date.today().isoformat()
                     if state.get('date') != today:
-                        self.send_text("📡 盘中监控: 今日未启动\n(launchd 每天 9:25 自动启动)", session)
+                        self.send_text("📡 盘中监控: 今日未启动\n(任务计划 TradingSystem-IntradayMonitor 每天 9:25 自动启动)", session)
                     else:
                         alerted = state.get('alerted_today', {})
                         lines = [
@@ -2072,10 +2113,11 @@ execute 数组中填入应执行的消息编号（从1开始），如果全部�
         })
 
         try:
+            # prompt 走 stdin，不作为 argv 传递。详见 call_claude 中的说明。
             result = subprocess.run(
                 [CLAUDE_BIN, '--print', '--dangerously-skip-permissions',
-                 '--output-format', 'json', '--json-schema', schema,
-                 '-p', prompt],
+                 '--output-format', 'json', '--json-schema', schema],
+                input=prompt,
                 capture_output=True, text=True, encoding='utf-8', errors='replace',
                 timeout=15, env=_CLEAN_ENV
             )

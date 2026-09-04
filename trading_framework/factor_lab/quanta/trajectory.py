@@ -352,7 +352,7 @@ class TrajectoryPool:
         path = self.save_dir / filename
         if not path.exists():
             return
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
         self._next_id = data.get("next_id", 1)
         self._trajectories = {

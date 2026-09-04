@@ -22,7 +22,7 @@ def get_instruments(qlib_dir: str = DEFAULT_QLIB_DIR) -> list[str]:
         return []
 
     instruments = []
-    with open(inst_file) as f:
+    with open(inst_file, encoding='utf-8') as f:
         for line in f:
             parts = line.strip().split("\t")
             if parts:

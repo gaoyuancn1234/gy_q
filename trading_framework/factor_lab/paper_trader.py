@@ -22,11 +22,21 @@
 """
 import json
 import csv
+import sys
 import time
 import warnings
 import argparse
 from pathlib import Path
 from datetime import datetime
+
+# 直接执行 `python factor_lab/paper_trader.py` 时 sys.path[0] 是 factor_lab/，
+# 顶层的 portfolio 包不可见。这里补上项目根目录，让脚本式和 -m 两种调用都能跑。
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+# 调仓风控规则与实盘共用同一实现，避免两边各写一份再次分叉
+from portfolio.rebalance_rules import select_sells, compute_exposure
 
 import yaml
 import numpy as np
@@ -36,7 +46,7 @@ warnings.filterwarnings('ignore')
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-from factor_lab.signal_generator import TOPK_BY_REGIME
+from factor_lab.signal_generator import TOPK_BY_REGIME, cap_topk
 
 
 class PaperTrader:
@@ -55,7 +65,7 @@ class PaperTrader:
 
     def _load_config(self, config_path: str) -> dict:
         full_path = PROJECT_DIR / config_path
-        with open(full_path) as f:
+        with open(full_path, encoding='utf-8') as f:
             return yaml.safe_load(f)
 
     # ── 状态管理 ──
@@ -63,7 +73,7 @@ class PaperTrader:
     def _load_state(self) -> dict:
         state_file = self.state_dir / "state.json"
         if state_file.exists():
-            with open(state_file) as f:
+            with open(state_file, encoding='utf-8') as f:
                 return json.load(f)
         return self._initial_state()
 
@@ -72,6 +82,9 @@ class PaperTrader:
             'cash': self.config['initial_cash'],
             'positions': {},
             'pending_orders': {'sells': [], 'buys': {}},
+            # 波动率目标需要按已实现波动率缩放敞口，故在状态里保留净值序列。
+            # 净值同时写入 daily_nav.csv，但那是给人看的，程序不依赖解析 CSV。
+            'nav_history': [],
             'metadata': {
                 'initial_cash': self.config['initial_cash'],
                 'start_date': None,
@@ -93,15 +106,18 @@ class PaperTrader:
                 return obj.tolist()
             raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-        with open(state_file, 'w') as f:
-            json.dump(self.state, f, indent=2, ensure_ascii=False, default=_convert)
+        # 原子写入: 模拟盘每个交易日都写这个文件，中断会留下截断的 JSON，
+        # 下次读取直接 JSONDecodeError，整段回放历史丢失。
+        from factor_lab.utils import atomic_json_dump
+        atomic_json_dump(state_file, self.state, indent=2,
+                         ensure_ascii=False, default=_convert)
 
     def _append_trade(self, date: str, action: str, instrument: str,
                       shares: int, price: float, cost: float, reason: str):
         """追加交易记录到 CSV"""
         trades_file = self.state_dir / "trades.csv"
         is_new = not trades_file.exists()
-        with open(trades_file, 'a', newline='') as f:
+        with open(trades_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             if is_new:
                 writer.writerow(['date', 'action', 'instrument', 'shares',
@@ -114,11 +130,18 @@ class PaperTrader:
         """追加日净值到 CSV"""
         nav_file = self.state_dir / "daily_nav.csv"
         is_new = not nav_file.exists()
-        with open(nav_file, 'a', newline='') as f:
+        with open(nav_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             if is_new:
                 writer.writerow(['date', 'nav', 'cash', 'n_positions'])
             writer.writerow([date, f"{nav:.2f}", f"{cash:.2f}", n_positions])
+
+        # 同步维护状态里的净值序列 (vol_target 计算已实现波动率要用)。
+        # 只保留最近 250 个交易日: 波动率窗口默认 20 天，留一年足够且不让状态无限膨胀。
+        hist = self.state.setdefault('nav_history', [])
+        hist.append({'date': date, 'nav': float(nav)})
+        if len(hist) > 250:
+            del hist[:-250]
 
     def reset(self, initial_cash: float = None):
         """重置模拟盘"""
@@ -262,7 +285,9 @@ class PaperTrader:
             else:
                 regime = 'normal'
 
-            effective_topk = TOPK_BY_REGIME[regime]
+            # 资金上限: 与 SignalGenerator 共用同一规则。
+            # 此前直接用 TOPK_BY_REGIME，绕过上限 —— 实测持有 16 只而非 8 只。
+            effective_topk = cap_topk(TOPK_BY_REGIME[regime], cfg)
 
             # 获取当日信号
             if date in signal_dates:
@@ -272,17 +297,37 @@ class PaperTrader:
                 day_signal = day_signal.sort_values(ascending=False)
                 target_stocks = set(day_signal.head(effective_topk).index)
 
-                # 卖出不在目标中的持仓
-                for inst in list(self.state['positions'].keys()):
-                    if inst not in target_stocks and inst not in pending['sells']:
+                # 卖出 — 受 n_drop 换手限制 (2026-09-03 补齐)
+                # 此前模拟盘是全量换手，与实盘/回测不一致，绩效被交易成本系统性拖低。
+                current_set = set(self.state['positions'].keys())
+                to_sell = select_sells(
+                    current_set, target_stocks,
+                    scores=day_signal.to_dict(),
+                    n_drop=cfg.get('n_drop'),
+                )
+                for inst in sorted(to_sell):          # 显式排序，保证可复现
+                    if inst not in pending['sells']:
                         pending['sells'].append(inst)
 
-                # 规划买入
-                current_holds = set(self.state['positions'].keys()) - set(pending['sells'])
-                to_buy = target_stocks - current_holds
+                # 规划买入 — 按信号分数降序排列，保证确定性迭代顺序。
+                # 用集合差集会因 Python 字符串哈希随机化导致同配置两次结果不同。
+                current_holds = current_set - set(pending['sells'])
+                # 只买入被腾出的坑位数，保持持仓数稳定 (与实盘一致)
+                free_slots = max(0, effective_topk - len(current_holds))
+                to_buy = [i for i in day_signal.head(effective_topk).index
+                          if i not in current_holds][:free_slots]
                 if to_buy:
-                    weight = 1.0 / effective_topk
+                    # 波动率目标: 按已实现波动率缩放本次投入的权益敞口
+                    exposure, realized = compute_exposure(
+                        [h['nav'] for h in self.state.get('nav_history', [])],
+                        cfg.get('vol_target'),
+                        window=int(cfg.get('vol_window', 20)),
+                        min_exposure=float(cfg.get('vol_min_exposure', 0.2)),
+                    )
+                    weight = exposure / effective_topk
                     pending['buys'] = {inst: weight for inst in to_buy}
+                    if exposure < 1.0:
+                        self._last_exposure = (exposure, realized)
 
         # 更新元数据
         self.state['pending_orders'] = pending
@@ -530,8 +575,14 @@ def main():
     parser.add_argument('action', choices=['replay', 'status', 'reset'],
                         help="replay=回放历史, status=查看状态, reset=重置")
     parser.add_argument('--start', default=None, help="回放起始日期")
-    parser.add_argument('--end', default=None, help="回放结束日期")
+    parser.add_argument('--end', default=None,
+                        help="回放结束日期，可传 today 表示当天(定时任务用)")
     args = parser.parse_args()
+
+    # 定时任务无法在命令行里算出当天日期，这里支持字面量 today。
+    # replay 内部会先 reset 再全量重放，所以每日重建是幂等的。
+    if args.end == 'today':
+        args.end = pd.Timestamp.today().strftime('%Y-%m-%d')
 
     pt = PaperTrader()
 
@@ -539,7 +590,7 @@ def main():
         result = pt.replay(start_date=args.start, end_date=args.end)
         # 保存绩效
         perf_file = pt.state_dir / "replay_performance.json"
-        with open(perf_file, 'w') as f:
+        with open(perf_file, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2, ensure_ascii=False, default=str)
         print(f"\n绩效已保存: {perf_file}")
 

@@ -18,7 +18,7 @@ def _get_current_preset() -> str:
     """从 signal_config.yaml 读取当前生产 preset"""
     config_path = PROJECT_DIR / "config" / "signal_config.yaml"
     try:
-        with open(config_path) as f:
+        with open(config_path, encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
         return cfg.get('preset', 'alpha158_val')
     except Exception:
@@ -68,7 +68,7 @@ def _load_baseline() -> dict | None:
     preset = _detect_effective_baseline()
     baseline_file = RESULTS_DIR / f"D_expand_3v_3r_{preset}_LightGBM.json"
     if baseline_file.exists():
-        with open(baseline_file) as f:
+        with open(baseline_file, encoding='utf-8') as f:
             data = json.load(f)
         overall = data.get("overall", {})
         if overall and overall.get("sharpe"):
@@ -96,7 +96,7 @@ def screen_by_importance(
         - importance_dict: {factor_name: importance_value} (所有候选)
     """
     from factor_lab.run_rolling_benchmark import (
-        generate_rolling_windows, build_model,
+        generate_rolling_windows, build_model, fit_with_degradation_guard,
     )
     from factor_lab.factors.custom_handler import build_handler_from_exprs
     from factor_lab.factors.presets import FACTOR_PRESETS
@@ -156,12 +156,15 @@ def screen_by_importance(
         "test": (w["pred_start"], w["pred_end"]),
     })
 
+    # 这里需要模型对象本身(取 feature_importance)，不能用只返回预测的
+    # train_window，故直接用兜底版 fit。单种子即可 —— importance 只用于粗筛。
     model, fit_kwargs = build_model("LightGBM")
-    model.fit(dataset, **fit_kwargs)
+    model, best_iter, used_fb = fit_with_degradation_guard(
+        model, dataset, fit_kwargs, prev_best_iters=[], model_name="LightGBM")
 
     elapsed = time.time() - t0
-    best_iter = getattr(model.model, "best_iteration", None)
-    print(f"    训练完成: best_iter={best_iter}, time={elapsed:.1f}s")
+    print(f"    训练完成: best_iter={best_iter}"
+          f"{' [兜底]' if used_fb else ''}, time={elapsed:.1f}s")
 
     # 4. 提取 feature importance (gain)
     # 注意: Qlib LGBModel 用 x.values (numpy) 训练, lightgbm feature name 为 Column_N
@@ -215,7 +218,7 @@ def run_comparison(new_factors: list[tuple[str, str]],
         {baseline, candidate, improvement}
     """
     from factor_lab.run_rolling_benchmark import (
-        generate_rolling_windows, build_model, run_backtest,
+        generate_rolling_windows, build_model, run_backtest, train_window,
     )
     from factor_lab.factors.custom_handler import build_handler_from_exprs
     from factor_lab.factors.presets import FACTOR_PRESETS
@@ -246,6 +249,7 @@ def run_comparison(new_factors: list[tuple[str, str]],
 
     # 4. 逐窗口训练预测
     all_preds = []
+    window_details = []          # 供 train_window 推导兜底轮数
     t_total = time.time()
 
     for w in windows:
@@ -273,10 +277,15 @@ def run_comparison(new_factors: list[tuple[str, str]],
             "test": (w["pred_start"], w["pred_end"]),
         })
 
-        model, fit_kwargs = build_model("LightGBM")
-        model.fit(dataset, **fit_kwargs)
-
-        pred = model.predict(dataset)
+        # 与 run_rolling_benchmark / retrain_pipeline 共用同一训练路径
+        # (退化兜底 + 多种子集成)。2026-09-03 修复:
+        # 此前这里是裸的 model.fit()，既无兜底也无种子控制 ——
+        # 而挖掘正是靠这个回测判断"因子有没有增量"。判据本身带 ±0.3 的随机
+        # 波动时，选出来的因子很可能只是噪声(run_006/run_010 那 22 个即如此)。
+        pred, best_iter, used_fb, n_models = train_window(
+            dataset, "LightGBM",
+            prev_best_iters=[d.get("best_iteration") for d in window_details],
+        )
         if isinstance(pred.index, pd.MultiIndex):
             dates = pred.index.get_level_values(0)
             mask = (dates >= pd.Timestamp(w["pred_start"])) & \
@@ -285,11 +294,13 @@ def run_comparison(new_factors: list[tuple[str, str]],
 
         all_preds.append(pred)
         elapsed = time.time() - t0
-        best_iter = getattr(model.model, "best_iteration", None)
-        print(f"    Window {wnum}: best_iter={best_iter}, "
+        window_details.append({"window_num": wnum, "best_iteration": best_iter,
+                               "fallback_rounds": bool(used_fb)})
+        print(f"    Window {wnum}: best_iter={best_iter}"
+              f"{' [兜底]' if used_fb else ''}, models={n_models}, "
               f"samples={len(pred)}, time={elapsed:.1f}s")
 
-        del handler, dataset, model, pred
+        del handler, dataset, pred
         gc.collect()
 
     if not all_preds:
@@ -326,6 +337,9 @@ def run_comparison(new_factors: list[tuple[str, str]],
         },
         "total_time": round(total_time, 1),
         "new_factors_count": len(new_factors),
+        # 供 DSR/PBO 做多重检验校正 (只有汇总指标算不了)
+        "candidate_returns": candidate.get("daily_returns", []),
+        "baseline_returns": baseline.get("daily_returns", []),
     }
 
     print(f"  [backtest] Baseline Sharpe={baseline.get('sharpe', 0):.3f} | "

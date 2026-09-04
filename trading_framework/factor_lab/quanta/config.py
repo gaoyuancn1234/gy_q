@@ -27,9 +27,33 @@ MAX_BASE_FEATURES = 5           # 最大基础字段数 (论文 max_base_feature
 MAX_FREE_PARAM_RATIO = 0.50     # 自由参数占比上限
 MAX_NESTING_DEPTH = 5           # 最大嵌套深度
 
+# --- 语义一致性闸门 (论文核心组件之一) ---
+#
+# 论文摘要: "enforces semantic consistency across hypothesis, factor expression,
+# and executable code"。原实现 verify_consistency() 写好了却从未被调用，
+# consistency_ok 字段也从未赋值 —— 整道闸是死代码 (2026-09-02 修复)。
+#
+# 缺这道闸的后果与已记录的事故吻合: run_006/run_010 的 22 个因子样本内 +7.4%、
+# 样本外 -12.9%。假说与表达式对不上的因子只能靠样本内噪声取胜。
+CONSISTENCY_CHECK_ENABLED = True
+CONSISTENCY_MIN_SCORE = 0.7     # score >= 此值视为一致 (原硬编码 0.7)
+CONSISTENCY_MAX_REPAIR = 2      # 判定不一致后的定向重构次数 (论文 check_and_correct)
+# 验证本身失败(调用异常/输出无法解析)时是否拦截。
+# False = 放行但显式告警; True = 一律拦截。默认 False: 避免 LLM 偶发故障
+# 卡死整条挖掘流水线，但绝不把"没验成"伪装成"验过了"。
+CONSISTENCY_STRICT = False
+
 # --- 因子池准入 (论文 Section 4.3) ---
 REDUNDANCY_CORR = 0.7           # 相关系数阈值
 AST_SIMILARITY = 0.8            # AST 同构相似度阈值
+
+# 数值相关性准入闸门 (2026-09-03 接线)
+# 此前 FactorPool.add() 只做 AST 相似度，check_corr_redundancy() 写好却从未被调用，
+# 论文用来抑制因子拥挤的核心规则形同虚设。
+CORR_CHECK_ENABLED = True
+# 检查跑不起来时是否拒绝准入。False = 放行但显式告警; True = 一律拒绝。
+# 默认 False 以免 qlib 未初始化时卡死整条挖掘流水线，但绝不静默当成"检查通过"。
+CORR_CHECK_STRICT = False
 POOL_CAP_RATIO = 0.50           # 池容量 = min(total * ratio, POOL_MAX)
 POOL_MAX = 200                  # 池容量硬上限
 
@@ -37,9 +61,18 @@ POOL_MAX = 200                  # 池容量硬上限
 QUALITY_MIN_ABS_ICIR = 0.4      # 略低于 evaluator "promising" 门槛 (0.5), LightGBM 可学方向
 QUALITY_MIN_ABS_RANK_IC = 0.02  # 过滤纯噪声因子
 
-# --- 回测参数 (论文 Table 5) ---
-TOPK = 50
-N_DROP = 5
+# --- 回测参数 ---
+# ⚠ 这两个常量【实际未生效】(2026-09-03 核实)。
+# eval_agent 走的是 run_rolling_benchmark.run_backtest，用的是那边从
+# signal_config.yaml 读来的生产参数 (当前 topk=8 / n_drop=2)。
+#
+# 保留论文值仅作参考。挖掘的评估口径必须与生产一致 —— 用 TopK 50 评出来的
+# 因子，在生产的 TopK 8 上未必有增量。若哪天真要按论文口径评估，
+# 需显式传参给 run_backtest，而不是改这里(改了也不生效)。
+PAPER_TOPK = 50      # 论文 Table 5 值，仅存档
+PAPER_N_DROP = 5
+TOPK = PAPER_TOPK    # 向后兼容: eval_agent 仍 import 这两个名字
+N_DROP = PAPER_N_DROP
 
 # --- 时间区间 (论文 Table 5/7, 与 Exp 012 一致) ---
 TRAIN_START = '2016-01-01'

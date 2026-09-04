@@ -39,7 +39,7 @@ def get_index_stocks(index_code: str = 'sh.000300', use_cache: bool = True) -> l
 
     # 检查缓存
     if use_cache and cache_file.exists():
-        with open(cache_file, 'r') as f:
+        with open(cache_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
             cache_date = datetime.fromisoformat(data['date'])
             if (datetime.now() - cache_date).days < CACHE_DAYS:
@@ -75,7 +75,7 @@ def get_index_stocks(index_code: str = 'sh.000300', use_cache: bool = True) -> l
 
     # 保存缓存
     if stocks:
-        with open(cache_file, 'w') as f:
+        with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump({
                 'date': datetime.now().isoformat(),
                 'index': index_code,

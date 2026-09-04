@@ -319,10 +319,12 @@ class NewsSentinel:
                 '--print',
                 '--dangerously-skip-permissions',
                 '--output-format', 'text',
-                '-p', prompt
             ]
+            # prompt 走 stdin: Windows 上 CLAUDE_BIN 解析到 claude.CMD (批处理)，
+            # argv 里的换行会截断命令行，多行 prompt 只有第一行送达。
             result = subprocess.run(
                 cmd,
+                input=prompt,
                 capture_output=True, text=True,
                 timeout=120,
                 cwd=str(PROJECT_DIR)

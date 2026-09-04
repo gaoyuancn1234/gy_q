@@ -61,7 +61,7 @@ def run_one(preset, model_name):
 
         # 保存
         out_path = RESULTS_DIR / f"{preset}_{model_name.lower()}.json"
-        with open(out_path, 'w') as f:
+        with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(bt_result, f, indent=2)
         print(f"  保存至: {out_path}")
 
@@ -87,7 +87,7 @@ def main():
         out_path = RESULTS_DIR / f"{preset}_{model.lower()}.json"
         if out_path.exists():
             print(f"\n[跳过] {key} — 已有结果")
-            with open(out_path) as f:
+            with open(out_path, encoding='utf-8') as f:
                 results[key] = json.load(f)
             continue
         results[key] = run_one(preset, model)
@@ -97,7 +97,7 @@ def main():
         for model in ["lightgbm", "xgboost"]:
             path = RESULTS_DIR / f"{preset}_{model}.json"
             if path.exists():
-                with open(path) as f:
+                with open(path, encoding='utf-8') as f:
                     results[f"{preset}_{model.title()}"] = json.load(f)
 
     # 打印对比表

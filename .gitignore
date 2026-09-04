@@ -74,3 +74,7 @@ shanghai_realestate_analysis.py
 shanghai_realestate_ranking.csv
 smart_bot.log
 test_*.py
+
+# 配置备份 (改参数前的快照，本地留存即可)
+*.bak_*
+*.rejected_*

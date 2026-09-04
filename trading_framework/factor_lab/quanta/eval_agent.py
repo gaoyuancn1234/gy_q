@@ -308,10 +308,10 @@ def generate_llm_feedback(traj: Trajectory, sota_entry: Optional[TraceEntry],
             CLAUDE_CLI,
             '--print', '--dangerously-skip-permissions',
             '--output-format', 'text',
-            '-p', prompt,
         ]
+        # prompt 走 stdin (Windows .cmd 包装器按换行截断 argv, 见 llm_backend._invoke)
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, input=prompt, capture_output=True, text=True,
             timeout=CLAUDE_TIMEOUT, cwd=str(work_dir),
             env=get_claude_env(),
         )
@@ -723,7 +723,9 @@ def _run_rolling_eval_lite(all_factors: list[tuple[str, str]]) -> dict:
         if combined_pred.index.duplicated().any():
             combined_pred = combined_pred[~combined_pred.index.duplicated(keep='last')]
 
-        # 回测: 使用 rolling benchmark 的 run_backtest (TopK=12, N_DROP=3)
+        # 回测: 使用 rolling benchmark 的 run_backtest —— 参数来自
+        # signal_config.yaml (当前 topk=8 / n_drop=2)，与生产一致。
+        # 注意本模块 import 的 TOPK/N_DROP (论文值 50/5) 在这条路径上不生效。
         bt = run_backtest(combined_pred)
 
         elapsed = time.time() - t0

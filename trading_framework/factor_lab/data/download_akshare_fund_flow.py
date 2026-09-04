@@ -37,7 +37,7 @@ def get_csi300_instruments() -> list[str]:
     """从 Qlib instruments 文件获取 CSI300 成分股"""
     inst_file = Path(QLIB_DIR).expanduser() / "instruments" / "csi300.txt"
     instruments = []
-    with open(inst_file) as f:
+    with open(inst_file, encoding='utf-8') as f:
         for line in f:
             parts = line.strip().split("\t")
             if parts:

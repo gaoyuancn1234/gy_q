@@ -13,6 +13,7 @@ from factor_lab.utils import atomic_json_dump
 
 from .config import (
     REDUNDANCY_CORR, AST_SIMILARITY, POOL_CAP_RATIO, POOL_MAX,
+    CORR_CHECK_ENABLED, CORR_CHECK_STRICT,
     QUALITY_MIN_ABS_ICIR, QUALITY_MIN_ABS_RANK_IC,
     REPLACE_IC_MIN, REPLACE_RATIO,
 )
@@ -72,11 +73,30 @@ class FactorPool:
         if name in existing_names:
             return False, f"名字重复: {name}"
 
-        # 检查相关性冗余 (需要 Qlib, 这里用 AST 相似度近似)
+        # 结构去重: AST 同构
         for existing in self._factors:
             sim = ast_similarity(expr, existing.expr)
             if sim >= AST_SIMILARITY:
                 return False, f"AST 相似度过高 ({sim:.2f} >= {AST_SIMILARITY}) vs {existing.name}"
+
+        # 数值去重: 与池中因子的截面相关性 (论文 Section 4.3 的核心准入规则)
+        #
+        # AST 只能捕捉结构相似，捕捉不到"写法不同但数值几乎一样"的因子 ——
+        # 后者才是因子拥挤的主要来源，也是 run_006/run_010 那 22 个因子
+        # 样本内 +7.4% / 样本外 -12.9% 的机制。
+        if CORR_CHECK_ENABLED and self._factors:
+            try:
+                is_red, max_corr, most_sim = self.check_corr_redundancy(expr)
+            except RuntimeError as e:
+                # 检查跑不起来时不能默认放行 —— 那等于这道闸不存在。
+                if CORR_CHECK_STRICT:
+                    return False, f"{e} (strict 模式拒绝准入)"
+                print(f"  [factor_pool] ⚠ {e}; 非严格模式放行 {name}，"
+                      f"该因子未经数值冗余检查")
+            else:
+                if is_red:
+                    return False, (f"与池中因子相关性过高 ({max_corr:.2f} >= "
+                                   f"{REDUNDANCY_CORR}) vs {most_sim}")
 
         # 容量控制: 如果已满, 需要比最差的好
         if self.size >= self.capacity:
@@ -156,27 +176,40 @@ class FactorPool:
         return True
 
     def check_corr_redundancy(self, expr: str) -> tuple[bool, float, str]:
-        """检查与池中因子的 Qlib 相关性 (需要 qlib.init)
+        """检查与【池中已有因子】的数值相关性 (需要 qlib.init)
+
+        论文 Section 4.3 的准入规则: 与池中每个因子的相关性绝对值都低于
+        REDUNDANCY_CORR 才准入。这是抑制因子拥挤的核心闸门。
+
+        2026-09-03 修复了三处:
+          1. 从未被调用 —— add() 只做 AST 相似度，注释写着"用 AST 相似度近似"。
+             AST 只看表达式结构，结构不同但数值高度相关的因子照样进池。
+          2. 比对对象错了 —— 原先比 baseline_preset (alpha158_val 基线因子)，
+             而规则要求比的是池中成员。
+          3. 异常时返回"不冗余"(fail-open) —— 检查失败却当成通过。
+             现改为抛出，由 add() 决定如何处置，绝不把"没检查成"伪装成"检查通过"。
 
         Returns:
             (is_redundant, max_corr, most_similar_name)
+        Raises:
+            RuntimeError: 相关性无法计算时 (qlib 未初始化 / 表达式非法等)
         """
-        try:
-            from factor_lab.mining.evaluator import check_redundancy
-            new_factor = [("_new_check", expr)]
-            result = check_redundancy(
-                new_factor,
-                baseline_preset="alpha158_val",
-                threshold=REDUNDANCY_CORR,
-            )
-            info = result.get("_new_check", {})
-            is_red = info.get("is_redundant", False)
-            max_corr = info.get("max_corr", 0.0)
-            most_sim = info.get("most_correlated", "")
-            return is_red, max_corr, most_sim
-        except Exception as e:
-            print(f"  [factor_pool] 冗余检查失败: {e}")
+        from factor_lab.mining.evaluator import check_redundancy
+        pool_factors = [(f.name, f.expr) for f in self._factors]
+        if not pool_factors:
             return False, 0.0, ""
+        try:
+            result = check_redundancy(
+                [("_new_check", expr)],
+                threshold=REDUNDANCY_CORR,
+                baseline_factors=pool_factors,
+            )
+        except Exception as e:
+            raise RuntimeError(f"相关性冗余检查失败: {e}") from e
+        info = result.get("_new_check", {})
+        return (bool(info.get("is_redundant", False)),
+                float(info.get("max_corr", 0.0)),
+                str(info.get("most_correlated", "")))
 
     def rebuild(self):
         """按 |RankIC| 降序重建池"""
@@ -257,7 +290,7 @@ class FactorPool:
         path = self.save_dir / filename
         if not path.exists():
             return
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
         self._total_attempted = data.get("total_attempted", 0)
         import dataclasses

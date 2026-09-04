@@ -14,6 +14,13 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+# Windows 控制台默认非 UTF-8 编码（如 GBK），print 中文/emoji 会 UnicodeEncodeError 崩溃
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 WORK_DIR = Path(__file__).parent
 BOT_SCRIPT = WORK_DIR / "smart_bot.py"
 LOG_DIR = WORK_DIR / "logs"
@@ -38,7 +45,7 @@ class Daemon:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_msg = f"[{timestamp}] {msg}"
         print(log_msg)
-        with open(LOG_FILE, 'a') as f:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(log_msg + "\n")
 
     def start_bot(self):
@@ -46,10 +53,23 @@ class Daemon:
         self.log("启动机器人...")
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
+        # Windows 中文环境的 locale 编码是 cp936。子进程若按 locale 读写文本，
+        # 与用 -X utf8 启动的进程 (CLAUDE.md 里记录的命令都带该参数) 写出的文件
+        # 会互相读不了。代码里已逐处显式指定 encoding='utf-8'，这里再兜一层：
+        # 让子进程整体运行在 UTF-8 模式，避免遗漏处退化成 GBK。
+        env['PYTHONUTF8'] = '1'
+        # 保持日志文件句柄引用，避免泄漏；旧句柄在重启时关闭
+        if hasattr(self, '_log_fh') and self._log_fh:
+            try:
+                self._log_fh.close()
+            except OSError:
+                pass
+        self._log_fh = open(WORK_DIR / "logs" / "smart_bot.log", 'a',
+                            encoding='utf-8', errors='replace')
         self.bot_process = subprocess.Popen(
             [sys.executable, '-u', str(BOT_SCRIPT)],
             cwd=str(WORK_DIR),
-            stdout=open(WORK_DIR / "logs" / "smart_bot.log", 'a'),
+            stdout=self._log_fh,
             stderr=subprocess.STDOUT,
             env=env
         )
@@ -102,8 +122,8 @@ class Daemon:
             try:
                 self.bot_process.kill()
                 self.bot_process.wait(timeout=5)
-            except:
-                pass
+            except (OSError, subprocess.TimeoutExpired):
+                self.log(f"⚠ 清理旧进程失败 (PID: {self.bot_process.pid})")
 
         self.start_bot()
 
@@ -115,7 +135,7 @@ class Daemon:
             self.bot_process.terminate()
             try:
                 self.bot_process.wait(timeout=10)
-            except:
+            except subprocess.TimeoutExpired:
                 self.bot_process.kill()
         if PID_FILE.exists():
             PID_FILE.unlink()
@@ -124,7 +144,7 @@ class Daemon:
     def run(self):
         """主循环"""
         # 写入 PID
-        with open(PID_FILE, 'w') as f:
+        with open(PID_FILE, 'w', encoding='utf-8') as f:
             f.write(str(os.getpid()))
 
         # 注册信号处理
@@ -153,17 +173,39 @@ class Daemon:
                     self.log("💓 机器人运行正常")
 
 
+IS_WINDOWS = os.name == 'nt'
+
+
+def pid_alive(pid: int) -> bool:
+    """检查进程是否存活
+
+    不能用 os.kill(pid, 0)。Windows 上 os.kill 对非 CTRL_* 信号走的是
+    TerminateProcess —— 传 0 不是探测而是**真的杀掉进程**(退出码 0)，
+    进程已不存在时又抛 SystemError 包裹的 WinError 87 而非 ProcessLookupError。
+    原实现因此既会误杀正在运行的守护进程，也接不住异常。
+    """
+    if IS_WINDOWS:
+        result = subprocess.run(
+            ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+            capture_output=True, text=True, errors='replace'
+        )
+        return str(pid) in (result.stdout or "")
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     # 检查是否已有守护进程运行
     if PID_FILE.exists():
         old_pid = int(PID_FILE.read_text().strip())
-        try:
-            os.kill(old_pid, 0)  # 检查进程是否存在
+        if pid_alive(old_pid):
             print(f"守护进程已在运行 (PID: {old_pid})")
             print("如需重启，请先运行: python daemon.py stop")
             sys.exit(1)
-        except ProcessLookupError:
-            PID_FILE.unlink()  # 清理残留的 PID 文件
+        PID_FILE.unlink()  # 清理残留的 PID 文件
 
     daemon = Daemon()
     daemon.run()
@@ -176,20 +218,32 @@ def stop():
         return
 
     pid = int(PID_FILE.read_text().strip())
-    try:
+    if not pid_alive(pid):
+        print("守护进程已不存在")
+        PID_FILE.unlink(missing_ok=True)
+        return
+
+    if IS_WINDOWS:
+        # Windows 上 SIGTERM 即 TerminateProcess，signal_handler 不会执行，
+        # 子进程 smart_bot 会被遗留成孤儿并继续占用飞书 WebSocket 连接
+        # (导致重启后出现两个 bot 重复处理消息)。用 /T 连同子进程树一起终止。
+        subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                       capture_output=True, text=True, errors='replace')
+        print(f"已终止守护进程及其子进程 (PID: {pid})")
+    else:
         os.kill(pid, signal.SIGTERM)
         print(f"已发送停止信号到守护进程 (PID: {pid})")
-        # 等待进程结束
-        for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                time.sleep(0.5)
-            except ProcessLookupError:
-                print("守护进程已停止")
-                break
-    except ProcessLookupError:
-        print("守护进程已不存在")
-        PID_FILE.unlink()
+
+    for _ in range(10):
+        if not pid_alive(pid):
+            print("守护进程已停止")
+            break
+        time.sleep(0.5)
+    else:
+        print(f"⚠ 守护进程 {pid} 仍在运行，请手动检查")
+        return
+
+    PID_FILE.unlink(missing_ok=True)
 
 
 def status():
@@ -199,14 +253,18 @@ def status():
         return
 
     pid = int(PID_FILE.read_text().strip())
-    try:
-        os.kill(pid, 0)
-        print(f"守护进程运行中 (PID: {pid})")
-        # 查看最近日志
-        print("\n最近日志:")
-        os.system(f"tail -10 {LOG_FILE}")
-    except ProcessLookupError:
+    if not pid_alive(pid):
         print("守护进程已停止（PID文件残留）")
+        return
+
+    print(f"守护进程运行中 (PID: {pid})")
+    print("\n最近日志:")
+    try:
+        lines = LOG_FILE.read_text(encoding='utf-8', errors='replace').splitlines()
+        for line in lines[-10:]:
+            print(line)
+    except OSError as e:
+        print(f"(读取日志失败: {e})")
 
 
 if __name__ == "__main__":

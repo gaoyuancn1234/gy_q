@@ -34,6 +34,35 @@ TOPK_BY_REGIME = {
 }
 
 
+def cap_topk(topk: int, config: dict) -> int:
+    """按资金约束收敛 TopK — 信号生成器与模拟盘共用
+
+    2026-09-03 新增，2026-09-04 抽为模块级函数。
+    TOPK_BY_REGIME 是按 20 万资金标定的 (strong 12 / normal 16 / weak 20)，
+    与 signal_config 里的 topk 无关，且会静默覆盖它。10 万资金落到 normal 档
+    每仓仅 6250 元、weak 档 5000 元 —— 沪深300 里相当一部分股票一手就超过
+    这个数，那些仓位根本建不起来。
+
+    实测后果 (模拟盘回放，修复前): 持有 16 只而非配置的 8 只，
+    SH600460 只买到 100 股(3285 元)、SH601916 仅 1704 元，仓位碎到无意义。
+
+    最初只在 SignalGenerator 内部实现，模拟盘 (paper_trader) 直接用
+    TOPK_BY_REGIME 绕过了它 —— 同一规则写两处必然漏改，故抽出共用。
+
+    max_topk_by_capital 未配置时不做限制，保持原行为。
+    """
+    cap = (config or {}).get('max_topk_by_capital')
+    if not cap:
+        return topk
+    capped = min(topk, int(cap))
+    if capped != topk:
+        cash = (config or {}).get('initial_cash')
+        print(f"  [signal] TopK {topk} → {capped} "
+              f"(资金约束 max_topk_by_capital={cap}"
+              f"{f', 资金 {cash:,.0f}' if cash else ''})")
+    return capped
+
+
 class SignalGenerator:
     """封装 rolling 预测 → TopK 信号 pipeline"""
 
@@ -45,8 +74,12 @@ class SignalGenerator:
 
     def _load_config(self, config_path: str) -> dict:
         full_path = PROJECT_DIR / config_path
-        with open(full_path) as f:
+        with open(full_path, encoding='utf-8') as f:
             return yaml.safe_load(f)
+
+    def _cap_topk(self, topk: int) -> int:
+        """按资金约束收敛 TopK (实现见模块级 cap_topk)"""
+        return cap_topk(topk, self.config)
 
     # ── 数据加载 ──
 
@@ -97,7 +130,7 @@ class SignalGenerator:
         json_name = f"{cfg['rolling_config']}_{cfg['preset']}_{cfg['model']}.json"
         json_path = json_dir / json_name
 
-        with open(json_path) as f:
+        with open(json_path, encoding='utf-8') as f:
             self._rolling_info = json.load(f)
         return self._rolling_info
 
@@ -162,7 +195,7 @@ class SignalGenerator:
 
         # 获取 regime
         regime = self._get_regime(target_date)
-        effective_topk = TOPK_BY_REGIME[regime]
+        effective_topk = self._cap_topk(TOPK_BY_REGIME[regime])
 
         # 获取当日信号
         day_signal = signal.loc[target_date]
@@ -235,8 +268,10 @@ class SignalGenerator:
                 if w['pred_start'] <= target_date.strftime('%Y-%m-%d') <= w['pred_end']:
                     best_iter = w.get('best_iteration')
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            # 不能静默 pass: best_iter 保持 None 会让下面的判据被整条跳过，
+            # 健康检查少了一条却毫无痕迹 —— "检查失败"被当成"检查通过"。
+            issues.append(f"无法读取 best_iteration (健康检查第三条判据未生效): {e}")
         if best_iter is not None and best_iter < self.MIN_BEST_ITER:
             issues.append(f"模型早停轮数过低: best_iter={best_iter} "
                           f"(阈值 {self.MIN_BEST_ITER})，模型未学到有效模式")
@@ -275,17 +310,23 @@ class SignalGenerator:
         topk = sig['effective_topk']
         weight = 1.0 / topk
 
-        to_sell = []
-        for inst in current_set:
-            if inst not in target_set:
-                to_sell.append({'instrument': inst, 'reason': 'not_in_topk'})
+        # 显式排序: 直接迭代集合会因 Python 字符串哈希随机化导致同一输入
+        # 两次得到不同顺序。to_sell 的顺序会影响资金不足时先卖谁，
+        # 进而影响实际成交 —— CLAUDE.md 记录过同类事故(Sharpe 0.318 vs 0.247)。
+        # 按信号分数升序卖出(最差的先走)，与 rebalance_rules.select_sells 一致。
+        scores = sig.get('scores') or {}
+        to_sell = [
+            {'instrument': inst, 'reason': 'not_in_topk'}
+            for inst in sorted(current_set - target_set,
+                               key=lambda c: (scores.get(c, float('-inf')), c))
+        ]
 
         to_buy = []
-        for inst in sig['target_stocks']:
+        for inst in sig['target_stocks']:      # 已按分数降序，顺序确定
             if inst not in current_set:
                 to_buy.append({'instrument': inst, 'weight': round(weight, 4)})
 
-        to_hold = list(current_set & target_set)
+        to_hold = sorted(current_set & target_set)
 
         return {
             'date': sig['date'],

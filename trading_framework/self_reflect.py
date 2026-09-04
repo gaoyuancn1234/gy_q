@@ -492,10 +492,12 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
         '--print',
         '--dangerously-skip-permissions',
         '--output-format', 'text',
-        '-p', prompt
     ]
+    # prompt 走 stdin: Windows 上 CLAUDE_BIN 解析到 claude.CMD (批处理)，
+    # argv 里的换行会截断命令行，多行 prompt 只有第一行送达。
     result = subprocess.run(
         cmd,
+        input=prompt,
         capture_output=True, text=True,
         timeout=timeout,
         cwd=str(WORK_DIR),
@@ -514,9 +516,13 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
         if "auth" in combined or "token" in combined or "expired" in combined or "403" in combined or "401" in combined:
             print("  [reflect] 检测到认证错误，尝试刷新 OAuth token...")
             try:
+                # 不能用 shell 管道 f"echo '/exit' | {CLAUDE_BIN}":
+                # Windows 的 cmd.exe 不剥单引号，Claude 收到的是 "'/exit'" 而非
+                # "/exit"，刷新等于没做；CLAUDE_BIN 含空格时还会被拆断。
+                # 直接用 stdin 传，与本项目其他 CLI 调用一致。
                 subprocess.run(
-                    f"echo '/exit' | {CLAUDE_BIN}",
-                    shell=True, capture_output=True, timeout=30,
+                    [CLAUDE_BIN], input="/exit\n",
+                    capture_output=True, text=True, timeout=30,
                     env=_CLEAN_ENV
                 )
                 print("  [reflect] token 刷新完成，重试反思...")

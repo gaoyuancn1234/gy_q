@@ -2,7 +2,20 @@
 交易框架配置文件 - 优化版
 策略：严格择时 + 精选蓝筹
 回测：近6个月滚动3个月年化 > 6%
+
+注意: 策略参数(topk/n_drop/stop_loss/vol_target 等)的唯一来源是
+signal_config.yaml。本文件只做转发，不再另存一份 —— 两处各自维护必然分叉。
 """
+from pathlib import Path as _Path
+
+import yaml as _yaml
+
+_CFG_PATH = _Path(__file__).resolve().parent / "signal_config.yaml"
+try:
+    with open(_CFG_PATH, encoding="utf-8") as _f:
+        _SIGNAL_CFG = _yaml.safe_load(_f) or {}
+except OSError as _e:                     # 配置缺失时显式失败，不要静默用默认值
+    raise RuntimeError(f"读取 {_CFG_PATH} 失败: {_e}") from _e
 
 # ============ 策略引擎 ============
 # 'rs' = 相对强度轮动, 'qlib' = Qlib ML模型, 'ml' = ML信号(实盘)
@@ -11,7 +24,7 @@ STRATEGY_TYPE = 'ml'
 # ============ ML 实盘配置 (STRATEGY_TYPE='ml' 时生效) ============
 ML_CONFIG = {
     'signal_config': 'config/signal_config.yaml',
-    'live_capital': 200000,   # 2026-08-30: 10万 -> 20万 (与 signal_config.initial_cash 一致)
+    'live_capital': 100000,   # 2026-09-02: 20万 → 10万 (CSI 800 + 小资金实盘)
 }
 
 # ============ 因子实验室配置 ============
@@ -103,7 +116,10 @@ LOOKBACK_DAYS = 60       # 因子计算所需历史天数
 
 # ============ 交易配置 ============
 TRADE_FREQ = 'W'         # 交易频率: 'W'=周度
-TOP_K = 8                # 持仓股票数量（减少以提高质量）
+# TOP_K / STOP_LOSS 改为从 signal_config.yaml 读取 (2026-09-03)。
+# 原先两处各存一份，值碰巧一致但各自维护，迟早分叉 —— 这正是当日反复出问题的
+# 模式(TOPK/N_DROP 在回测器硬编码 12/3、配置写 8/2，回测报的不是实盘跑的策略)。
+TOP_K = int(_SIGNAL_CFG.get('topk', 8))          # 持仓股票数量
 POSITION_LIMIT = 0.15    # 单只股票最大仓位
 CASH_RESERVE = 0.05      # 现金保留比例
 PRED_THRESHOLD = 0.01    # 预测得分门槛（新增）
@@ -126,7 +142,7 @@ SLIPPAGE = 0.001         # 滑点估计
 
 # ============ 风控配置 ============
 MAX_DRAWDOWN = 0.10      # 最大回撤阈值（收紧）
-STOP_LOSS = 0.08         # 个股止损线
+STOP_LOSS = float(_SIGNAL_CFG.get('stop_loss', 0.08))   # 个股止损线 (读配置，同上)
 TAKE_PROFIT = 0.25       # 个股止盈线（收紧）
 INDUSTRY_LIMIT = 0.30    # 单一行业最大占比
 

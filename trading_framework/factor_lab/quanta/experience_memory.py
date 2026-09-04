@@ -311,7 +311,7 @@ class ExperienceMemory:
         path = self.save_dir / filename
         if not path.exists():
             return
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
         self._updated_at = data.get("updated_at", 0.0)
         self._success_patterns = [

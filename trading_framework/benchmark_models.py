@@ -431,7 +431,7 @@ def load_results():
     """加载已有结果（支持断点续跑）"""
     import json
     if RESULTS_FILE.exists():
-        with open(RESULTS_FILE) as f:
+        with open(RESULTS_FILE, encoding='utf-8') as f:
             return json.load(f)
     return {}
 
@@ -442,7 +442,7 @@ def save_result(name, result):
     RESULTS_DIR.mkdir(exist_ok=True)
     results = load_results()
     results[name] = result
-    with open(RESULTS_FILE, 'w') as f:
+    with open(RESULTS_FILE, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
 
@@ -549,7 +549,7 @@ def main():
         for k in error_keys:
             del existing[k]
         RESULTS_DIR.mkdir(exist_ok=True)
-        with open(RESULTS_FILE, 'w') as f:
+        with open(RESULTS_FILE, 'w', encoding='utf-8') as f:
             json.dump(existing, f, indent=2, ensure_ascii=False)
 
     print("=" * 80)

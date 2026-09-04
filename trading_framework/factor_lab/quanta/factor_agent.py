@@ -20,6 +20,8 @@ from .config import (
     MAX_FREE_PARAM_RATIO, MAX_NESTING_DEPTH, BASE_FEATURES,
     QLIB_OPERATORS, QLIB_CONSTRAINTS, MAX_REGEN_ATTEMPTS,
     REGEN_FEEDBACK_TMPL, get_claude_env,
+    CONSISTENCY_CHECK_ENABLED, CONSISTENCY_MIN_SCORE,
+    CONSISTENCY_MAX_REPAIR, CONSISTENCY_STRICT,
 )
 
 WORK_DIR = Path(__file__).resolve().parent.parent.parent.parent
@@ -70,7 +72,7 @@ def construct_factors_with_regen(hypothesis: dict, n: int = N_CANDIDATES,
                 continue
             return [], regen_count
 
-        # 检查每个候选的复杂度
+        # 逐个候选: 复杂度检查 -> 语义一致性闸门
         valid = []
         rejected_details = []
         for cand in candidates:
@@ -79,15 +81,21 @@ def construct_factors_with_regen(hypothesis: dict, n: int = N_CANDIDATES,
             all_tried_names.add(name)
 
             ok, reason = check_paper_complexity(expr)
-            if ok:
-                valid.append(cand)
-            else:
+            if not ok:
                 rejected_details.append(f"- {name}: {expr[:80]}... -> 拒绝原因: {reason}")
+                continue
+
+            accepted, reason = _gate_consistency(cand, hypothesis)
+            if accepted is None:
+                rejected_details.append(f"- {name}: {expr[:80]}... -> 拒绝原因: {reason}")
+                continue
+            all_tried_names.add(accepted.get('name', name))
+            valid.append(accepted)
 
         if valid:
             # 有通过的候选
             if rejected_details:
-                print(f"  [regen] {len(valid)}/{len(candidates)} 通过复杂度检查")
+                print(f"  [regen] {len(valid)}/{len(candidates)} 通过复杂度+一致性检查")
             return valid, regen_count
 
         # 全部被拒 -> 累积反馈后重试
@@ -103,6 +111,60 @@ def construct_factors_with_regen(hypothesis: dict, n: int = N_CANDIDATES,
             print(f"  [regen] 达到最大重试次数 ({max_regen}), 返回空列表")
 
     return [], regen_count
+
+
+def _gate_consistency(cand: dict, hypothesis: dict) -> tuple[dict | None, str]:
+    """语义一致性闸门 (对齐论文 FactorConsistencyChecker.check_and_correct)
+
+    判定不一致时先做定向重构 (reconstruct_factor)，重构结果需同时通过复杂度
+    与一致性检查才接受; 重构耗尽仍不一致则拒绝，交由外层再生循环处理。
+
+    候选会被标注 consistency_ok / consistency_feedback 供 Trajectory 记录。
+
+    Returns:
+        (accepted_candidate, reason) — accepted 为 None 表示拒绝，reason 说明原因
+    """
+    if not CONSISTENCY_CHECK_ENABLED:
+        cand['consistency_ok'] = None
+        cand['consistency_feedback'] = "一致性检查已关闭"
+        return cand, ""
+
+    hyp_text = hypothesis.get('hypothesis', '')
+    current = cand
+
+    for repair in range(CONSISTENCY_MAX_REPAIR + 1):
+        verdict, feedback = verify_consistency(
+            hyp_text, current.get('description', ''), current.get('expr', ''))
+
+        if verdict is True:
+            current['consistency_ok'] = True
+            current['consistency_feedback'] = feedback
+            if repair:
+                print(f"  [一致性] {current.get('name','')} 第 {repair} 次重构后通过")
+            return current, ""
+
+        if verdict is None:
+            # 未能验证: 绝不伪装成通过
+            if CONSISTENCY_STRICT:
+                return None, f"一致性未能验证 (strict): {feedback}"
+            print(f"  [一致性] ⚠ {current.get('name','')} 未能验证，按非严格模式放行: {feedback}")
+            current['consistency_ok'] = None
+            current['consistency_feedback'] = feedback
+            return current, ""
+
+        # verdict is False -> 定向重构
+        if repair >= CONSISTENCY_MAX_REPAIR:
+            return None, f"假说与表达式语义不一致 (已重构 {repair} 次): {feedback}"
+
+        print(f"  [一致性] {current.get('name','')} 不一致，第 {repair+1} 次定向重构")
+        repaired = reconstruct_factor(hypothesis, feedback,
+                                      failed_expr=current.get('expr', ''))
+        repaired = [r for r in repaired if check_paper_complexity(r.get('expr', ''))[0]]
+        if not repaired:
+            return None, f"语义不一致且重构未产出合法表达式: {feedback}"
+        current = repaired[0]
+
+    return None, "一致性闸门未得出结论"
 
 
 def _construct_with_context(hypothesis: dict, n: int,
@@ -174,8 +236,19 @@ def construct_factors(hypothesis: dict, n: int = N_CANDIDATES) -> list[dict]:
     return _construct_with_context(hypothesis, n)
 
 
-def verify_consistency(hypothesis: str, description: str, expr: str) -> tuple[bool, str]:
-    """一致性验证: 假说 <-> 描述 <-> 表达式是否语义对齐"""
+def verify_consistency(hypothesis: str, description: str, expr: str
+                       ) -> tuple[bool | None, str]:
+    """一致性验证: 假说 <-> 描述 <-> 表达式是否语义对齐
+
+    对应论文四大组件之一 (enforces semantic consistency across hypothesis,
+    factor expression, and executable code)，用于抑制"假说说的是动量、表达式
+    其实在算别的"这类因子进入池子 —— 它们靠样本内噪声取胜，样本外必然崩。
+
+    返回 (verdict, feedback):
+      True  = 一致
+      False = 不一致，应拒绝并重构
+      None  = 未能验证 (调用/解析失败)，由调用方按 CONSISTENCY_STRICT 决定
+    """
     prompt = f"""你是一位量化因子审核员。请验证以下三者之间的一致性:
 
 ## 投资假说
@@ -207,10 +280,10 @@ def verify_consistency(hypothesis: str, description: str, expr: str) -> tuple[bo
             CLAUDE_CLI,
             '--print', '--dangerously-skip-permissions',
             '--output-format', 'text',
-            '-p', prompt,
         ]
+        # prompt 走 stdin (Windows .cmd 包装器按换行截断 argv, 见 llm_backend._invoke)
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, input=prompt, capture_output=True, text=True,
             timeout=CLAUDE_TIMEOUT, cwd=str(WORK_DIR),
             env=get_claude_env(),
         )
@@ -226,11 +299,13 @@ def verify_consistency(hypothesis: str, description: str, expr: str) -> tuple[bo
                 feedback += f", issues: {'; '.join(issues[:3])}"
             if suggestion:
                 feedback += f", suggestion: {suggestion}"
-            return is_ok or score >= 0.7, feedback
-        return True, "unable to parse verification"
+            return bool(is_ok or score >= CONSISTENCY_MIN_SCORE), feedback
+        # 无法解析 != 通过。返回 None 表示"未能验证"，由调用方决定放行还是拦截，
+        # 不再伪装成 True —— 那会让这道闸在解析失败时静默失效。
+        return None, "无法解析验证输出"
     except Exception as e:
-        print(f"  [factor_agent] 一致性验证失败: {e}")
-        return True, f"verification error: {e}"
+        print(f"  [factor_agent] 一致性验证异常: {e}")
+        return None, f"验证异常: {e}"
 
 
 def check_paper_complexity(expr: str) -> tuple[bool, str]:
@@ -319,10 +394,12 @@ def _call_claude_factors(prompt: str) -> list[dict]:
                 CLAUDE_CLI,
                 '--print', '--dangerously-skip-permissions',
                 '--output-format', 'text',
-                '-p', prompt,
             ]
+            # prompt 走 stdin。原先作为 argv 传递，在 Windows 上被 .cmd 包装器
+            # 按第一个换行截断 —— Claude 只收到 "请将以下投资假说转化为 N 个
+            # Qlib 表达式。"，假说/算子表/约束/输出格式全部丢失。
             result = subprocess.run(
-                cmd, capture_output=True, text=True,
+                cmd, input=prompt, capture_output=True, text=True,
                 timeout=CLAUDE_TIMEOUT, cwd=str(WORK_DIR),
                 env=get_claude_env(),
             )

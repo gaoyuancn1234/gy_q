@@ -45,7 +45,7 @@ def load_diverse_factors() -> list[tuple[str, str]]:
     """从 run_011.json 加载原始 20 因子"""
     import json
     run_file = PROJECT_DIR / "factor_lab" / "mining_results" / "runs" / "run_011.json"
-    with open(run_file) as f:
+    with open(run_file, encoding='utf-8') as f:
         data = json.load(f)
     factors = [(f['name'], f['expr']) for f in data['non_redundant']]
     print(f"  run_011 因子: {len(factors)} 个")
@@ -350,7 +350,7 @@ def main():
     # 加载已有结果
     results = {}
     if result_file.exists() and not args.force:
-        with open(result_file) as f:
+        with open(result_file, encoding='utf-8') as f:
             results = json.load(f)
 
     # 强制模式: 清除 C/D 旧结果
@@ -361,7 +361,7 @@ def main():
     # 填充 A, B 从已有实验结果
     gated_file = PROJECT_DIR / "factor_lab" / "results" / "gated" / "gated_benchmark.json"
     if gated_file.exists():
-        with open(gated_file) as f:
+        with open(gated_file, encoding='utf-8') as f:
             gated = json.load(f)
         if 'baseline' in gated:
             results['A'] = gated['baseline']
@@ -390,7 +390,7 @@ def main():
     if not args.skip_lgb:
         if 'C' not in results:
             results['C'] = run_diverse_lgb(diverse_factors)
-            with open(result_file, 'w') as f:
+            with open(result_file, 'w', encoding='utf-8') as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
         else:
             print(f"\n  [跳过] C) diverse+LGB 已有结果: Sharpe={results['C']['sharpe']:.3f}")
@@ -400,7 +400,7 @@ def main():
         print(f"\n  [跳过] D) diverse+gate_mlp (--skip-gate)")
     elif 'D' not in results:
         results['D'] = run_diverse_gate_mlp(diverse_factors)
-        with open(result_file, 'w') as f:
+        with open(result_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
     else:
         print(f"\n  [跳过] D) diverse+gate_mlp 已有结果: Sharpe={results['D']['sharpe']:.3f}")

@@ -54,10 +54,17 @@ def refresh_data(end_date: str = None):
     from qlib_engine.data_setup import setup_qlib_data
     if end_date is None:
         end_date = date.today().strftime('%Y-%m-%d')
-    print(f"  数据截止日期: {end_date}")
+
+    # 从 signal_config 读取 universe 和数据目录
+    with open(CONFIG_FILE, encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    universe = cfg.get('instruments', 'csi300')
+    data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if universe == 'csi300' else universe}"
+
+    print(f"  数据截止日期: {end_date}  universe: {universe}")
 
     t0 = time.time()
-    setup_qlib_data(end_date=end_date)
+    setup_qlib_data(target_dir=data_dir, end_date=end_date, universe=universe)
     print(f"  数据刷新完成 ({time.time() - t0:.0f}s)")
 
 
@@ -72,6 +79,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
 
     from factor_lab.run_rolling_benchmark import (
         generate_rolling_windows, build_model, ROLLING_CONFIGS,
+        train_window,
     )
 
     config = ROLLING_CONFIGS[CONFIG_NAME]
@@ -91,7 +99,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
         print("  无已有预测，将全量训练")
 
     if json_path.exists():
-        with open(json_path) as f:
+        with open(json_path, encoding='utf-8') as f:
             old_json = json.load(f)
         old_windows = old_json.get('windows', [])
     else:
@@ -132,7 +140,11 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
     # 初始化 Qlib
     import qlib
     from qlib.data.dataset import DatasetH
-    qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region='cn')
+    with open(CONFIG_FILE, encoding='utf-8') as _f:
+        _cfg = yaml.safe_load(_f)
+    _universe = _cfg.get('instruments', 'csi300')
+    _data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if _universe == 'csi300' else _universe}"
+    qlib.init(provider_uri=_data_dir, region='cn')
 
     new_preds = []
     new_window_details = []
@@ -166,7 +178,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
                 end_time=w['pred_end'],
                 fit_start_time=w['train_start'],
                 fit_end_time=w['train_end'],
-                instruments='csi300',
+                instruments=_universe,
             )
         else:
             from factor_lab.factors.presets import build_handler
@@ -176,6 +188,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
                 end_time=w['pred_end'],
                 fit_start_time=w['train_start'],
                 fit_end_time=w['train_end'],
+                instruments=_universe,
             )
 
         dataset = DatasetH(handler=handler, segments={
@@ -184,10 +197,12 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
             "test": (w['pred_start'], w['pred_end']),
         })
 
-        model, fit_kwargs = build_model(MODEL_NAME)
-        model.fit(dataset, **fit_kwargs)
-
-        pred = model.predict(dataset)
+        # 与 run_rolling_benchmark 共用同一训练函数 (退化兜底 + 多种子集成)
+        pred, _guard_best, _used_fb, _n_models = train_window(
+            dataset, MODEL_NAME,
+            prev_best_iters=([x.get('best_iteration') for x in old_windows]
+                             + [d.get('best_iteration') for d in new_window_details]),
+        )
         if isinstance(pred.index, pd.MultiIndex):
             dates = pred.index.get_level_values(0)
             mask = (dates >= pd.Timestamp(w['pred_start'])) & \
@@ -196,7 +211,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
 
         elapsed = time.time() - t0
 
-        best_iter = getattr(model.model, 'best_iteration', None)
+        best_iter = _guard_best
         detail = {
             "window_num": wnum,
             "train_start": w['train_start'],
@@ -205,6 +220,8 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
             "pred_end": w['pred_end'],
             "n_samples": int(len(pred)),
             "best_iteration": best_iter,
+            "fallback_rounds": bool(_used_fb),   # 该窗口是否走了退化兜底
+            "n_models": _n_models,               # 集成的模型数
             "train_time": round(elapsed, 1),
         }
         new_window_details.append(detail)
@@ -212,7 +229,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
 
         print(f"    Best iter: {best_iter}, Samples: {len(pred)}, Time: {elapsed:.1f}s")
 
-        del handler, dataset, model, pred
+        del handler, dataset, pred
         gc.collect()
 
     # 合并 old + new
@@ -242,7 +259,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
         "windows": all_window_details,
         "timestamp": pd.Timestamp.now().isoformat(),
     }
-    with open(json_path, 'w') as f:
+    with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     print(f"  JSON 已更新: {json_path.name}")
 
@@ -297,23 +314,42 @@ def update_signal_config(new_test_end: str):
     print("Step 4: 更新 signal_config.yaml")
     print("=" * 60)
 
-    with open(CONFIG_FILE) as f:
+    with open(CONFIG_FILE, encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     old_end = config.get('test_end', '')
-    config['test_end'] = new_test_end
-
-    # 更新重训版本号
     from datetime import datetime as _dt
     new_retrain = _dt.now().strftime('%Y-%m')
     old_retrain = config.get('last_retrain', '')
-    config['last_retrain'] = new_retrain
 
-    with open(CONFIG_FILE, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+    # 定点替换，不用 yaml.dump 整文件重写。
+    #
+    # 2026-09-03 修复: 原实现 yaml.safe_load -> yaml.dump，PyYAML 不保留注释，
+    # 每次重训都会把整个配置文件的注释清空。被抹掉的正是参数选择依据 ——
+    # vol_target 6/8/10/12% 的三段对比表、n_drop 对比表、调仓频率实测数据，
+    # 以及股票池选择的理由。CLAUDE.md 明确要求保留这些依据(单段最优的结论
+    # 默认按噪声处理)，丢了之后只剩裸数值，后人无从判断参数为何如此。
+    _set_yaml_scalar(CONFIG_FILE, 'test_end', f"'{new_test_end}'")
+    _set_yaml_scalar(CONFIG_FILE, 'last_retrain', new_retrain)
 
     print(f"  test_end: {old_end} → {new_test_end}")
     print(f"  last_retrain: {old_retrain} → {new_retrain}")
+
+
+def _set_yaml_scalar(path, key: str, value: str):
+    """只替换顶层标量键的值，保留注释与其余排版
+
+    仅匹配行首(无缩进)的 `key:`，避免误改嵌套结构里的同名键。
+    """
+    import re
+    text = Path(path).read_text(encoding='utf-8')
+    pattern = re.compile(rf'^({re.escape(key)}:)[^\n]*$', re.MULTILINE)
+    new_text, n = pattern.subn(rf'\g<1> {value}', text)
+    if n != 1:
+        raise RuntimeError(
+            f"更新 {path} 的 {key} 失败: 匹配到 {n} 处(期望 1 处)。"
+            f"配置结构可能已变，请人工检查后再重训。")
+    Path(path).write_text(new_text, encoding='utf-8')
 
 
 def validate(new_test_end: str):
@@ -343,7 +379,67 @@ def validate(new_test_end: str):
     else:
         print(f"  信号错误: {latest['error']}")
 
-    print("\n  验证通过!")
+    degraded = check_window_health()
+    if degraded:
+        print("\n  ⚠ 验证完成，但存在退化窗口 —— 见上方告警")
+    else:
+        print("\n  验证通过!")
+    return degraded
+
+
+# 低于此轮数视为模型未学到东西 (与 daily_runner 的信号健康检查一致)
+MIN_BEST_ITERATION = 20
+
+
+def check_window_health() -> list:
+    """检查各滚动窗口的 best_iteration，识别"训练了但什么都没学到"的窗口
+
+    2026-09-03 新增。原 validate() 只验证信号能否生成，不看模型是否真的学到
+    东西 —— 一个 best_iteration=1 的模型(只有一棵树)照样能产出"信号"，
+    分数却几乎没有区分度，TopK 里会出现大量并列同分，等于把随机名单当交易信号。
+    CLAUDE.md 记录过同款事故(best_iter=3，300 只股票只剩 123 个不同分数)。
+
+    最新窗口尤其关键: 它驱动的是当前实盘信号。
+
+    Returns:
+        退化窗口的 window_num 列表 (最新窗口退化时排在最前并单独告警)
+    """
+    json_path = (RESULTS_DIR /
+                 f"{CONFIG_NAME}_{PRESET}_{MODEL_NAME}.json")
+    if not json_path.exists():
+        print(f"\n  ⚠ 找不到 {json_path.name}，跳过窗口健康检查")
+        return []
+
+    with open(json_path, encoding='utf-8') as f:
+        windows = json.load(f).get('windows', [])
+    if not windows:
+        return []
+
+    degraded = [w for w in windows
+                if w.get('best_iteration') is not None
+                and w['best_iteration'] < MIN_BEST_ITERATION]
+    if not degraded:
+        print(f"\n  ✓ 窗口健康检查: {len(windows)} 个窗口 best_iteration 均 "
+              f">= {MIN_BEST_ITERATION}")
+        return []
+
+    print(f"\n  {'=' * 56}")
+    print(f"  ⚠ 窗口健康告警: {len(degraded)}/{len(windows)} 个窗口疑似未学到有效信号")
+    print(f"  {'=' * 56}")
+    for w in degraded:
+        print(f"    W{w['window_num']:2} {w['pred_start']} ~ {w['pred_end']}: "
+              f"best_iteration={w['best_iteration']} (< {MIN_BEST_ITERATION})")
+
+    latest = windows[-1]
+    if latest in degraded:
+        print()
+        print(f"  🔴 最新窗口 W{latest['window_num']} 已退化 —— "
+              f"当前实盘信号来自该窗口，其预测分数几乎没有区分度。")
+        print(f"     成因通常是验证期与训练期规律不一致(验证损失从第 1 轮起就上升)，")
+        print(f"     模型正确地拒绝学习。这不是代码 bug，但该信号不可用于交易。")
+        print(f"     处理前请勿据此调仓。")
+
+    return [w['window_num'] for w in degraded]
 
 
 def main():

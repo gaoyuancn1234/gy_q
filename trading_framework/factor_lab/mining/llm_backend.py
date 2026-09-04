@@ -176,15 +176,16 @@ class LLMBackend:
             return self._invoke_file_mode(provider, prompt, env, work_dir)
 
         # stdout 模式 (claude / gemini)
-        cmd = list(provider.cli_args)
-        if provider.prompt_flag:
-            cmd = [provider.cli_path] + cmd + [provider.prompt_flag, prompt]
-        else:
-            # positional prompt (如某些 CLI)
-            cmd = [provider.cli_path] + cmd + [prompt]
+        #
+        # prompt 走 stdin，不作为 argv 传递。Windows 上这些 CLI 都由 npm 安装为
+        # .cmd 批处理包装器，CreateProcess 经 cmd.exe 执行时 argv 里的换行符会
+        # 截断命令行 —— 多行 prompt 只有第一行送达，假说/算子表/约束/输出格式
+        # 全部丢失，LLM 收到的是残缺指令却照常返回内容，属于静默失败。
+        # stdin 是字节流，不经 cmd.exe 解析，同时规避 8191 字符命令行上限。
+        cmd = [provider.cli_path] + list(provider.cli_args)
 
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, input=prompt, capture_output=True, text=True,
             timeout=provider.timeout, cwd=str(work_dir), env=env,
         )
         if result.returncode != 0 and not result.stdout.strip():
@@ -202,17 +203,17 @@ class LLMBackend:
                                              delete=False, dir=str(MINING_DIR)) as tmp:
                 tmp_path = tmp.name
 
-            # codex exec ... -o tmpfile "prompt"
+            # codex exec ... -o tmpfile  (prompt 走 stdin，理由同 _invoke)
             cmd = ([provider.cli_path] + list(provider.cli_args)
-                   + ["-o", tmp_path, prompt])
+                   + ["-o", tmp_path])
 
             subprocess.run(
-                cmd, capture_output=True, text=True,
+                cmd, input=prompt, capture_output=True, text=True,
                 timeout=provider.timeout, cwd=str(work_dir), env=env,
             )
             # -o 写入的是干净的最终回复 (无 banner/thinking)
             if tmp_path and os.path.exists(tmp_path):
-                with open(tmp_path) as f:
+                with open(tmp_path, encoding='utf-8') as f:
                     content = f.read().strip()
                 if content:
                     return content

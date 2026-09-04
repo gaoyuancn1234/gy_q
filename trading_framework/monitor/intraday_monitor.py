@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_DIR / ".env", override=True)
 
 from config.settings import STOP_LOSS
+from market_calendar import is_trading_day as _is_trading_day
+from feishu_target import resolve_open_id as _resolve_open_id
 
 # 日志
 LOG_DIR = PROJECT_DIR / "logs"
@@ -240,7 +242,7 @@ def _get_model_version() -> str:
     config_file = PROJECT_DIR / "config" / "signal_config.yaml"
     try:
         import yaml
-        with open(config_file, 'r') as f:
+        with open(config_file, 'r', encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
         tag = cfg.get('model_tag', 'M01')
         retrain = cfg.get('last_retrain', '')  # '2026-02'
@@ -317,7 +319,7 @@ def push_feishu(message: str):
 
         app_id = os.environ.get("FEISHU_APP_ID_1", "")
         app_secret = os.environ.get("FEISHU_APP_SECRET_1", "")
-        user_id = os.environ.get("FEISHU_USER_OPEN_ID", "")
+        user_id = _resolve_open_id()
 
         if not all([app_id, app_secret, user_id]):
             log.error("飞书凭证未配置")
@@ -382,28 +384,14 @@ def save_monitor_state(state: dict):
 # ============ 交易日检查 ============
 
 def is_trading_day() -> bool:
-    """复用 daily_runner 的交易日逻辑"""
-    today = date.today()
-    if today.weekday() >= 5:
-        return False
-    try:
-        import baostock as bs
-        lg = bs.login()
-        try:
-            rs = bs.query_trade_dates(
-                start_date=today.strftime('%Y-%m-%d'),
-                end_date=today.strftime('%Y-%m-%d'),
-            )
-            while rs.next():
-                row = rs.get_row_data()
-                if row[1] == '1':
-                    return True
-            return False
-        finally:
-            bs.logout()
-    except Exception as e:
-        log.warning(f"交易日检查失败: {e}, 按工作日处理")
-        return today.weekday() < 5
+    """交易日判断 —— 与 daily_runner 共用 market_calendar
+
+    2026-09-04: 原实现调 baostock.login()(无超时)。实测一个 --once 实例从
+    09:35 卡到 11:05、烧掉 1394 秒 CPU 且没写出一行日志，后续每 5 分钟的
+    触发全部因"上一实例仍在运行"被拒绝(0x800710E0)。任务显示 Running，
+    实际整个上午都没监控。
+    """
+    return _is_trading_day()
 
 
 # ============ 主循环 ============

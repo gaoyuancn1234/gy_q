@@ -27,6 +27,14 @@ DEFAULT_TARGET_DIR = "~/.qlib/qlib_data/cn_data_bs"
 # 中小盘(中证500)出现ST的概率远高于沪深300，必须能在选股时排除。
 FIELDS = ["open", "close", "high", "low", "volume", "amount", "turn", "pctChg", "isST"]
 
+# factor: 复权因子 = 前复权价 / 原始价。
+# qlib 回测只有在 `$factor` 存在且无 NaN 时才应用 trade_unit(整手 100 股)；
+# 缺失时会回退到 adjusted_price 模式并警告 "trade unit 100 is not supported"，
+# 等于允许买零碎股 —— 对 10 万本金失真严重(TopK=20 每仓 5000 元，
+# 28% 的成分股一手就超过这个数，实盘根本建不了仓)。
+# 不写进 FIELDS 是为了不影响既有 handler 的因子列表，单独写 bin 文件。
+EXTRA_FIELDS = ["factor"]
+
 
 def _get_csi300_stocks() -> list:
     """获取沪深300成分股列表（baostock 格式 sh.600519）
@@ -126,6 +134,21 @@ def _get_index_membership(start_date: str, end_date: str,
     except OSError as e:
         print(f"[data_setup] 成分股缓存写入失败（不影响本次运行）: {e}")
 
+    return snapshots_to_intervals(snapshots)
+
+
+def snapshots_to_intervals(snapshots: dict) -> tuple:
+    """把 {日期: 成分股集合} 快照转成 (历史并集, 各股存续区间)
+
+    从 _get_index_membership 抽出，供其他数据源模块 (如 data_setup_sina)
+    复用同一套时点成分股逻辑 —— 这段决定了是否存在幸存者偏差，
+    必须只有一份实现。
+
+    Args:
+        snapshots: {'2024-01-31': {'sh.600000', ...}, ...}，baostock 格式代码
+    Returns:
+        (sorted(union), {instrument: [(start, end), ...]})
+    """
     if not snapshots:
         raise RuntimeError("成分股历史采样失败，未取到任何快照")
 
@@ -238,7 +261,7 @@ def _build_calendar(all_dates: list, target_dir: Path):
     cal_dir.mkdir(parents=True, exist_ok=True)
 
     sorted_dates = sorted(set(all_dates))
-    with open(cal_dir / "day.txt", "w") as f:
+    with open(cal_dir / "day.txt", "w", encoding='utf-8') as f:
         for d in sorted_dates:
             f.write(pd.Timestamp(d).strftime("%Y-%m-%d") + "\n")
 
@@ -280,9 +303,9 @@ def _build_instruments(stock_map: dict, target_dir: Path, intervals: dict = None
             if s <= e:
                 lines_csi300.append(f"{instrument}\t{s}\t{e}\n")
 
-    with open(inst_dir / "all.txt", "w") as f:
+    with open(inst_dir / "all.txt", "w", encoding='utf-8') as f:
         f.writelines(lines_all)
-    with open(inst_dir / f"{universe}.txt", "w") as f:
+    with open(inst_dir / f"{universe}.txt", "w", encoding='utf-8') as f:
         f.writelines(lines_csi300)
 
     mode = "时点成分股" if intervals is not None else "全区间(含幸存者偏差)"
@@ -312,15 +335,27 @@ def _build_features(stock_map: dict, calendar: list, target_dir: Path):
         end_idx = max(indices)
         length = end_idx - start_idx + 1
 
-        for field in FIELDS:
-            arr = np.full(length + 2, np.nan, dtype=np.float32)
+        # factor 只在数据源提供时写出 (baostock 源没有，新浪源有)
+        fields = list(FIELDS) + [f for f in EXTRA_FIELDS if f in df.columns]
+        for field in fields:
+            # Qlib bin 格式: 头部只有【一个】float32 (起始日历索引)，其后紧跟数据。
+            # 依据 qlib/data/storage/file_storage.py:
+            #   写: np.hstack([index, data_array]).astype("<f").tofile(fp)
+            #   读: fp.seek(4 * (i - storage_start_index) + 4)   <- 只跳 4 字节
+            #
+            # 2026-09-02 修复: 原实现写了【两个】头部 (start_idx 和 end_idx)，
+            # 数据从 +2 开始。qlib 只跳过 1 个，于是
+            #   - end_idx 被当成首个数据值 (表现为每个字段的最大值恰等于日历长度-1)
+            #   - 整条序列后移一个交易日 (某日读出的其实是前一交易日的值)
+            # 实测: SH600000 真值 08-28=9.00/08-31=9.16，错位前 qlib 在
+            # 08-31 读到 9.00、09-01 读到 9.16。旧的 cn_data_bs 同样受影响。
+            arr = np.full(length + 1, np.nan, dtype=np.float32)
             arr[0] = np.float32(start_idx)
-            arr[1] = np.float32(start_idx + length - 1)
 
             for _, row in df.iterrows():
                 d_str = row["date"].strftime("%Y-%m-%d")
                 if d_str in cal_index:
-                    pos = cal_index[d_str] - start_idx + 2
+                    pos = cal_index[d_str] - start_idx + 1
                     arr[pos] = np.float32(row[field])
 
             _write_bin_file(arr, inst_dir / f"{field.lower()}.day.bin")

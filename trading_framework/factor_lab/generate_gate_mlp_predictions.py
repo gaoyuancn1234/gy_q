@@ -123,7 +123,7 @@ def main():
         "total_time": round(time.time() - t_total, 1),
         "windows": window_details,
     }
-    with open(json_path, 'w') as f:
+    with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     # 生成 quality_score (复用 retrain_pipeline 逻辑)

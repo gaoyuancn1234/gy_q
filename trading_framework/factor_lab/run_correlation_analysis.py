@@ -124,7 +124,7 @@ def main():
     }
     import json
     result_path = RESULTS_DIR / "factor_selection_result.json"
-    with open(result_path, 'w') as f:
+    with open(result_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     print(f"\n筛选结果保存至: {result_path}")
 

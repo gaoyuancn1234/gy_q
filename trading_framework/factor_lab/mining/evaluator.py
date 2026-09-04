@@ -64,14 +64,18 @@ def check_redundancy(new_factors: list[tuple[str, str]],
                      threshold: float = 0.7,
                      start_time: str = "2025-01-01",
                      end_time: str = "2025-12-31",
+                     baseline_factors: list[tuple[str, str]] | None = None,
                      ) -> dict:
     """检测新因子 vs 已有因子的冗余性
 
     Args:
         new_factors: [(name, expr), ...]
-        baseline_preset: 已有因子预设
+        baseline_preset: 已有因子预设 (baseline_factors 为 None 时使用)
         threshold: 相关性阈值
         start_time, end_time: 计算相关性的区间
+        baseline_factors: 显式指定对照因子集，用于"与因子池已有成员比对"
+                          (论文 Section 4.3 的准入规则是 vs 池成员，不是 vs 预设)。
+                          给空列表表示无对照，直接判定不冗余。
 
     Returns:
         {name: {is_redundant, max_corr, most_correlated}}
@@ -79,11 +83,16 @@ def check_redundancy(new_factors: list[tuple[str, str]],
     from qlib.data import D
     from factor_lab.factors.presets import FACTOR_PRESETS
 
-    # 获取 baseline 因子
-    preset = FACTOR_PRESETS[baseline_preset]
-    extra = preset["extra_factors"]
-    if callable(extra):
-        extra = extra()
+    if baseline_factors is not None:
+        extra = baseline_factors
+        if not extra:                      # 池为空: 无可比对象
+            return {n: {"is_redundant": False, "max_corr": 0.0,
+                        "most_correlated": ""} for n, _ in new_factors}
+    else:
+        preset = FACTOR_PRESETS[baseline_preset]
+        extra = preset["extra_factors"]
+        if callable(extra):
+            extra = extra()
     baseline_names = [n for n, _ in extra]
     baseline_exprs = [e for _, e in extra]
 

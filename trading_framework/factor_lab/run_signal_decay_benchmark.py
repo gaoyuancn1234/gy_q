@@ -50,7 +50,7 @@ def _get_current_preset() -> str:
     import yaml
     config_path = PROJECT_DIR / "config" / "signal_config.yaml"
     try:
-        with open(config_path) as f:
+        with open(config_path, encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
         return cfg.get('preset', 'alpha158_val')
     except Exception:
@@ -83,7 +83,7 @@ def load_close_prices() -> pd.Series:
 
 def load_rolling_windows() -> list[dict]:
     """加载 rolling window 信息"""
-    with open(ROLLING_JSON) as f:
+    with open(ROLLING_JSON, encoding='utf-8') as f:
         data = json.load(f)
     return data['windows']
 
@@ -367,13 +367,14 @@ class AdaptiveBacktester:
                     if inst not in target_stocks:
                         pending_sells.add(inst)
 
-                # 规划买入
+                # 规划买入 — 按信号分数降序排列，保证确定性迭代顺序。
                 current_holds = set(positions.keys()) - pending_sells
-                to_buy = target_stocks - current_holds
+                to_buy = [i for i in day_signal.head(effective_topk).index
+                          if i not in current_holds]
                 if to_buy:
                     if cfg['signal_weight']:
                         # 策略 C: 按信号值分配权重, max 15%
-                        top_sig = day_signal.loc[list(to_buy)]
+                        top_sig = day_signal.loc[to_buy]
                         if len(top_sig) > 0 and top_sig.max() > top_sig.min():
                             top_sig = top_sig - top_sig.min() + 1e-8
                             raw_w = top_sig / top_sig.sum()
@@ -577,7 +578,7 @@ def save_results(analysis: dict, results: list[dict], window_df: pd.DataFrame):
     for r in results:
         rc = {k: v for k, v in r.items() if k != 'daily_values'}
         results_clean.append(rc)
-    with open(RESULTS_DIR / "backtest_results.json", 'w') as f:
+    with open(RESULTS_DIR / "backtest_results.json", 'w', encoding='utf-8') as f:
         json.dump(results_clean, f, indent=2, ensure_ascii=False, default=str)
     print(f"  回测结果: {RESULTS_DIR / 'backtest_results.json'}")
 
@@ -696,7 +697,7 @@ def main():
         # backtest-only mode
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         results_clean = [{k: v for k, v in r.items() if k != 'daily_values'} for r in results]
-        with open(RESULTS_DIR / "backtest_results.json", 'w') as f:
+        with open(RESULTS_DIR / "backtest_results.json", 'w', encoding='utf-8') as f:
             json.dump(results_clean, f, indent=2, ensure_ascii=False, default=str)
         if len(window_df) > 0:
             window_df.to_csv(RESULTS_DIR / "window_breakdown.csv", index=False)

@@ -82,7 +82,7 @@ class ShadowManager:
 
         # 拷贝 live config + 应用 overrides
         live_config_path = PROJECT_DIR / "config" / "signal_config.yaml"
-        with open(live_config_path) as f:
+        with open(live_config_path, encoding='utf-8') as f:
             config = yaml.safe_load(f)
         config.update(config_overrides)
 
@@ -100,7 +100,7 @@ class ShadowManager:
 
         # 保存 shadow config
         shadow_config_path = SHADOW_DIR / "configs" / f"{shadow_id}.yaml"
-        with open(shadow_config_path, 'w') as f:
+        with open(shadow_config_path, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
 
         # 注册
@@ -127,7 +127,7 @@ class ShadowManager:
             raise ValueError(f"Shadow {shadow_id} 不存在")
 
         shadow_config_path = PROJECT_DIR / cand['signal_config_path']
-        with open(shadow_config_path) as f:
+        with open(shadow_config_path, encoding='utf-8') as f:
             config = yaml.safe_load(f)
 
         preset = config.get('preset', 'alpha158_val')
@@ -160,7 +160,11 @@ class ShadowManager:
         # 避免重复 init — backtest_daily 后 QlibRecorder 已激活,
         # 再次 init 会导致 C.reset() 清除 _registered 然后 register() 异常
         if not _qlib_C.__dict__.get('_config', {}).get('_registered', False):
-            qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region='cn')
+            with open(PROJECT_DIR / "config" / "signal_config.yaml", encoding='utf-8') as _f:
+                _sc = yaml.safe_load(_f)
+            _univ = _sc.get('instruments', 'csi300')
+            _uri = f"~/.qlib/qlib_data/cn_data_{'bs' if _univ == 'csi300' else _univ}"
+            qlib.init(provider_uri=_uri, region='cn')
 
         preds = []
         window_details = []
@@ -380,10 +384,10 @@ class ShadowManager:
         print(f"  [shadow] 备份: {bak_path.name}")
 
         # 2. 更新 live config
-        with open(live_config_path) as f:
+        with open(live_config_path, encoding='utf-8') as f:
             config = yaml.safe_load(f)
         config.update(cand.get('config_overrides', {}))
-        with open(live_config_path, 'w') as f:
+        with open(live_config_path, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
         print(f"  [shadow] 已更新 signal_config.yaml")
 
@@ -417,7 +421,7 @@ class ShadowManager:
             reverse_id = _next_shadow_id(self.registry)
 
             # 从备份读取旧基线 config
-            with open(bak_config_path) as f:
+            with open(bak_config_path, encoding='utf-8') as f:
                 old_config = yaml.safe_load(f)
 
             # 独立 state 目录
@@ -435,7 +439,7 @@ class ShadowManager:
             # 保存 shadow config
             reverse_config_path = (SHADOW_DIR / "configs" /
                                    f"{reverse_id}.yaml")
-            with open(reverse_config_path, 'w') as f:
+            with open(reverse_config_path, 'w', encoding='utf-8') as f:
                 yaml.dump(old_config, f, default_flow_style=False,
                           allow_unicode=True)
 
@@ -546,14 +550,14 @@ class ShadowManager:
         else:
             # fallback: 从 shadow config 恢复，替换路径为默认值
             shadow_config_path = PROJECT_DIR / cand['signal_config_path']
-            with open(shadow_config_path) as f:
+            with open(shadow_config_path, encoding='utf-8') as f:
                 old_config = yaml.safe_load(f)
             old_config['model_cache_dir'] = (
                 'factor_lab/results/rolling/predictions')
             old_config['quality_cache_dir'] = (
                 'factor_lab/results/signal_decay')
             old_config['rolling_json_dir'] = 'factor_lab/results/rolling'
-            with open(live_config_path, 'w') as f:
+            with open(live_config_path, 'w', encoding='utf-8') as f:
                 yaml.dump(old_config, f, default_flow_style=False,
                           allow_unicode=True)
 

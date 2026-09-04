@@ -207,9 +207,11 @@ class CapitalBacktester:
                         if inst not in pending_sells:
                             pending_sells.append(inst)
 
-                # 买入
+                # 买入 — 按信号分数降序排列，保证确定性迭代顺序。
+                # 用集合差集会因 Python 字符串哈希随机化导致同配置两次结果不同。
                 current_holds = set(positions.keys()) - set(pending_sells)
-                to_buy = target_stocks - current_holds
+                to_buy = [i for i in day_signal.head(effective_topk).index
+                          if i not in current_holds]
                 if to_buy:
                     weight = 1.0 / effective_topk
                     pending_buys = {inst: weight for inst in to_buy}
@@ -475,7 +477,7 @@ def main():
         save_results[label] = save_r
 
     output_file = output_dir / "capital_impact_results.json"
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(save_results, f, indent=2, ensure_ascii=False, default=str)
     print(f"\n结果已保存: {output_file}")
 

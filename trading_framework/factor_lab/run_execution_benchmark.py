@@ -355,9 +355,10 @@ class PortfolioBacktester:
                     if inst not in target_stocks:
                         pending_sells.add(inst)
 
-                # 规划买入 (去掉已持有和待卖出)
+                # 规划买入 — 按信号分数降序排列，保证确定性迭代顺序。
                 current_holds = set(positions.keys()) - pending_sells
-                to_buy = target_stocks - current_holds
+                to_buy = [i for i in day_signal.head(self.topk).index
+                          if i not in current_holds]
                 if to_buy:
                     weight = 1.0 / self.topk
                     pending_buys = {inst: weight for inst in to_buy}
@@ -486,7 +487,7 @@ def main():
 
     if args.custom_only and standard_cache.exists():
         print("\n=== Step 3: 标准回测 (从缓存加载) ===")
-        with open(standard_cache) as f:
+        with open(standard_cache, encoding='utf-8') as f:
             std_results = json.load(f)
         all_results.extend(std_results)
         print(f"  已加载 {len(std_results)} 条标准回测结果")
@@ -515,7 +516,7 @@ def main():
                   f"MDD={r['max_drawdown']:.2%} ({elapsed:.1f}s)")
 
         # 中间保存
-        with open(standard_cache, 'w') as f:
+        with open(standard_cache, 'w', encoding='utf-8') as f:
             json.dump(std_results, f, indent=2, ensure_ascii=False)
         print(f"  标准回测结果已保存: {standard_cache}")
         all_results.extend(std_results)
@@ -553,7 +554,7 @@ def main():
               f"MDD={r['max_drawdown']:.2%} Trades={r['n_trades']} ({elapsed:.1f}s)")
 
     # 中间保存
-    with open(custom_cache, 'w') as f:
+    with open(custom_cache, 'w', encoding='utf-8') as f:
         json.dump(cust_results, f, indent=2, ensure_ascii=False)
     print(f"  自定义回测结果已保存: {custom_cache}")
     all_results.extend(cust_results)
@@ -563,7 +564,7 @@ def main():
 
     # 保存完整结果
     result_file = RESULTS_DIR / "execution_benchmark.json"
-    with open(result_file, 'w') as f:
+    with open(result_file, 'w', encoding='utf-8') as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     print(f"\n完整结果已保存: {result_file}")
 

@@ -960,7 +960,7 @@ def main():
     if args.report_only:
         result_file = RESULTS_DIR / "gated_benchmark.json"
         if result_file.exists():
-            with open(result_file) as f:
+            with open(result_file, encoding='utf-8') as f:
                 results = json.load(f)
             print_comparison_table(results)
         else:
@@ -1236,12 +1236,12 @@ def main():
     result_file = RESULTS_DIR / "gated_benchmark.json"
     existing = {}
     if result_file.exists():
-        with open(result_file) as f:
+        with open(result_file, encoding='utf-8') as f:
             existing = json.load(f)
     # Convert non-serializable values
     for k, v in all_results.items():
         existing[k] = {sk: sv for sk, sv in v.items() if isinstance(sv, (int, float, str, list))}
-    with open(result_file, 'w') as f:
+    with open(result_file, 'w', encoding='utf-8') as f:
         json.dump(existing, f, indent=2, ensure_ascii=False)
     print(f"\n结果已保存: {result_file}")
 

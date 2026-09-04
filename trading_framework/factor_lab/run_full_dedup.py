@@ -212,7 +212,7 @@ def run_dedup(start_time: str = "2024-01-01", end_time: str = "2026-02-05",
 
     # 8. 输出因子名单 (方便硬编码到 presets.py)
     names_path = RESULTS_DIR / "full_selected_names.txt"
-    with open(names_path, "w") as f:
+    with open(names_path, "w", encoding='utf-8') as f:
         for name in sorted(kept):
             f.write(f"{name}\n")
     print(f"因子名单保存至: {names_path}")

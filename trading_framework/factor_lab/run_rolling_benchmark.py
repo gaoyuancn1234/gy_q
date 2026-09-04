@@ -55,9 +55,22 @@ DEAL_PRICE = 'close'
 KNOWN_TAGS = ('holdout', 'closeprice', 'openprice',
               'windowcmp', 'winseg1', 'seg2pred', 'pre2024')
 
-# 回测参数 (与 benchmark_models.py 一致)
-TOPK = 12
-N_DROP = 3
+# 从 signal_config 读取回测参数
+import yaml as _yaml
+with open(PROJECT_DIR / "config" / "signal_config.yaml", encoding='utf-8') as _f:
+    _sig_cfg = _yaml.safe_load(_f)
+INSTRUMENTS = _sig_cfg.get('instruments', 'csi300')
+
+# 回测参数 (2026-09-03 改为读配置)
+#
+# 原先硬编码 TOPK=12 / N_DROP=3，而 signal_config 是 topk=8 / n_drop=2 ——
+# 回测报出的绩效不是实盘实际会执行的那个策略，两者无从对比。
+# instruments 早已读配置，TOPK/N_DROP 却没有，属于半截改造。
+TOPK = int(_sig_cfg.get('topk', 12))
+N_DROP = int(_sig_cfg.get('n_drop') if _sig_cfg.get('n_drop') is not None else 3)
+# 成交价同样改为读配置 (原先在上方硬编码 'close')，理由见上方注释:
+# 研究口径必须与生产一致，硬编码迟早会和配置分叉。
+DEAL_PRICE = _sig_cfg.get('deal_price', DEAL_PRICE)
 
 # Rolling 配置矩阵
 ROLLING_CONFIGS = {
@@ -183,25 +196,207 @@ def generate_rolling_windows(config_name: str, config: dict,
     return windows
 
 
-def _rank_ic_feval(preds, train_data):
-    """LightGBM 自定义 feval: 返回 rank IC (越大越好)
+def make_rank_ic_feval(dates_by_nrow: dict):
+    """构造 LightGBM feval: 按日截面 rank IC 的均值 (越大越好)
 
-    metric="None" → 进入 self.params → 禁用默认 MSE metric
-    feval → 通过 LGBModel.fit(**kwargs) → lgb.train(feval=...) 透传
+    2026-09-03 修复。原实现把所有交易日的样本混在一起算一个总的 Spearman:
+
+        ic = pd.Series(preds).corr(pd.Series(labels), method='spearman')
+
+    IC 的定义是【每天做截面相关、再对天数取平均】。混合计算会被跨日的水平差异
+    主导，得到的数不是 IC。后果是 rank_ic 早停变体形同虚设 —— 实测它与 default
+    变体产出逐位相同的结果，看着能用、实则无效。
+
+    LightGBM 的 feval 只收到 (preds, dataset)，拿不到日期索引，这是原实现只能
+    混合计算的原因。这里改为工厂函数，由调用方按行数把日期索引传进来。
+
+    Args:
+        dates_by_nrow: {样本行数: 该数据集的日期索引 (array-like)}。
+                       用行数区分 train / valid 两个数据集。
+
+    Returns:
+        feval 函数
     """
-    labels = train_data.get_label()
-    ic = pd.Series(preds).corr(pd.Series(labels), method='spearman')
-    if pd.isna(ic):
-        ic = 0.0
-    return 'rank_ic', ic, True  # (name, value, is_higher_better)
+    def _feval(preds, eval_data):
+        labels = eval_data.get_label()
+        dates = dates_by_nrow.get(len(labels))
+        if dates is None:
+            # 认不出是哪个数据集就不要给一个错的数 —— 返回 nan 让它显式暴露，
+            # 而不是退回混合计算冒充 IC。
+            return 'rank_ic', float('nan'), True
+        df = pd.DataFrame({'p': preds, 'y': labels}, index=dates)
+        ic = df.groupby(level=0).apply(
+            lambda g: g['p'].corr(g['y'], method='spearman')).mean()
+        return 'rank_ic', float(0.0 if pd.isna(ic) else ic), True
+
+    return _feval
 
 
-def build_model(model_name: str, variant: str = "default"):
+# 早停退化判定与兜底 (2026-09-03 新增)
+#
+# 现象: W8/W11 的 best_iteration=1 —— 模型只长一棵树, 预测分数几乎无区分度
+# (300 只股票仅 18~27 个不同分数, TopK 里大量并列同分, 选谁本质是随机)。
+#
+# 根因: 验证集固定取【紧邻的上一个季度】。撞上无信号的季度(2026 Q2 的验证
+# rank-IC 全程 ≈0, 2025 Q3 全程 ≈-0.02)时, 早停无法区分模型优劣, 于是停在第 1 轮。
+# 但这并不代表【预测期】没有信号 —— 实测 W11 训练到 200 轮时预测期 IC 从
+# 0.0279 升到 0.0446(翻倍), 区分度恢复到 299.8。也就是说早停掐死了有效模型。
+#
+# 兜底: 判定验证集不具区分能力时, 改用【历史窗口 best_iteration 的中位数】
+# 作为固定轮数重训。只使用当时已有的信息, 无泄漏 —— 绝不能拿预测期表现挑轮数,
+# 那就是拿测试集调参(CLAUDE.md 记录过的"用考题当练习册")。
+MIN_HEALTHY_BEST_ITER = 20      # 低于此视为早停退化
+FALLBACK_ROUNDS_DEFAULT = 200   # 无历史可依时的保底轮数
+FALLBACK_ROUNDS_MIN = 50
+FALLBACK_ROUNDS_MAX = 500
+
+
+def fallback_rounds(prev_best_iters: list) -> int:
+    """由历史窗口的 best_iteration 推导兜底轮数 (中位数, 裁剪到合理区间)
+
+    只接受已完成窗口的结果 —— 这些在当前窗口训练时已经存在, 不构成前视。
+    """
+    healthy = sorted(b for b in (prev_best_iters or [])
+                     if b is not None and b >= MIN_HEALTHY_BEST_ITER)
+    if not healthy:
+        return FALLBACK_ROUNDS_DEFAULT
+    mid = healthy[len(healthy) // 2] if len(healthy) % 2 else \
+        (healthy[len(healthy) // 2 - 1] + healthy[len(healthy) // 2]) // 2
+    return int(max(FALLBACK_ROUNDS_MIN, min(FALLBACK_ROUNDS_MAX, mid)))
+
+
+def fit_with_degradation_guard(model, dataset, fit_kwargs: dict,
+                               prev_best_iters: list, model_name: str,
+                               build_fn=None) -> tuple:
+    """训练一个窗口; 早停退化时用历史中位数轮数重训
+
+    Returns:
+        (model, best_iteration, used_fallback)
+    """
+    model.fit(dataset, **fit_kwargs)
+    best = getattr(getattr(model, 'model', None), 'best_iteration', None)
+    if best is None or best >= MIN_HEALTHY_BEST_ITER:
+        return model, best, False
+
+    rounds = fallback_rounds(prev_best_iters)
+    print(f"    ⚠ 早停退化 (best_iteration={best} < {MIN_HEALTHY_BEST_ITER}): "
+          f"验证集无区分能力。改用历史中位数 {rounds} 轮重训。")
+
+    # 关掉早停的正确做法: 构造一个【不含 valid 段】的 DatasetH。
+    #
+    # qlib 的 LGBModel._prepare_data 按 dataset.segments 决定 valid_sets:
+    #     for key in ["train", "valid"]:
+    #         if key in dataset.segments: ...
+    # 没有 valid 段时只剩训练集，LightGBM 会自行禁用早停
+    # ("Only training set found, disabling early stopping")，从而跑满轮数。
+    #
+    # 不能靠把 early_stopping_rounds 设得大于 num_boost_round 来绕过 ——
+    # 实测无效: 只要早停回调存在，模型仍被截断到 best_iteration=1，
+    # 树数只有 1 棵、预测与修复前逐位相同，兜底看着触发了实则没生效。
+    from qlib.data.dataset import DatasetH
+
+    builder = build_fn or build_model
+    model2, kw2 = builder(model_name)
+
+    segs = {k: v for k, v in dataset.segments.items() if k != "valid"}
+    ds_no_valid = DatasetH(handler=dataset.handler, segments=segs)
+    model2.fit(ds_no_valid, num_boost_round=rounds, **kw2)
+
+    trees = getattr(model2.model, "current_iteration", lambda: None)()
+    print(f"      兜底完成: {trees} 棵树 "
+          f"(best_iteration={getattr(model2.model, 'best_iteration', None)}, "
+          f"0 表示预测使用全部树)")
+    if trees is not None and trees < rounds:
+        print(f"      ⚠ 实际树数 {trees} 少于预期 {rounds}，早停可能仍在生效")
+    return model2, rounds, True
+
+
+# 随机种子 (2026-09-03 新增)
+#
+# 原先一个种子都没设，而 bagging_fraction=0.75 / feature_fraction=0.75 都依赖
+# 随机抽样 —— 同样的代码、同样的数据，每次训练出的模型都不同。
+#
+# 实测这个不确定性有多大: 主段 (2024-01~2026-09) 用两次独立训练的预测回测，
+#   预测相关系数 0.9002，TopK 8 平均只有 7.1/8 只重叠 (每次调仓差一只)
+#   Sharpe 0.876 vs 1.449   —— 相差 0.57
+# 也就是说单次回测的 Sharpe 有 ±0.3 量级的随机波动，
+# 而我们在 TopK 扫描里比较的差异只有 0.1~0.3 —— 完全淹没在噪声里。
+#
+# CLAUDE.md 记录过同类事故(集合迭代顺序导致 Sharpe 0.318 vs 0.247)并修了排序，
+# 但模型种子这一路一直没堵上。
+#
+# seed 会派生 bagging_seed / feature_fraction_seed 等；deterministic=True
+# 进一步关闭 LightGBM 内部依赖线程调度的非确定性路径。
+_SEED_PARAMS = {"seed": 42, "deterministic": True}
+
+# 集成种子数: 训练 N 个模型取预测均值。
+# 光设固定种子只解决"可复现"，不解决"单次结果本身是一次抽样" ——
+# 实盘信号会取决于某个任意选定的种子。取多个种子的均值能把这部分方差
+# 按 ~1/sqrt(N) 压下去，同时让每次调仓的选股更稳定。
+# 代价是训练时间线性增加，故默认 1 (与原行为一致)，由配置开启。
+N_SEEDS = int(_sig_cfg.get('n_seeds', 1))
+
+
+def _seed_params(seed: int | None = None) -> dict:
+    """LightGBM 随机性参数; seed 为 None 时用默认种子"""
+    p = dict(_SEED_PARAMS)
+    if seed is not None:
+        p["seed"] = int(seed)
+    return p
+
+
+def ensemble_seeds(n: int | None = None) -> list[int]:
+    """集成使用的种子列表 (确定性派生自基准种子)"""
+    n = N_SEEDS if n is None else n
+    base = int(_SEED_PARAMS["seed"])
+    return [base + i * 1000 for i in range(max(1, int(n)))]
+
+
+def train_window(dataset, model_name: str, prev_best_iters: list,
+                 variant: str = "default", dates_by_nrow: dict | None = None,
+                 n_seeds: int | None = None) -> tuple:
+    """训练一个窗口并返回预测 —— 回测器与重训 pipeline 共用
+
+    2026-09-03 新增。此前两条训练路径各写各的，导致:
+      - 退化兜底只接在 retrain_pipeline，run_rolling_benchmark 没有 ——
+        段1/主段的验证数字是在 W8/W11 只有 1 棵树的情况下跑出来的
+      - 随机性未受控，同配置两次训练 Sharpe 0.876 vs 1.449
+
+    多种子集成: 训练 n_seeds 个模型取预测均值。固定种子只解决可复现，
+    集成才能真正压低"单次抽样"的方差 (~1/sqrt(N))，并让实盘选股稳定。
+
+    Returns:
+        (pred, best_iteration, used_fallback, n_models)
+    """
+    seeds = ensemble_seeds(n_seeds)
+    preds, bests, fb_any = [], [], False
+    for i, sd in enumerate(seeds):
+        model, fit_kwargs = build_model(model_name, variant=variant,
+                                        dates_by_nrow=dates_by_nrow, seed=sd)
+        model, best, used_fb = fit_with_degradation_guard(
+            model, dataset, fit_kwargs, prev_best_iters, model_name)
+        fb_any = fb_any or used_fb
+        bests.append(best)
+        preds.append(model.predict(dataset))
+        if len(seeds) > 1:
+            print(f"      [seed {i+1}/{len(seeds)}] best_iter={best}")
+        del model
+    pred = preds[0] if len(preds) == 1 else sum(preds) / len(preds)
+    valid = [b for b in bests if b is not None]
+    best_iter = int(sum(valid) / len(valid)) if valid else None   # 均值便于记录
+    return pred, best_iter, fb_any, len(seeds)
+
+
+def build_model(model_name: str, variant: str = "default",
+                dates_by_nrow: dict | None = None,
+                seed: int | None = None):
     """创建模型实例 (超参与 benchmark_models.py 一致)
 
     Args:
         model_name: 模型名
         variant: "default" 或 "rank_ic" (rank-IC 早停)
+        dates_by_nrow: variant="rank_ic" 时必填，{样本行数: 日期索引}，
+                       用于在 feval 里按日分组算截面 IC
 
     Returns:
         (model, fit_kwargs) 元组
@@ -209,19 +404,26 @@ def build_model(model_name: str, variant: str = "default"):
     if model_name == 'LightGBM':
         from qlib.contrib.model.gbdt import LGBModel
         if variant == "rank_ic":
+            if not dates_by_nrow:
+                raise ValueError(
+                    "variant='rank_ic' 需要 dates_by_nrow 才能按日计算截面 IC。"
+                    "缺少它就只能把所有交易日混在一起算，那不是 IC —— "
+                    "旧实现正是如此，导致该变体形同虚设。")
             model = LGBModel(
                 loss="mse", metric="None",
                 learning_rate=0.01, num_leaves=64,
                 num_boost_round=500, early_stopping_rounds=80,
                 feature_fraction=0.75, bagging_fraction=0.75, bagging_freq=5,
                 lambda_l1=0.1, lambda_l2=0.1, min_data_in_leaf=80,
+                **_seed_params(seed),
             )
-            return model, {"feval": _rank_ic_feval}
+            return model, {"feval": make_rank_ic_feval(dates_by_nrow)}
         model = LGBModel(
             loss="mse", learning_rate=0.01, num_leaves=64,
             num_boost_round=500, early_stopping_rounds=80,
             feature_fraction=0.75, bagging_fraction=0.75, bagging_freq=5,
             lambda_l1=0.1, lambda_l2=0.1, min_data_in_leaf=80,
+            **_seed_params(seed),
         )
         return model, {}
 
@@ -247,8 +449,94 @@ def build_model(model_name: str, variant: str = "default"):
         raise ValueError(f"未知模型: {model_name}")
 
 
-def run_backtest(pred):
-    """统一回测逻辑 (复用 benchmark_models.py 的逻辑)"""
+def _run_backtest_hifi(pred):
+    """高保真回测 — 口径与实盘一致，参数全部来自 signal_config.yaml"""
+    from qlib.data import D
+    from factor_lab.run_vol_target import VolTargetBacktester
+
+    dates = pred.index.get_level_values(0)
+    start, end = dates.min(), dates.max()
+
+    # 行情: 带 $isST 以支持 ST 过滤; 数据集没有该字段时优雅降级
+    try:
+        prices = D.features(D.instruments(INSTRUMENTS), ['$close', '$isST'],
+                            start_time=start.strftime('%Y-%m-%d'),
+                            end_time=end.strftime('%Y-%m-%d'))
+    except Exception:
+        prices = D.features(D.instruments(INSTRUMENTS), ['$close'],
+                            start_time=start.strftime('%Y-%m-%d'),
+                            end_time=end.strftime('%Y-%m-%d'))
+
+    # D.features 返回 (instrument, datetime)，而 VolTargetBacktester 用
+    # prices_df.loc[date] 按日取截面，需要 datetime 在第 0 层。
+    # 漏掉这步不会报错 —— loc[date] 会按 instrument 匹配，交集为空，
+    # 回测跑完但一笔交易都没有，指标全 0。属于典型的静默失败。
+    prices = prices.swaplevel().sort_index()
+
+    # 显式自检: 信号日与行情日必须有交集，否则回测会"跑完但没交易"、
+    # 指标全 0 且不报错。这次正是靠新旧引擎对照才发现，不能依赖运气。
+    _overlap = len(set(prices.index.get_level_values(0).unique())
+                   & set(dates.unique()))
+    if _overlap == 0:
+        raise RuntimeError(
+            f"行情与信号无共同交易日 (行情 "
+            f"{prices.index.get_level_values(0).nunique()} 天 / 信号 "
+            f"{dates.nunique()} 天)，回测无法进行。"
+            f"常见原因: MultiIndex 层级顺序不符 (需 datetime 在第 0 层)。")
+
+    bt = VolTargetBacktester(
+        signal=pred,
+        initial_cash=float(_sig_cfg.get('initial_cash', 100_000)),
+        topk=TOPK,
+        rebalance_every=int(_sig_cfg.get('rebalance_every', 5)),
+        stop_loss=float(_sig_cfg.get('stop_loss', 0.08)),
+        open_cost=float(_sig_cfg.get('open_cost', 0.0005)),
+        close_cost=float(_sig_cfg.get('close_cost', 0.0015)),
+        target_vol=_sig_cfg.get('vol_target'),
+        vol_window=int(_sig_cfg.get('vol_window', 20)),
+        min_exposure=float(_sig_cfg.get('vol_min_exposure', 0.2)),
+        n_drop=N_DROP,
+    )
+    result = bt.run(prices)
+
+    # 基准超额: 与旧引擎的输出字段保持一致，调用方无需改动
+    try:
+        bench = D.features(['SH000300'], ['$close'],
+                           start_time=start.strftime('%Y-%m-%d'),
+                           end_time=end.strftime('%Y-%m-%d'))['$close']
+        bench = bench.droplevel(0) if bench.index.nlevels > 1 else bench
+        bench = bench.dropna()
+        if len(bench) > 1:
+            result['bench_return'] = float(bench.iloc[-1] / bench.iloc[0] - 1)
+            result['excess_return'] = result['total_return'] - result['bench_return']
+    except Exception as e:
+        print(f"  [backtest] 基准收益计算失败(不影响策略指标): {e}")
+    return result
+
+
+def run_backtest(pred, engine: str | None = None):
+    """统一回测入口
+
+    2026-09-04: 默认改用高保真引擎 (VolTargetBacktester)。
+    ================================================================
+    此前本函数用 qlib 原生 TopkDropoutStrategy，参数只有 topk/n_drop ——
+    **不含 vol_target**。而实盘、模拟盘都应用波动率目标，于是主力验证工具
+    跑的不是实盘会执行的策略。实测同一区间、同一份预测:
+
+        qlib 原生 (无 vol_target):  Sharpe 1.005  回撤 -28.40%
+        模拟盘   (有 vol_target):  Sharpe 1.143  回撤  -9.69%
+
+    回撤差了三倍。而三段验证、TopK 扫描、因子挖掘的 beat_baseline 判据
+    全部走这个函数 —— 等于用一个没开风控的引擎去评判要不要上线因子。
+
+    高保真引擎的口径与实盘一致: 10万资金 / 整手 100 股 / 涨跌停 ±9.5% /
+    双边成本 / 止损 / n_drop 换手限制 / vol_target 敞口缩放 / ST 过滤。
+
+    engine="qlib" 可显式回到旧引擎 (仅供口径对照，不要用于验收)。
+    """
+    if (engine or "hifi") != "qlib":
+        return _run_backtest_hifi(pred)
+
     from qlib.contrib.evaluate import backtest_daily
     from qlib.utils import init_instance_by_config
 
@@ -259,7 +547,18 @@ def run_backtest(pred):
     }
     backtest_config = {
         "start_time": TEST_START, "end_time": TEST_END,
-        "account": 100_000_000, "benchmark": "SH000300",
+        # 资金规模改为读配置 (原先硬编码 1 亿)。
+        # 1 亿资金下整手约束形同不存在，TopK 越大失真越严重: TopK=20 时
+        # 每仓 500 万，任何股票都买得进; 而 10 万本金下每仓仅 5000 元，
+        # 28% 的沪深300 成分股一手就超过这个数，根本建不了仓。
+        # 回测口径必须与实际资金一致，否则得出的"最优 TopK"在实盘无法执行。
+        #
+        # ⚠ 仍有一层未解决: qlib 需要 `$factor` 字段才会应用 trade_unit(整手)，
+        #   我们的数据没有 factor.day.bin，qlib 回退到 adjusted_price 模式并
+        #   显式警告 "trade unit 100 is not supported"。也就是说当前回测仍允许
+        #   买零碎股。要真正模拟整手，需在数据里补 factor 字段(见 data_setup_sina)。
+        "account": float(_sig_cfg.get('initial_cash', 100_000_000)),
+        "benchmark": "SH000300",
         "exchange_kwargs": {
             "freq": "day", "limit_threshold": 0.095, "deal_price": DEAL_PRICE,
             "open_cost": 0.0005, "close_cost": 0.0015, "min_cost": 5, "trade_unit": 100,
@@ -280,6 +579,9 @@ def run_backtest(pred):
         result['max_drawdown'] = float(drawdown.min())
         daily_std = float(returns.std())
         result['sharpe'] = float(returns.mean() / daily_std * (252 ** 0.5)) if daily_std > 0 else 0.0
+        # 保留日收益序列: DSR/PBO 需要序列而不只是汇总指标。
+        # 汇总指标丢掉了偏度/峰度和时间结构，无法做多重检验校正。
+        result['daily_returns'] = [float(x) for x in returns.tolist()]
     if 'bench' in report.columns:
         result['bench_return'] = float((1 + report['bench']).prod() - 1)
         result['excess_return'] = result.get('total_return', 0) - result['bench_return']
@@ -310,7 +612,7 @@ def run_rolling_single(preset: str, model_name: str,
 
     if result_file.exists() and not force:
         print(f"  [跳过] 已有结果: {result_file.name}")
-        with open(result_file) as f:
+        with open(result_file, encoding='utf-8') as f:
             return json.load(f)
 
     windows = generate_rolling_windows(config_name, config, TEST_START, TEST_END)
@@ -345,7 +647,7 @@ def run_rolling_single(preset: str, model_name: str,
                 end_time=w['pred_end'],
                 fit_start_time=w['train_start'],
                 fit_end_time=w['train_end'],
-                instruments='csi300',
+                instruments=INSTRUMENTS,
             )
         else:
             from factor_lab.factors.presets import build_handler
@@ -355,6 +657,7 @@ def run_rolling_single(preset: str, model_name: str,
                 end_time=w['pred_end'],
                 fit_start_time=w['train_start'],
                 fit_end_time=w['train_end'],
+                instruments=INSTRUMENTS,
             )
 
         # 2. 构建 DatasetH
@@ -366,11 +669,22 @@ def run_rolling_single(preset: str, model_name: str,
         })
 
         # 3. 构建模型并训练
-        model, fit_kwargs = build_model(model_name, variant=variant)
-        model.fit(dataset, **fit_kwargs)
+        dates_by_nrow = None
+        if variant == "rank_ic":
+            # feval 拿不到日期索引，按行数把 train/valid 的日期传进去
+            from qlib.data.dataset.handler import DataHandlerLP
+            dates_by_nrow = {}
+            for seg in ("train", "valid"):
+                d = dataset.prepare(seg, col_set=["feature", "label"],
+                                    data_key=DataHandlerLP.DK_L)
+                y = d["label"].iloc[:, 0]
+                dates_by_nrow[len(y)] = y.index.get_level_values(0)
+        pred, _win_best, _win_fb, _n_models = train_window(
+            dataset, model_name,
+            prev_best_iters=[d.get('best_iteration') for d in window_details],
+            variant=variant, dates_by_nrow=dates_by_nrow)
 
-        # 4. 预测并过滤到 pred 区间
-        pred = model.predict(dataset)
+        # 4. 过滤到 pred 区间
         if isinstance(pred.index, pd.MultiIndex):
             dates = pred.index.get_level_values(0)
             mask = (dates >= pd.Timestamp(w['pred_start'])) & \
@@ -379,12 +693,7 @@ def run_rolling_single(preset: str, model_name: str,
 
         elapsed = time.time() - t0
 
-        # 记录窗口信息
-        # CatBoost uses 'best_iteration_', others use 'best_iteration'
-        best_iter = getattr(model.model, 'best_iteration', None)
-        if best_iter is None:
-            best_iter = getattr(model.model, 'best_iteration_', None)
-
+        # 记录窗口信息 (best_iteration 由 train_window 汇总，多种子时取均值)
         detail = {
             "window_num": wnum,
             "train_start": w['train_start'],
@@ -392,16 +701,19 @@ def run_rolling_single(preset: str, model_name: str,
             "pred_start": w['pred_start'],
             "pred_end": w['pred_end'],
             "n_samples": int(len(pred)),
-            "best_iteration": best_iter,
+            "best_iteration": _win_best,
+            "fallback_rounds": bool(_win_fb),
+            "n_models": _n_models,
             "train_time": round(elapsed, 1),
         }
         window_details.append(detail)
         all_preds.append(pred)
 
-        print(f"    Best iter: {best_iter}, Samples: {len(pred)}, Time: {elapsed:.1f}s")
+        print(f"    Best iter: {_win_best}{' [兜底]' if _win_fb else ''}, "
+              f"models: {_n_models}, Samples: {len(pred)}, Time: {elapsed:.1f}s")
 
-        # 5. 释放内存
-        del handler, dataset, model, pred
+        # 5. 释放内存 (model 已在 train_window 内部释放)
+        del handler, dataset, pred
         gc.collect()
 
     # 拼接所有窗口预测
@@ -437,13 +749,31 @@ def run_rolling_single(preset: str, model_name: str,
         "n_windows": len(windows),
         "windows": window_details,
         "overall": bt_result,
+        # 参数快照 (2026-09-04 新增)
+        # 回测参数在模块导入时读一次，之后改配置不影响已运行的进程。
+        # 不记录快照就无法事后分辨某个结果文件是哪套配置跑出来的 ——
+        # 这正是 CLAUDE.md 列为头号风险的"表头与数字不符"。
+        "params": {
+            "topk": TOPK,
+            "n_drop": N_DROP,
+            "deal_price": DEAL_PRICE,
+            "instruments": INSTRUMENTS,
+            "engine": "hifi",
+            "initial_cash": _sig_cfg.get("initial_cash"),
+            "rebalance_every": _sig_cfg.get("rebalance_every"),
+            "vol_target": _sig_cfg.get("vol_target"),
+            "stop_loss": _sig_cfg.get("stop_loss"),
+            "n_seeds": N_SEEDS,
+            "test_start": TEST_START,
+            "test_end": TEST_END,
+        },
         "total_time": round(total_time, 1),
         "timestamp": pd.Timestamp.now().isoformat(),
     }
 
     # 保存结果
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(result_file, 'w') as f:
+    with open(result_file, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     print(f"\n  结果: Sharpe={bt_result.get('sharpe', 0):.3f}  "
@@ -463,8 +793,14 @@ def print_comparison_table(all_results: list[dict]):
     print("=" * 110)
     print(f"测试区间: {TEST_START} ~ {TEST_END} | 基准: 沪深300")
     _dp = "次日开盘" if DEAL_PRICE == "open" else "次日收盘"
-    print(f"策略: TopkDropout (topk={TOPK}, n_drop={N_DROP}) | "
-          f"成交价: {_dp} ({DEAL_PRICE}, T+1)")
+    # 表头必须反映实际口径: 引擎已换成高保真版，旧表头写的是 qlib 原生策略名，
+    # 且不显示 vol_target / 调仓频率 —— 看表的人会以为跑的是另一套配置。
+    _vt = _sig_cfg.get('vol_target')
+    print(f"引擎: hifi (整手/涨跌停/双边成本/止损) | "
+          f"topk={TOPK} n_drop={N_DROP} 调仓{_sig_cfg.get('rebalance_every')}日 | "
+          f"vol_target={f'{_vt:.0%}' if _vt else '关闭'} | "
+          f"资金={_sig_cfg.get('initial_cash'):,.0f} | 种子={N_SEEDS}")
+    print(f"成交价: {_dp} ({DEAL_PRICE}, T+1) | 基准: 沪深300")
     print()
 
     # 按 Sharpe 降序排列
@@ -494,7 +830,7 @@ def print_comparison_table(all_results: list[dict]):
     print("--- Single-Shot Baseline (参考) ---")
     baseline_file = PROJECT_DIR / "benchmark_results" / "results.json"
     if baseline_file.exists():
-        with open(baseline_file) as f:
+        with open(baseline_file, encoding='utf-8') as f:
             baselines = json.load(f)
         for model_name in ['LightGBM', 'XGBoost', 'CatBoost']:
             if model_name in baselines and 'total_return' in baselines[model_name]:
@@ -529,8 +865,28 @@ def load_all_results() -> list[dict]:
                 continue
         elif any(stem.endswith(f"_{t}") for t in KNOWN_TAGS):
             continue  # 默认测试期不应混入带 tag 的结果
-        with open(f) as fp:
+        with open(f, encoding='utf-8') as fp:
             results.append(json.load(fp))
+
+    # 参数一致性校验 (2026-09-04 新增)
+    # tag 只区分测试期，不区分回测参数。同一张表里若混入不同 topk/n_drop/
+    # 调仓频率/vol_target 的结果，表头写着当前配置、数字却来自别的配置 ——
+    # CLAUDE.md 把这类"表头与数字不符"列为头号风险。
+    _cur = {"topk": TOPK, "n_drop": N_DROP,
+            "rebalance_every": _sig_cfg.get("rebalance_every"),
+            "vol_target": _sig_cfg.get("vol_target"),
+            "deal_price": DEAL_PRICE}
+    for r in results:
+        p = r.get("params")
+        if p is None:
+            print(f"  [警告] {r.get('config_name')}/{r.get('preset')} "
+                  f"无参数快照(旧结果)，无法确认口径是否与当前一致")
+            continue
+        diff = {k: (p.get(k), v) for k, v in _cur.items() if p.get(k) != v}
+        if diff:
+            desc = ", ".join(f"{k}: 结果={a} 当前={b}" for k, (a, b) in diff.items())
+            print(f"  [警告] {r.get('config_name')}/{r.get('preset')} "
+                  f"参数与当前配置不符 — {desc}")
     return results
 
 
@@ -588,7 +944,8 @@ def main():
 
     import qlib
     from qlib.constant import REG_CN
-    qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region=REG_CN)
+    _data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if INSTRUMENTS == 'csi300' else INSTRUMENTS}"
+    qlib.init(provider_uri=_data_dir, region=REG_CN)
 
     # 计算总任务数
     total = len(args.configs) * len(args.presets) * len(args.models)

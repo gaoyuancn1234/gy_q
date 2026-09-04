@@ -22,7 +22,7 @@ def _load_calendar(qlib_dir: str = DEFAULT_QLIB_DIR) -> dict[str, int]:
         raise FileNotFoundError(f"日历文件不存在: {cal_path}")
 
     date_to_idx = {}
-    with open(cal_path) as f:
+    with open(cal_path, encoding='utf-8') as f:
         for i, line in enumerate(f):
             date_str = line.strip()
             if date_str:

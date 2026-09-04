@@ -5,8 +5,10 @@
 
 ## 运行环境 (重要)
 
-- **必须使用 conda 环境**: `C:\Users\gaoyu\.conda\envs\qlib\python.exe` (Python 3.12)
-  系统 Python 3.13 装不了 pyqlib，直接用 `python` 会失败。
+- **解释器**: `C:\Program Files\Python312\python.exe` (Python 3.12.7, qlib 0.9.7)
+  2026-09-04 更正: 本文件原先写的 `C:\Users\gaoyu\.conda\envs\qlib\python.exe`
+  在当前机器上**不存在**(用户目录已是 `C:\Users\1`)。直接用 `python` 走的是
+  系统 3.13，装不了 pyqlib。
 - 平台已从 macOS 迁移到 **Windows**，注意三条差异:
   1. `multiprocessing` 只支持 `spawn`，无 `fork`。任何调用 `D.features()` 的
      脚本**必须**有 `if __name__ == '__main__':` 保护，否则子进程重新导入模块
@@ -17,19 +19,29 @@
 ## 策略说明
 - **当前模型**: `M01-LGB-D3v3r-v2602` (D_expand_3v_3r = 扩展窗口, 3月验证, 3月重训)
 - **因子集**: alpha158_val (**188** 因子)
-- **股票池**: 沪深300 (时点成分股，历史并集 564 只)
-- **持仓**: TopK 12 等权，**n_drop=2** (每次调仓最多换 2 只)
-- **调仓**: 每 5 个交易日
+- **股票池**: CSI 300 时点成分股 (历史并集 549 只)
+  - 2026-09-02 曾切到 CSI 800，当日回退: baostock 数据源故障导致
+    cn_data_csi800 从未生成，且 ML 路径的 provider_uri 硬编码为 cn_data_bs，
+    只改配置不会真正换源，反而会拿到全 NaN 成分股(沉默失败)。
+- **持仓**: 见 `config/signal_config.yaml` 的 `topk` / `n_drop` (以配置为准)
+- **调仓**: 每 8 个交易日 (2026-09-04 由 5 日改，依据见配置文件注释)
 - **成交价**: **收盘价** (次日收盘, T+1)
-- **止损**: 8% | **波动率目标**: 8% 年化 (敞口 0.2~1.0，不加杠杆)
-- **资金**: 20 万
+- **止损**: 8% | **波动率目标**: 8% 年化
+- **资金**: 10 万
+- **训练**: 3 个随机种子集成 (LightGBM 原先未设种子，同配置两次训练
+  主段 Sharpe 0.876 vs 1.449)，含退化回退(验证集早停杀模型时改用无验证集训练)
 
-### 实测绩效 (20万 / 收盘价 / 含整手与全部交易成本)
-| 区间 | Sharpe | 收益 | 最大回撤 |
+### 实测绩效 (10万 / 收盘价 / 含整手与全部交易成本 / TopK16 n_drop4)
+
+**必须报 8 相位均值，不要报单次回测。** 单相位数字有 ±0.3 量级的抽样波动。
+
+| 区间 | 8相位均值 Sharpe | 标准差 | 最差相位 |
 |---|---|---|---|
-| 段1 2022-05~2023-12 (样本外) | 1.272 | 20.47% | -5.93% |
-| 2024-01~2026-08 | 1.162 | 36.92% | -11.48% |
-| 其中 2026-02~08 (最差) | 0.674 | 3.75% | -6.82% |
+| 段1 2022-05~2023-12 (样本外) | 1.053 | 0.319 | 0.54 |
+| 主段 2024-01~2026-08 | 1.121 | 0.129 | 0.82 |
+
+模拟盘重放 (2024-01-02~2026-08-28, 单条路径):
+Sharpe 1.171 / 收益 50.08% / 回撤 -10.59% / 超额 +13.96%
 
 **vs 沪深300**: 五段里赢四段。熊市极强(段1 超额 +38.68%)，牛市可能跑输
 (2025 年 -7.42%)。全期超额仅 +2.41% —— 价值主要在**更小回撤**，不在更高收益。
@@ -141,7 +153,7 @@ intraday_monitor.py → Sina实时行情 → 止损/异动/待执行订单 → �
 - 日内急跌: -5%
 - 15:00 收盘总结
 
-### 每日 22:00 因子挖掘 (⚠ 当前已暂停，未配置定时任务)
+### 每日 22:00 因子挖掘 (任务 TradingSystem-FactorMiner，工作日)
 
 **暂停原因 (2026-08-30)**: 挖掘的评估期与验收测试期原本完全相同
 (`quanta/config.py` 的 `ROLLING_EVAL_TEST_*` == `run_rolling_benchmark.TEST_*`)，
@@ -149,8 +161,13 @@ intraday_monitor.py → Sina实时行情 → 止损/异动/待执行订单 → �
 因子样本内 +7.4%、样本外 **-12.9%**(符号反转)，已全部从 `mined.py` 清除
 (归档于 `mined.py.rejected_20260830`)。
 
-已修复: 划出 `MINING_HOLDOUT_START = '2026-02-06'` 边界并加导入时自检。
-**重新启用前必须**: 在 holdout 区间验证挖掘产出确实有增量。
+已修复: 划出 `MINING_HOLDOUT_START = '2026-02-06'` 边界并加导入时自检
+(挖掘评估期 2024-01-01~2026-02-05，严格早于边界)。
+
+2026-09-04 恢复定时任务。安全性依据: 实盘 preset 是 `alpha158_val`，**不含**
+`mined` —— 挖掘产物写入 `factors/mined.py` 只会进 `alpha158_val_mined`，
+必须经影子验证 + 人工 promote 才可能上线。写入前还有 beat_baseline 与 DSR
+两道门。仍需人工确认 holdout 区间的增量后才做 promote。
 
 
 ```
@@ -218,7 +235,7 @@ python retrain_pipeline.py --skip-data  # 跳过数据刷新
 ```
 
 ## 启动/管理
-**所有命令用 conda 环境的 python**: `C:\Users\gaoyu\.conda\envs\qlib\python.exe -X utf8 ...`
+**所有命令用**: `"C:\Program Files\Python312\python.exe" -X utf8 ...`
 
 ```bash
 python daemon.py          # 启动守护进程 (smart_bot)
@@ -226,16 +243,20 @@ python daemon.py stop     # 停止
 python daemon.py restart  # 重启
 
 # Windows 任务计划 (已创建并启用，"仅在用户登录时运行")
-schtasks /Query /TN "TradingSystem-DailyRunner"      # 每日 18:00
+schtasks /Query /TN "TradingSystem-DailyRunner"      # 每日 18:00 信号推送
+schtasks /Query /TN "TradingSystem-PaperTrader"      # 工作日 18:30 模拟盘重放
 schtasks /Query /TN "TradingSystem-IntradayMonitor"  # 9:25-15:05 每 5 分钟
-schtasks /Query /TN "TradingSystem-SelfReflect"      # 每日 23:30
+schtasks /Query /TN "TradingSystem-FactorMiner"      # 工作日 22:00 因子挖掘
+schtasks /Query /TN "TradingSystem-SelfReflect"      # 每日 23:30 自我反思
+# 五个任务的 WorkingDirectory 必须是 trading_framework —— 2026-09-04 发现
+# 原先为空，相对路径会解析到 System32
 schtasks /Change /TN "TradingSystem-DailyRunner" /DISABLE   # 临时停用
 # 若需未登录也运行，得在任务计划程序 GUI 里改并存储账户密码
 
 python monitor/intraday_monitor.py --dry-run    # 单次检查 (不推送)
 python monitor/intraday_monitor.py --once       # 单次检查 + 推送
 
-# 因子挖掘 (当前暂停，无定时任务)
+# 因子挖掘 (工作日 22:00 定时)
 python -m factor_lab.factor_miner                       # 每日渐进式 (默认)
 python -m factor_lab.factor_miner --daily --smoke-test   # 快速验证 (2方向, 1h)
 python -m factor_lab.factor_miner --evolved              # 单次全量演化式
@@ -278,6 +299,24 @@ python news_sentinel.py --test-stocks SH600036 SH601318  # 测试个股新闻
 | 每日调仓 | 两段都大幅落后 (0.28 vs 1.41) |
 | 3年滑动窗口 +46% | 段1 最差，平均反不如扩展窗口 |
 
+### 单次回测只是一个抽样 (2026-09-04 新增，比上表更根本)
+
+8 日调仓在 2.5 年样本上只有约 **81 次调仓**。起始日错开 1 天(相位 0~7)就是
+一组同样合理、但样本不同的结果。实测 8 个相位间的 Sharpe 标准差 **0.11~0.32**，
+而候选参数之间的差异只有 **0.1~0.16** —— 差异完全淹没在噪声里。
+
+具体翻车例: 段1 的 TopK=8 曾录得 Sharpe 1.341(相位0)，8 相位均值只有
+**0.840**、最差相位 **0.29**。据此认为"8 只在熊市很强"是错的。
+
+已知的三个独立噪声源:
+1. **随机种子** — 未设种子时同配置两次训练 0.876 vs 1.449 (已用 3 种子集成压制)
+2. **调仓相位** — 见上
+3. **集合迭代顺序** — set 差集决定买入顺序，哈希随机化导致 0.318 vs 0.247
+
+**参数选择必须用配对比较**: 同一组相位下算 (候选 − 现行) 的逐样本差值，
+报均值、配对 t、胜出样本数。TopK 8→16 就是这样定的(配对 t=2.74, 12/16
+相位胜出)；单相位对比给出的是相反结论。
+
 **必须做的三段验证**（预测缓存已备好，见 `results/rolling/predictions/`）:
 - 段1 `--pred-tags pre2024` (2022-05~2023-12) —— 参数选择之外的样本
 - 主段 `--pred-tags "" seg2pred` (2024-01~2026-08)
@@ -296,10 +335,46 @@ python news_sentinel.py --test-stocks SH600036 SH601318  # 测试个股新闻
    True，ST 过滤形同虚设。**必须检查 `.notna().any()`**
 5. 模型退化(best_iter=3)后照常推送随机名单
 
+6. **飞书主动推送从未生效** (2026-09-04) —— 5 个推送点都读
+   `FEISHU_USER_OPEN_ID`，而 `.env` 里这一项是注释掉的(模板里就带 `#`)。
+   `push_feishu` 在凭证缺失时只 log 一行然后 return，消息丢弃、不排队、
+   退出码仍是 0。`smart_bot` 不受影响(它回复收到的消息，收件人来自消息本身)
+   —— "能对话"恰好掩盖了"推不出来"。
+   已修: `feishu_target.resolve_open_id()` 回落到 `FEISHU_ALLOWED_OPEN_IDS`
+   的第一个，凭证缺失改为落盘补发。**改推送相关代码后必须看返回的
+   `resp.success()`，不要拿自己脚本的 print 当投递凭据。**
+7. **交易日判断卡死整条链路** (2026-09-04) —— `is_trading_day()` 调
+   `baostock.login()`，该接口无超时参数，源挂了就永久阻塞。盘中监控一个
+   实例从 09:35 卡到 11:05、烧 1394 秒 CPU、一行日志没写，后续每 5 分钟
+   触发全被 0x800710E0 拒绝。任务显示 Running，实际整个上午没监控。
+   已抽出 `market_calendar.py` 共用，带硬超时 + fail-open。
+
+8. **第三方库的网络调用没有超时 = 降级分支永远不执行** (2026-09-04)
+   一天内在四处踩到同一个坑: `baostock.login()` 和 akshare 内部的
+   `requests.get` 都不接受 timeout，源一挂就永久阻塞。**挂起不抛异常**，
+   所以调用方写好的 `except` 降级分支根本轮不到执行 —— 代码看起来有兜底，
+   实际没有。四处: `intraday_monitor.is_trading_day`(卡 1.5h)、
+   `daily_runner.is_trading_day`、`live_portfolio.get_current_prices`(卡 1h+，
+   下面就写着"失败时降级到本地缓存")、`data_setup_sina` 逐只下载(卡 8.5h)。
+   已修: 统一用 `net_guard.run_with_timeout` / `install_default_request_timeout`。
+   **调用任何第三方网络库前，先确认它能不能设超时；不能就用 net_guard 包一层。**
+9. **数据重建期间目录是空的** (2026-09-04) —— `data_setup*` 原先直接
+   `shutil.rmtree(生产目录)` 再重建，中间数百个 bin 文件的写入窗口里，
+   任何读数据的任务(22:00 挖掘、盘中监控、手动回测)拿到的是全 NaN
+   而不是报错。已改为建到 `.building` 旁路目录再 `os.replace` 原子替换。
+   注: `data_setup.py`(baostock 源) 仍是旧写法，它已不是主源，但若重新启用需一并改。
+
 **写新代码时**: 宁可显式失败，不要静默降级。
+**凡是"对外发生效果"的动作(推送/下单/写盘)，必须检查返回值再报成功。**
 
 ## 关键设计决策与依据
 
+- **实盘取价用新浪原始价，不用 BaoStock 前复权价** (2026-09-04):
+  `cost_price` 来自成交截图解析，是**实际成交价(原始价)**。原先拿
+  BaoStock 的 `adjustflag=2` 前复权价去比它，除权日之后会系统性错位 ——
+  止损判据 `current/cost-1` 凭空多出或抹掉一截收益。仓位市值、可买手数
+  同理都该用原始价。换源同时修的是口径，不只是可用性。
+  三级降级: 新浪实时(1.1s/5只) → BaoStock → 当日本地缓存，每级都有硬超时。
 - **成交价用 close 不用 open**: one-switch 实验(其余变量固定)显示
   open 超额 27.11% vs close 11.90%，超额腰斩。开盘价是实盘最难兑现的价格。
 - **n_drop=2 换手限制**: 原为全量换手，5 日调仓下几乎每次换掉全部 12 只，
@@ -312,10 +387,8 @@ python news_sentinel.py --test-stocks SH600036 SH601318  # 测试个股新闻
 
 ## 待办 / 进行中
 
-- **中证800 数据下载未完成** (`--universe csi800`，历史并集 1403 只，
-  目标目录 `~/.qlib/qlib_data/cn_data_csi800`)。用户方向是中小盘以求更高收益。
-  数据齐后需: 三段验证 + **重新校准 vol_target**(8% 是按沪深300 波动定的，
-  中小盘波动 15~25%，继续用 8% 会把敞口长期压到 40% 以下)。
+- **~~中证800~~** → 已回退到 CSI 300，理由见上。若要重做，先解决
+  provider_uri 硬编码，否则换池是沉默失败。
 - ST 过滤已实现(日线 `isST`，时点状态无前视)，但**旧的 cn_data_bs 数据集
   没有该字段**，只有新下载的数据集才生效。
 - 未实现: "regime-trust gate"(arXiv:2603.13252) —— 训练副模型预测主模型的

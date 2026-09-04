@@ -20,6 +20,7 @@ Cron/launchd: 工作日 18:00
     python daily_runner.py --extend-experiment exp_001 15 # 延长实验
 """
 import os
+import subprocess
 import sys
 import json
 import time
@@ -52,46 +53,71 @@ log = logging.getLogger(__name__)
 
 # ============ 交易日检查 ============
 
+from market_calendar import is_trading_day as _is_trading_day
+from feishu_target import resolve_open_id as _resolve_open_id
+
+
 def is_trading_day() -> bool:
-    """检查今天是否为 A 股交易日 (周一~周五, 非节假日)"""
-    today = date.today()
-    # 周末直接跳过
-    if today.weekday() >= 5:
-        return False
-    # 简单节假日检查: 用 BaoStock 日历判断
-    try:
-        import baostock as bs
-        lg = bs.login()
-        rs = bs.query_trade_dates(
-            start_date=today.strftime('%Y-%m-%d'),
-            end_date=today.strftime('%Y-%m-%d'),
-        )
-        while rs.next():
-            row = rs.get_row_data()
-            if row[1] == '1':  # is_trading_day
-                bs.logout()
-                return True
-        bs.logout()
-        return False
-    except Exception as e:
-        log.warning(f"交易日检查失败: {e}, 按工作日处理")
-        return today.weekday() < 5
+    """检查今天是否为 A 股交易日
+
+    2026-09-04: 原实现直接调 baostock.login()，无超时，源挂了就永久阻塞，
+    整个 18:00 任务卡死在这一行。改用 market_calendar (本地日历 → akshare，
+    带硬超时，失败按工作日 fail-open)。
+    """
+    return _is_trading_day()
 
 
 # ============ 数据刷新 ============
 
+def _load_signal_config() -> dict:
+    """读取 signal_config.yaml"""
+    import yaml
+    cfg_path = PROJECT_DIR / "config" / "signal_config.yaml"
+    with open(cfg_path, encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+
+def _get_universe_config() -> tuple:
+    """从 signal_config.yaml 读取 universe 和对应的数据目录"""
+    cfg = _load_signal_config()
+    universe = cfg.get('instruments', 'csi300')
+    data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if universe == 'csi300' else universe}"
+    return universe, data_dir
+
+
+# 单个数据源的硬超时 (秒)。超时即换源，不允许无限期挂住定时任务。
+# 3600 而非 1800: 新浪源是全量重下 549 只(非增量)，实测单次约 30~40 分钟。
+DATA_REFRESH_TIMEOUT = 3600
+
+
 def refresh_daily_data() -> bool:
-    """增量刷新 BaoStock 数据"""
-    log.info("刷新 BaoStock 数据...")
-    try:
-        from qlib_engine.data_setup import setup_qlib_data
+    """增量刷新行情数据
+
+    2026-09-04: 主源由 BaoStock 改为新浪(akshare)。BaoStock 长期连不上，
+    定时任务会卡在这一步不返回 —— 挂住比报错更糟，后面的信号生成永远等不到。
+    新浪失败才回落到 BaoStock，两条路都在子进程里跑并设硬超时。
+    """
+    universe, data_dir = _get_universe_config()
+    for label, module in (("新浪", "qlib_engine.data_setup_sina"),
+                          ("BaoStock", "qlib_engine.data_setup")):
+        log.info(f"刷新数据 ({label})...")
         t0 = time.time()
-        setup_qlib_data()
-        log.info(f"数据刷新完成 ({time.time() - t0:.0f}s)")
-        return True
-    except Exception as e:
-        log.error(f"数据刷新失败: {e}")
-        return False
+        try:
+            r = subprocess.run(
+                [sys.executable, "-X", "utf8", "-m", module,
+                 "--target_dir", str(data_dir), "--universe", universe],
+                cwd=str(PROJECT_DIR), timeout=DATA_REFRESH_TIMEOUT,
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+        except subprocess.TimeoutExpired:
+            log.error(f"{label} 数据刷新超时 ({DATA_REFRESH_TIMEOUT}s)，换下一个源")
+            continue
+        if r.returncode == 0:
+            log.info(f"数据刷新完成: {universe} via {label} ({time.time() - t0:.0f}s)")
+            return True
+        log.error(f"{label} 数据刷新失败 (rc={r.returncode}): "
+                  f"{(r.stderr or r.stdout or '')[-500:]}")
+    log.error("所有数据源都失败，本次不刷新数据")
+    return False
 
 
 # ============ 每日增量预测 ============
@@ -119,7 +145,7 @@ def _update_daily_predictions() -> bool:
         # 读取 test_end 配置
         import yaml
         config_path = PROJECT_DIR / "config" / "signal_config.yaml"
-        with open(config_path) as f:
+        with open(config_path, encoding='utf-8') as f:
             sig_cfg = yaml.safe_load(f)
         test_end = sig_cfg.get('test_end', '2026-06-30')
 
@@ -195,7 +221,7 @@ def _update_shadow_predictions(dry_run: bool = False):
     if not registry_path.exists():
         return
 
-    with open(registry_path) as f:
+    with open(registry_path, encoding='utf-8') as f:
         registry = _json.load(f)
 
     for sid, cand in registry.items():
@@ -207,7 +233,7 @@ def _update_shadow_predictions(dry_run: bool = False):
         if not config_path.exists():
             continue
 
-        with open(config_path) as f:
+        with open(config_path, encoding='utf-8') as f:
             shadow_cfg = yaml.safe_load(f)
 
         model = shadow_cfg.get('model', 'LightGBM')
@@ -295,7 +321,7 @@ def _get_pred_pkl() -> Path:
     """从 signal_config.yaml 动态构建预测文件路径"""
     import yaml
     config_path = PROJECT_DIR / "config" / "signal_config.yaml"
-    with open(config_path) as f:
+    with open(config_path, encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
     rc = cfg.get('rolling_config', 'D_expand_3v_3r')
     preset = cfg.get('preset', 'alpha158_val')
@@ -345,7 +371,9 @@ def _check_prediction_safety(old_pred: 'pd.Series', new_pred: 'pd.Series',
     common_dates = old_dates.intersection(new_dates).sort_values()
 
     if len(common_dates) == 0:
-        return True, "无共有日期，跳过安全检查"
+        # 返回 True 但标注"未生效" —— 调用方据此告警，不要把"没检查成"
+        # 当成"检查通过"静默放行 (本文件另一处同类问题见下方 overlaps 为空)
+        return True, "⚠ 安全检查未生效: 新旧预测无共有日期，无法比对突变"
 
     # 取最近30天共有日期
     recent = common_dates[-30:]
@@ -357,11 +385,12 @@ def _check_prediction_safety(old_pred: 'pd.Series', new_pred: 'pd.Series',
             new_day = new_pred.loc[dt].nlargest(topk).index.tolist()
             overlap = len(set(old_day) & set(new_day)) / topk
             overlaps.append(overlap)
-        except Exception:
+        except Exception as e:
+            log.debug("overlap 计算跳过 %s: %s", dt, e)
             continue
 
     if not overlaps:
-        return True, "无法计算重叠率，跳过安全检查"
+        return True, "⚠ 安全检查未生效: 全部交易日的重叠率都算不出来"
 
     avg_overlap = sum(overlaps) / len(overlaps)
     threshold = 0.5
@@ -442,6 +471,17 @@ def _check_auto_retrain(dry_run: bool = False) -> bool:
         if old_pred is not None:
             is_safe, safety_msg = _check_prediction_safety(old_pred, new_pred)
             log.info(f"安全检查: {safety_msg}")
+
+            # 检查本身没跑起来时也要告警。突变防护的价值在于拦截"新旧模型
+            # 选股完全不同"，而它失效时若静默放行，等于这道闸不存在
+            # —— 与信号健康检查、因子池相关性闸门是同一类问题。
+            if is_safe and safety_msg.startswith("⚠"):
+                warn = (f"⚠️ 自动重训: 突变防护未生效，本次未做突变校验\n"
+                        f"{safety_msg}")
+                log.warning(warn)
+                push_feishu(warn, dry_run)
+                from notifications import write_notification
+                write_notification("signal", "突变防护未生效", warn, "warn")
 
             if not is_safe:
                 # 突变！回退
@@ -590,7 +630,8 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         log.warning(f"净值记录失败 (不影响调仓): {e}")
 
     # 判断是否为调仓日 (每 5 个交易日)
-    rebalance_every = 5
+    # 2026-09-03: 原先硬编码 5，改配置不会生效 (与 topk/n_drop 同类问题)
+    rebalance_every = int(_load_signal_config().get('rebalance_every', 5))
     is_rebalance = (holdings['rebalance_day_count'] % rebalance_every == 0)
     log.info(f"交易日计数: {holdings['rebalance_day_count']}, 调仓: {'是' if is_rebalance else '否'}")
 
@@ -601,7 +642,8 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         # 保存待执行订单到 holdings
         target_set = set(signal['target_stocks'])
         current_set = set(holdings.get('positions', {}).keys())
-        to_sell = list(current_set - target_set)
+        # 排序保证确定性（集合差集迭代顺序随 Python 哈希随机化变化）
+        to_sell = sorted(current_set - target_set)
         to_buy = [c for c in signal['target_stocks'] if c not in current_set]
 
         holdings['pending_orders'] = {
@@ -985,11 +1027,18 @@ def push_feishu(message: str, dry_run: bool = False):
 
     app_id = os.environ.get("FEISHU_APP_ID_1", "")
     app_secret = os.environ.get("FEISHU_APP_SECRET_1", "")
-    user_id = os.environ.get("FEISHU_USER_OPEN_ID", "")
+    user_id = _resolve_open_id()
 
     if not all([app_id, app_secret, user_id]):
-        log.error("飞书凭证未配置，消息未发送")
-        log.info(f"消息内容:\n{message}")
+        # 2026-09-04: 这里原本只 log 然后 return —— 消息直接丢弃，不排队也不
+        # 报错。实际后果是 FEISHU_USER_OPEN_ID 未配置期间，所有定时任务的推送
+        # 全部无声消失，而任务退出码仍是 0，外部完全看不出来。
+        # 现在与"重试耗尽"走同一条路: 落盘，等下次连通时补发。
+        log.error("飞书凭证/收件人未配置，消息已排队等待补发 "
+                  f"(app_id={'有' if app_id else '无'} "
+                  f"secret={'有' if app_secret else '无'} "
+                  f"open_id={'有' if user_id else '无'})")
+        _save_pending_message(message)
         return
 
     client = lark.Client.builder() \
@@ -1231,8 +1280,8 @@ def main():
                 f"请检查日志: logs/daily_runner.log\n{tb}",
                 dry_run=args.dry_run
             )
-        except Exception:
-            pass
+        except Exception as e2:
+            log.error("推送飞书崩溃通知也失败: %s", e2)
 
 
 if __name__ == '__main__':

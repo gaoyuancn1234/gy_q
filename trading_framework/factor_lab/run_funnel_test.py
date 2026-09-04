@@ -41,7 +41,7 @@ def main():
         print(f"  错误: 因子池文件不存在: {MAIN_POOL_FILE}")
         sys.exit(1)
 
-    with open(MAIN_POOL_FILE) as f:
+    with open(MAIN_POOL_FILE, encoding='utf-8') as f:
         pool_data = json.load(f)
 
     pool_factors_raw = pool_data.get("factors", [])

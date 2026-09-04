@@ -27,7 +27,7 @@ class DirectionRegistry:
     def load(self):
         if not self._path.exists():
             return
-        with open(self._path) as f:
+        with open(self._path, encoding='utf-8') as f:
             data = json.load(f)
         self._directions = data.get("directions", [])
         self._next_id = data.get("next_id", 1)

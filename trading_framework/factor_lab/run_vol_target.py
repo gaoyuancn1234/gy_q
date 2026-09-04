@@ -77,8 +77,15 @@ class VolTargetBacktester:
         self.exclude_st = exclude_st
 
     def _exposure(self, recent_returns: list[float]) -> float:
-        """由近期实现波动率决定权益敞口"""
-        if self.target_vol is None:
+        """由近期实现波动率决定权益敞口
+
+        2026-09-04 修复: 原先只有 target_vol is None 才视为关闭，而 0 是合法数值，
+        会走到 clip(0/vol, min_exposure, 1.0) = min_exposure ——
+        命令行传 --target-vols 0 想表达"关闭"，实际得到"固定 20% 仓位"。
+        实测该配置敞口 21.5%、收益 21.77%，被当成"不启用"的对照组写进汇总表，
+        任何与之比较的结论都是错的。
+        """
+        if not self.target_vol:          # None 或 0 都视为关闭
             return 1.0
         if len(recent_returns) < self.vol_window:
             return 1.0                      # 历史不足时不缩放
@@ -108,8 +115,9 @@ class VolTargetBacktester:
         has_st = ('$isST' in prices_df.columns
                   and bool(prices_df['$isST'].notna().any()))
         if self.exclude_st and not has_st:
-            print("  [警告] 数据集无有效 $isST 数据，ST 过滤未生效 "
-                  "(旧数据集需重新下载才带该字段)")
+            print("  [警告] 数据集无有效 $isST 数据，ST 过滤未生效。"
+                  "当前数据源为新浪(akshare)，其日线接口不提供 ST 标记，"
+                  "重新下载也不会有 —— 需 baostock 恢复后补该字段。")
 
         for day_idx, date in enumerate(trading_days):
             day_row = prices_df.loc[date]
@@ -240,6 +248,8 @@ class VolTargetBacktester:
             'annual_return': float(ann_ret),
             'sharpe': float(sharpe),
             'max_drawdown': float(mdd),
+            # 日收益序列: DSR 多重检验校正需要序列而非汇总指标
+            'daily_returns': [float(x) for x in rets.tolist()],
             'realized_vol': float(rets.std() * np.sqrt(TRADING_DAYS)),
             'n_trades': int(n_trades),
             'avg_positions': float(df['n_positions'].mean()),

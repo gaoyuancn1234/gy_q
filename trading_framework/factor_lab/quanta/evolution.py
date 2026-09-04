@@ -244,6 +244,16 @@ def _run_steps_2_to_5(traj: Trajectory, hypothesis: dict,
 
     traj.factor_candidates = candidates
 
+    # 记录语义一致性闸门结论。此前该字段从未被赋值，恒为 None，
+    # 导致 eval_agent 里 `if traj.consistency_ok is False` 永不触发。
+    flags = [c.get('consistency_ok') for c in candidates]
+    if any(f is False for f in flags):
+        traj.consistency_ok = False       # 防御性: 正常不会出现(已在闸门处拦截)
+    elif flags and all(f is True for f in flags):
+        traj.consistency_ok = True
+    else:
+        traj.consistency_ok = None        # 含未能验证的候选
+
     # --- Step 3: Calculate (validate + evaluate) ---
     print(f"    [Step 3] Calculate (validate + evaluate)")
     eval_agent.run_validation_pipeline(traj, candidates)

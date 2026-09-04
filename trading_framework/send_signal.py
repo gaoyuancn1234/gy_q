@@ -13,12 +13,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
+from feishu_target import resolve_open_id as _resolve_open_id
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 APP_ID = os.environ.get("FEISHU_APP_ID_1", "")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET_1", "")
-USER_OPEN_ID = os.environ.get("FEISHU_USER_OPEN_ID", "")
+USER_OPEN_ID = _resolve_open_id()
 CHAT_ID = ""
 
 
@@ -89,10 +90,10 @@ def generate_signal_message():
     current_positions = set(holdings['positions'].keys())
     new_positions = set(new_top12)
 
-    # 计算买卖
-    to_sell = current_positions - new_positions
-    to_buy = new_positions - current_positions
-    to_hold = current_positions & new_positions
+    # 计算买卖 — sorted 保证确定性迭代顺序
+    to_sell = sorted(current_positions - new_positions)
+    to_buy = sorted(new_positions - current_positions)
+    to_hold = sorted(current_positions & new_positions)
 
     # 计算每只股票目标金额
     total_capital = holdings['total_capital']

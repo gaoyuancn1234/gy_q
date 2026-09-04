@@ -145,6 +145,16 @@ def get_top_signals():
             print(f"ML 信号错误: {signal['error']}")
             return None, None, None
 
+        # 健康闸门 (2026-09-03 补，理由同 smart_bot._handle_ml_signal):
+        # 模型退化时预测分数几乎无区分度，据此调仓等同随机。
+        # 此前只有 daily_runner 检查，本路径 (send_signal.py 等) 会绕过。
+        _health = signal.get('health') or {}
+        if _health and not _health.get('ok', True):
+            print("信号健康检查未通过，拒绝生成调仓指令:")
+            for _i in _health.get('issues', []):
+                print(f"  • {_i}")
+            return None, None, None
+
         target_stocks = signal['target_stocks']
         latest_date = datetime.strptime(signal['date'], '%Y-%m-%d')
 

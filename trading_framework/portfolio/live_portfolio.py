@@ -19,6 +19,14 @@ from pathlib import Path
 import baostock as bs
 import pandas as pd
 
+# 调仓风控规则与模拟盘共用同一实现
+from portfolio.rebalance_rules import (
+    select_sells, compute_exposure as _compute_exposure)
+from net_guard import run_with_timeout
+
+# 单次取价的总预算 (秒)。超时即降级到本地缓存，绝不允许无限期挂住。
+PRICE_FETCH_TIMEOUT = 90
+
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 HOLDINGS_FILE = PROJECT_DIR / "portfolio" / "live_holdings.json"
 
@@ -93,7 +101,7 @@ def _save_price_cache(prices: dict):
             'prices': prices,
         }
         tmp = PRICE_CACHE_FILE.with_suffix('.tmp')
-        with open(tmp, 'w') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cache, f)
         import os
         os.replace(tmp, PRICE_CACHE_FILE)
@@ -106,7 +114,7 @@ def _load_price_cache(instruments: list) -> dict:
     if not PRICE_CACHE_FILE.exists():
         return {}
     try:
-        with open(PRICE_CACHE_FILE, 'r') as f:
+        with open(PRICE_CACHE_FILE, 'r', encoding='utf-8') as f:
             cache = json.load(f)
         cache_date = cache.get('date', '')[:10]
         today = datetime.now().strftime('%Y-%m-%d')
@@ -118,8 +126,51 @@ def _load_price_cache(instruments: list) -> dict:
         return {}
 
 
+def _fetch_prices_sina(instruments: list) -> dict:
+    """新浪实时行情 —— 一次请求取回全部代码
+
+    2026-09-04 改为主源，两个原因:
+
+    1. 可用性: BaoStock 已连续多日连不上(login 无超时，只会一直挂)。
+    2. 口径: cost_price 来自成交截图解析，是**实际成交价(原始价)**。
+       BaoStock 那条路用的是 adjustflag=2 前复权价，两者在除权日之后会
+       系统性错位 —— 止损判据 current/cost-1 会凭空多出或抹掉一截收益。
+       新浪返回原始价，与 cost_price 同口径；仓位市值、可买手数也都该用
+       原始价算。所以这不只是换个源，是把口径改对了。
+    """
+    import requests
+
+    codes = [f"{c[:2].lower()}{c[2:]}" for c in instruments]
+    prices = {}
+    # 单次 URL 不宜过长，分批
+    for i in range(0, len(codes), 60):
+        batch = codes[i:i + 60]
+        r = requests.get("https://hq.sinajs.cn/list=" + ",".join(batch),
+                         timeout=15,
+                         headers={"Referer": "https://finance.sina.com.cn"})
+        r.raise_for_status()
+        r.encoding = "gbk"
+        for line in r.text.strip().split("\n"):
+            if '="' not in line:
+                continue
+            code = line.split("hq_str_")[1].split("=")[0]
+            fields = line.split('"')[1].split(",")
+            if len(fields) < 4:
+                continue
+            try:
+                px = float(fields[3])          # 当前价; 收盘后即为收盘价
+            except ValueError:
+                continue
+            if px <= 0:                        # 停牌返回 0，跳过而不是记 0
+                continue
+            prices[f"{code[:2].upper()}{code[2:]}"] = px
+    return prices
+
+
 def get_current_prices(instruments: list) -> tuple:
-    """获取指定股票的最新价格 (BaoStock)，失败时降级到本地缓存
+    """获取指定股票的最新价格
+
+    新浪实时行情 → BaoStock → 本地当日缓存，三级降级，每级都有硬超时。
 
     Args:
         instruments: Qlib 格式代码列表 ['SH600036', ...]
@@ -127,32 +178,51 @@ def get_current_prices(instruments: list) -> tuple:
     Returns:
         (prices_dict, from_cache) — prices_dict: {instrument: price}, from_cache: bool
     """
+    if not instruments:
+        return {}, False
+
+    try:
+        prices = run_with_timeout(lambda: _fetch_prices_sina(instruments),
+                                  PRICE_FETCH_TIMEOUT, "新浪取价")
+        if prices:
+            _save_price_cache(prices)
+            return prices, False
+        print("[get_prices] 新浪返回空，转 BaoStock")
+    except Exception as e:
+        print(f"[get_prices] 新浪失败 ({type(e).__name__}): {e}, 转 BaoStock")
+
+    def _fetch() -> dict:
+        lg = bs.login()
+        if lg.error_code != '0':
+            raise ConnectionError(f"BaoStock 登录失败: {lg.error_msg}")
+
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+        prices = {}
+
+        for inst in instruments:
+            bao_code = qlib_to_bao(inst)
+            rs = bs.query_history_k_data_plus(
+                bao_code,
+                "date,close",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2",  # 前复权
+            )
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            if rows:
+                prices[inst] = float(rows[-1][1])
+        return prices
+
     with _bs_lock:
         try:
-            lg = bs.login()
-            if lg.error_code != '0':
-                raise ConnectionError(f"BaoStock 登录失败: {lg.error_msg}")
-
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-            prices = {}
-
-            for inst in instruments:
-                bao_code = qlib_to_bao(inst)
-                rs = bs.query_history_k_data_plus(
-                    bao_code,
-                    "date,close",
-                    start_date=start_date,
-                    end_date=end_date,
-                    frequency="d",
-                    adjustflag="2",  # 前复权
-                )
-                rows = []
-                while rs.next():
-                    rows.append(rs.get_row_data())
-                if rows:
-                    prices[inst] = float(rows[-1][1])
-
+            # 2026-09-04: 必须加硬超时。bs.login() 没有超时参数，源挂了就永久
+            # 阻塞 —— 挂起不抛异常，下面写好的缓存降级分支永远轮不到执行。
+            # 当天 18:00 的 daily_runner 就卡死在这一行一个多小时。
+            prices = run_with_timeout(_fetch, PRICE_FETCH_TIMEOUT, "BaoStock 取价")
             if prices:
                 _save_price_cache(prices)
             return prices, False
@@ -288,30 +358,15 @@ def _get_vol_target_config() -> dict:
 
 def compute_exposure(holdings: dict, target_vol: float,
                      window: int = 20, min_exposure: float = 0.2) -> tuple:
-    """按已实现波动率计算权益敞口
+    """按已实现波动率计算权益敞口 (薄封装，实现见 rebalance_rules)
 
-    诊断依据: TopK 等权是固定风险敞口，市场波动翻倍时组合风险随之翻倍。
-    2026-02~08 正是如此 —— 选股能力未衰减 (超额日均 +0.09%，与 2024 相当)，
-    但组合日波动从 1.14% 升至 2.15%，导致 Sharpe 崩塌。
-
-    Returns:
-        (exposure, realized_vol) — 历史不足时返回 (1.0, None)
+    保留本函数是为了不改动既有调用方的签名 (传 holdings 而非净值列表)。
+    算法本身与模拟盘共用 portfolio/rebalance_rules.compute_exposure，
+    避免两份实现再次分叉 —— 这正是 n_drop/vol_target 在模拟盘缺失的成因。
     """
-    if not target_vol:
-        return 1.0, None
-    hist = holdings.get('nav_history', [])
-    if len(hist) < window + 1:
-        return 1.0, None
-    navs = [h['nav'] for h in hist[-(window + 1):]]
-    rets = [navs[i] / navs[i - 1] - 1 for i in range(1, len(navs)) if navs[i - 1] > 0]
-    if len(rets) < window:
-        return 1.0, None
-    mean = sum(rets) / len(rets)
-    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
-    vol = (var ** 0.5) * (TRADING_DAYS ** 0.5)
-    if vol <= 1e-9:
-        return 1.0, None
-    return float(min(1.0, max(min_exposure, target_vol / vol))), float(vol)
+    navs = [h['nav'] for h in (holdings.get('nav_history') or [])]
+    return _compute_exposure(navs, target_vol, window=window,
+                             min_exposure=min_exposure)
 
 
 # ============ 持仓操作 ============
@@ -325,10 +380,16 @@ def load_live_holdings() -> dict:
 
 
 def save_live_holdings(holdings: dict):
-    """保存实盘持仓"""
+    """保存实盘持仓 (原子写入)
+
+    2026-09-03: 原先直接 open(...,'w') + json.dump —— 写到一半被中断
+    (断电、进程被杀、磁盘满) 会留下截断的 JSON。这个文件记录真实持仓与现金，
+    损坏等于账本丢失，而下次读取只会抛 JSONDecodeError，无从恢复。
+    改用先写临时文件再 os.replace 的原子写法。
+    """
     holdings['last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with open(HOLDINGS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(holdings, f, ensure_ascii=False, indent=2)
+    from factor_lab.utils import atomic_json_dump
+    atomic_json_dump(HOLDINGS_FILE, holdings, ensure_ascii=False, indent=2)
 
 
 def init_live_portfolio(capital: float = 100000) -> dict:
@@ -464,7 +525,7 @@ def get_model_version() -> str:
     config_file = PROJECT_DIR / "config" / "signal_config.yaml"
     try:
         import yaml
-        with open(config_file, 'r') as f:
+        with open(config_file, 'r', encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
         tag = cfg.get('model_tag', 'M01')
         retrain = cfg.get('last_retrain', '')  # '2026-02'
@@ -473,7 +534,9 @@ def get_model_version() -> str:
             ver = parts[0][2:] + parts[1] if len(parts) == 2 else retrain.replace('-', '')
             return f"{tag}-v{ver}"
         return tag
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("get_current_model_id 失败，回退到默认 M01: %s", e)
         return "M01"
 
 
@@ -505,15 +568,11 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
     # 双边成本 0.05%+0.15% 累积 ≈ 1.4 万 (本金的 14%)。
     #   全量换手  Sharpe 0.24(段1) / 0.48(2024-26)
     #   n_drop=2  Sharpe 1.27(段1) / 1.16(2024-26)
+    # 规则实现在 portfolio/rebalance_rules.py，与模拟盘共用同一份
     _n_drop = _get_vol_target_config().get('n_drop')
-    _all_out = current_set - target_set
-    if _n_drop is not None and _all_out:
-        scores = signal.get('scores') or {}
-        # 分数最低的先卖; 不在分数表里的视为最差 (信号已不覆盖该股)
-        ranked_out = sorted(_all_out, key=lambda c: scores.get(c, float('-inf')))
-        to_sell = set(ranked_out[:_n_drop])
-    else:
-        to_sell = _all_out
+    to_sell = select_sells(current_set, target_set,
+                           scores=signal.get('scores') or {},
+                           n_drop=_n_drop)
     to_hold = current_set - to_sell
     # 只买入被腾出的坑位数，保持持仓数稳定
     _free = max(0, topk - len(to_hold))
@@ -611,12 +670,20 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
 
 # ============ 止损检查 ============
 
-def check_stop_loss(holdings: dict, prices: dict, threshold: float = 0.08) -> list:
+def check_stop_loss(holdings: dict, prices: dict,
+                    threshold: float | None = None) -> list:
     """检查止损
+
+    2026-09-03: threshold 原先硬编码默认 0.08，而唯一的调用处不传参 ——
+    改 signal_config.yaml 的 stop_loss 对实盘止损不生效，
+    与盘中监控(读 settings.STOP_LOSS)用的是两个值。改为默认读配置。
 
     Returns:
         [{'code': 'SH600036', 'name': ..., 'loss_pct': -0.12, ...}]
     """
+    if threshold is None:
+        from config.settings import STOP_LOSS
+        threshold = STOP_LOSS
     alerts = []
     for code, pos in holdings.get('positions', {}).items():
         cost = pos.get('cost_price', 0)

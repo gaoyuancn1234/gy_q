@@ -48,7 +48,7 @@ def run_preset_benchmark(preset: str, models: list[str], force: bool = False):
         out_path = RESULTS_DIR / f"{preset}_{model_name.lower()}.json"
         if out_path.exists() and not force:
             print(f"\n[跳过] {preset}_{model_name} — 已有结果")
-            with open(out_path) as f:
+            with open(out_path, encoding='utf-8') as f:
                 results[model_name] = json.load(f)
             continue
 
@@ -78,7 +78,7 @@ def run_preset_benchmark(preset: str, models: list[str], force: bool = False):
             print(f"  Sharpe: {bt_result.get('sharpe', 0):.3f}")
             print(f"  最大回撤: {bt_result.get('max_drawdown', 0):.2%}")
 
-            with open(out_path, 'w') as f:
+            with open(out_path, 'w', encoding='utf-8') as f:
                 json.dump(bt_result, f, indent=2)
             results[model_name] = bt_result
         except Exception as e:
@@ -100,7 +100,7 @@ def print_comparison(presets: list[str], models: list[str]):
         for model in models:
             path = RESULTS_DIR / f"{preset}_{model.lower()}.json"
             if path.exists():
-                with open(path) as f:
+                with open(path, encoding='utf-8') as f:
                     r = json.load(f)
                 d_feat = r.get('d_feat', '?')
                 sharpe = r.get('sharpe', 0)

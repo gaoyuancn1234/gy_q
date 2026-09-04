@@ -27,6 +27,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 from factor_lab.utils import json_default as _json_default
+from feishu_target import resolve_open_id as _resolve_open_id
 
 MINING_DIR = PROJECT_DIR / "factor_lab" / "mining_results"
 RUNS_DIR = MINING_DIR / "runs"
@@ -43,15 +44,31 @@ def _ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
+def _pid_alive(pid: int) -> bool:
+    """跨平台检查进程是否存活（Windows 上 os.kill(pid, 0) 会误杀进程）"""
+    if os.name == 'nt':
+        import subprocess
+        result = subprocess.run(
+            ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+            capture_output=True, text=True, errors='replace'
+        )
+        return str(pid) in (result.stdout or "")
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def _acquire_lock() -> bool:
     """lockfile 防并发"""
     if LOCK_FILE.exists():
         try:
             pid = int(LOCK_FILE.read_text().strip())
-            os.kill(pid, 0)  # 检查进程是否存活
-            return False
-        except (ProcessLookupError, ValueError, PermissionError):
-            pass  # 旧锁，进程已死或 PID 被复用
+            if _pid_alive(pid):
+                return False
+        except (ValueError, PermissionError):
+            pass  # 旧锁，PID 无效
     LOCK_FILE.write_text(str(os.getpid()))
     return True
 
@@ -72,10 +89,16 @@ def _next_run_id() -> str:
 
 def _init_qlib():
     """初始化 Qlib (只执行一次)"""
+    import yaml
     import qlib
     from qlib.constant import REG_CN
+    cfg_path = PROJECT_DIR / "config" / "signal_config.yaml"
+    with open(cfg_path, encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    universe = cfg.get('instruments', 'csi300')
+    data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if universe == 'csi300' else universe}"
     try:
-        qlib.init(provider_uri="~/.qlib/qlib_data/cn_data_bs", region=REG_CN)
+        qlib.init(provider_uri=data_dir, region=REG_CN)
     except Exception:
         pass  # 已初始化
 
@@ -108,7 +131,7 @@ def _push_feishu(message: str):
 
         app_id = os.environ.get("FEISHU_APP_ID_1", "")
         app_secret = os.environ.get("FEISHU_APP_SECRET_1", "")
-        user_id = os.environ.get("FEISHU_USER_OPEN_ID", "")
+        user_id = _resolve_open_id()
 
         if not all([app_id, app_secret, user_id]):
             print(f"  [feishu] 凭证未配置，消息:\n{message}")
@@ -145,6 +168,41 @@ def _check_beat_baseline(backtest) -> bool:
     """检查回测是否超越 baseline"""
     return (backtest and isinstance(backtest, dict)
             and backtest.get("improvement", {}).get("is_better", False))
+
+
+def _check_overfitting(backtest: dict, run_result: dict) -> dict:
+    """多重检验校正 — DSR (紧缩夏普比率)
+
+    2026-09-03 新增。原验收标准只有 "holdout 上 beat_baseline"，
+    对"试了多少次才挑出这个"毫无校正。一轮 --evolved 是 8 方向 × 6 轮 × 2 候选，
+    几百次试验起步 —— 从一堆真实夏普为 0 的随机策略里挑最大值，
+    那个最大值必然显著大于 0。实测: 200 个纯随机策略里最好的一个，
+    年化夏普能到 2.0。
+
+    run_006/run_010 的 22 个因子(样本内 +7.4% / 样本外 -12.9%)正是这个机制。
+
+    Returns:
+        stats_overfit.evaluate 的结果; 无法检验时返回 {} (不阻断，但会记录原因)
+    """
+    from factor_lab.stats_overfit import deflated_sharpe, format_report
+
+    rets = (backtest or {}).get("candidate_returns") or []
+    if len(rets) < 8:
+        return {"note": "无日收益序列，跳过 DSR 检验"}
+
+    # 试验次数: 本轮实际测试过的因子数 (含被拒的) —— 每个都是一次"试验"
+    n_trials = max(int(run_result.get("factors_tested", 0)), 1)
+
+    # 各次试验夏普的标准差: 手上只有本轮汇总，用候选与基线的差异做保守估计。
+    # 低估离散度会低估运气门槛，故设下限 0.3，避免把门槛调得过松。
+    bl_sr = (backtest.get("baseline") or {}).get("sharpe", 0.0)
+    cd_sr = (backtest.get("candidate") or {}).get("sharpe", 0.0)
+    sr_std = max(0.3, abs(cd_sr - bl_sr) * 2)
+
+    result = {"dsr": deflated_sharpe(rets, n_trials=n_trials, sr_std_ann=sr_std)}
+    result["passed"] = bool(result["dsr"].get("passed"))
+    result["report"] = format_report(result)
+    return result
 
 
 def _build_discovery_message(run_result: dict, backtest: dict) -> str:
@@ -414,11 +472,24 @@ def run_mining(dry_run: bool = False, skip_backtest: bool = False):
     beat_baseline = _check_beat_baseline(backtest)
     run_result["beat_baseline"] = beat_baseline
 
+    # 多重检验校正: beat_baseline 只说明"比基线好"，DSR 回答"扣掉试了几百次
+    # 带来的运气成分后还剩多少"。两道都过才写入 mined.py。
+    overfit = _check_overfitting(backtest, run_result) if beat_baseline else {}
+    run_result["overfit_check"] = overfit
+    if beat_baseline and overfit and not overfit.get("passed", True):
+        print("\n" + overfit.get("report", ""))
+        print("  ⚠ 未通过多重检验校正 —— 不写入 mined.py，仅记录供人工复核")
+        beat_baseline = False
+        run_result["beat_baseline"] = False
+        run_result["rejected_by"] = "DSR"
+
     if beat_baseline and not dry_run:
         # 写入 mined.py + 自动创建 shadow 验证
         _accept_factors_to_mined(non_redundant_factors, run_id)
         shadow_id = _create_shadow_for_run(run_id, backtest)
         msg = _build_discovery_message(run_result, backtest)
+        if overfit.get("report"):
+            msg += "\n\n" + overfit["report"]
         if shadow_id:
             msg += f"\n\n已自动创建影子验证: {shadow_id} (20交易日)"
         _push_feishu(msg)
