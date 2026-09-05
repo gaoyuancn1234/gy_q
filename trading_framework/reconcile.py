@@ -88,7 +88,11 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
     from factor_lab.paper_trader import PaperTrader
     from portfolio.live_portfolio import compute_rebalance_orders
 
-    trader = PaperTrader()
+    # 临时状态目录 —— 对账是只读检查，不能碰真实模拟盘的持仓与历史。
+    # replay()/reset() 会写 state.json 并删除 trades.csv / daily_nav.csv。
+    import tempfile
+    _tmp = tempfile.mkdtemp(prefix='reconcile_')
+    trader = PaperTrader(state_dir=_tmp)
     cfg = trader.config
     trader.reset()
 

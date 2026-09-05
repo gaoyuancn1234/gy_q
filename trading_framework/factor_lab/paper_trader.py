@@ -52,9 +52,20 @@ from factor_lab.signal_generator import TOPK_BY_REGIME, cap_topk
 class PaperTrader:
     """模拟盘引擎 — 收盘价成交，T+1 执行"""
 
-    def __init__(self, config_path: str = 'config/signal_config.yaml'):
+    def __init__(self, config_path: str = 'config/signal_config.yaml',
+                 state_dir: str = None):
+        """
+        Args:
+            state_dir: 覆盖配置里的状态目录。分析类脚本(对账、相位扫描)必须
+                传一个临时目录 —— 2026-09-05 教训: reconcile.py 与
+                run_phase_test.py 都调 replay()，而 replay() 开头的 reset()
+                无条件 _save_state() 并删除 trades.csv / daily_nav.csv，
+                于是每跑一次分析就把真实模拟盘的持仓与历史清空一次。
+                只读的分析绝不该写生产状态。
+        """
         self.config = self._load_config(config_path)
-        self.state_dir = PROJECT_DIR / self.config['state_dir']
+        self.state_dir = (Path(state_dir) if state_dir
+                          else PROJECT_DIR / self.config['state_dir'])
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
         # 从 SignalGenerator 加载信号和质量分数
@@ -366,7 +377,8 @@ class PaperTrader:
     # ── 批量回放 ──
 
     def replay(self, start_date: str = None, end_date: str = None,
-               verbose: bool = True) -> dict:
+               verbose: bool = True, phase: int = 0,
+               save: bool = True) -> dict:
         """批量回放历史数据
 
         逐日调用 update_daily()，用于:
@@ -433,8 +445,12 @@ class PaperTrader:
         t_start = time.time()
 
         for day_idx, date in enumerate(trading_days):
+            # phase: 把调仓日整体平移几个交易日。
+            # 8 日调仓在 2.5 年上只有约 81 次调仓，起始日错开 1 天就是一组
+            # 同样合理、但样本不同的结果。实测相位间 Sharpe 标准差 0.11~0.32，
+            # 而候选参数之间的差异只有 0.1~0.16 —— 单次回测的数字读不出结论。
             result = self.update_daily(
-                date, prices, prev_close_map, day_idx, signal, quality
+                date, prices, prev_close_map, day_idx + phase, signal, quality
             )
             total_trades += result['trades']
             if result['regime']:
@@ -454,8 +470,9 @@ class PaperTrader:
                       f"{date.strftime('%Y-%m-%d')} NAV={nav:,.0f} "
                       f"({ret:+.2%}) 持仓={len(self.state['positions'])}")
 
-        # 保存最终状态
-        self._save_state()
+        # 保存最终状态 (相位扫描时不落盘，否则会覆盖真实模拟盘状态)
+        if save:
+            self._save_state()
 
         elapsed = time.time() - t_start
 
