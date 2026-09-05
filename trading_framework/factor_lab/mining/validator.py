@@ -19,6 +19,67 @@ VALID_OPS = {
     "Mul", "Add", "Sub",
 }
 
+# 带时序位移/窗口参数的算子 —— 这些算子的数值参数为负即构成前视
+_SHIFT_OPS = {
+    "Ref", "Mean", "Std", "Sum", "Delta", "Min", "Max", "Slope", "Rsquare",
+    "Rank", "Corr", "Cov", "IdxMin", "IdxMax", "Quantile", "Mad", "Kurt", "Skew",
+}
+
+
+def _split_args(inner: str) -> list[str]:
+    """按顶层逗号切分参数，忽略嵌套括号内的逗号"""
+    args, depth, cur = [], 0, []
+    for ch in inner:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            args.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    args.append(''.join(cur))
+    return [a.strip() for a in args]
+
+
+def _find_negative_shift(expr: str):
+    """找出任何时序算子的负数位移参数 (前视)
+
+    用括号配对解析，不能用正则。
+    2026-09-05: 原实现是 re.findall(r'Ref\\([^,]+,\\s*(-\\d+)\\)')，其中
+    [^,]+ 不允许逗号 —— 只要 Ref 的第一个参数是含逗号的嵌套表达式就完全
+    漏检。实测:
+        Ref($close, -5)                      -> 拒绝 ✓
+        Ref(Corr($close, $volume, 10), -5)   -> **通过** ✗
+        Ref(Mean($close, 5), -3)             -> **通过** ✗
+    而 LLM 生成的因子表达式绝大多数是嵌套的，等于这道前视闸对最常见的
+    形式完全无效。用未来数据的因子 IC 会异常高、顺利通过 beat_baseline
+    写进 mined.py —— 这可能正是 run_006/run_010 那 22 个因子样本内
+    +7.4% 的来源之一。
+
+    Returns: 命中的片段描述，无则 None
+    """
+    for m in re.finditer(r'\b([A-Z][a-zA-Z]*)\s*\(', expr):
+        op = m.group(1)
+        if op not in _SHIFT_OPS:
+            continue
+        # 从左括号开始做括号配对，取出完整参数串
+        start = m.end()
+        depth, i = 1, start
+        while i < len(expr) and depth > 0:
+            if expr[i] == '(':
+                depth += 1
+            elif expr[i] == ')':
+                depth -= 1
+            i += 1
+        if depth != 0:
+            continue                      # 括号不配对，前面已单独检查
+        for arg in _split_args(expr[start:i - 1]):
+            if re.fullmatch(r'-\s*\d+', arg):
+                return f"{op}(..., {arg})"
+    return None
+
 
 def validate_expression(name: str, expr: str) -> tuple[bool, str]:
     """静态验证: 名称格式、括号配对、字段合法、无前视
@@ -55,11 +116,10 @@ def validate_expression(name: str, expr: str) -> tuple[bool, str]:
     if invalid:
         return False, f"不合法的字段: {invalid}"
 
-    # 无前视 — Ref($xxx, -N) 其中 N>0
-    lookahead = re.findall(r'Ref\([^,]+,\s*(-\d+)\)', expr)
-    for val in lookahead:
-        if int(val) < 0:
-            return False, f"检测到前视引用: Ref(..., {val})"
+    # 无前视 — 任何时序算子的位移/窗口参数不得为负
+    bad = _find_negative_shift(expr)
+    if bad:
+        return False, f"检测到前视引用: {bad}"
 
     # 基本算子检查 — 提取所有 FuncName(
     ops_used = set(re.findall(r'([A-Z][a-zA-Z]+)\s*\(', expr))

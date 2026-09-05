@@ -305,7 +305,8 @@ OPERATOR_ALIASES = {
 QLIB_CONSTRAINTS = """约束:
 1. 除零保护: 分母加 1e-8，如 Div(x, y + 1e-8)
 2. Corr/Cov 的两个字段必须同源 (都来自日频 OHLCV)
-3. 不得使用未来数据 (Ref($close, -N) 中 N 必须 > 0)
+3. 不得使用未来数据: 任何时序算子(Ref/Mean/Delta/Corr...)的位移或窗口
+   参数必须为正。Ref($close, -5)、Delta($close, -3) 这类都会被拒。
 4. 因子名全大写下划线格式
 5. 表达式必须是有效的 Qlib 表达式
 6. 表达式长度 ≤ 200 字符, 嵌套 ≤ 5 层, 基础字段 ≤ 5 种"""

@@ -88,7 +88,8 @@ $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $c
 ## 约束
 1. 除零保护: 分母加 1e-8，如 Div(x, y + 1e-8)
 2. Corr/Cov 的两个字段必须同源 (都来自日频 OHLCV)，不能混合不同数据范围
-3. 不得使用未来数据 (Ref($close, -N) 禁止 N<0 用于因子，仅标签可用)
+3. 不得使用未来数据: 任何时序算子(Ref/Mean/Delta/Corr...)的位移或窗口
+   参数必须为正。Ref($close, -5)、Delta($close, -3) 这类都会被拒。
 4. 因子名全大写下划线，如 VOL_REGIME_RATIO
 5. 表达式必须是有效的 Qlib 表达式
 6. 不要重复已有因子
