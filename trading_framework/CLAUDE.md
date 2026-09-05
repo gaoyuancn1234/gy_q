@@ -387,8 +387,10 @@ python news_sentinel.py --test-stocks SH600036 SH601318  # 测试个股新闻
 
 ## 待办 / 进行中
 
-- **~~中证800~~** → 已回退到 CSI 300，理由见上。若要重做，先解决
-  provider_uri 硬编码，否则换池是沉默失败。
+- **~~中证800~~** → 已回退到 CSI 300，理由见上。2026-09-04 用户确认继续用
+  CSI 300，相关残留已清理(csi800 成分股缓存、cn_data_bs.broken_249)。
+  `data_setup.py --universe csi500/csi800` 的下载能力保留可用。
+  **若要重做，先解决 provider_uri 硬编码**，否则换池是沉默失败。
 - ST 过滤已实现(日线 `isST`，时点状态无前视)，但**旧的 cn_data_bs 数据集
   没有该字段**，只有新下载的数据集才生效。
 - 未实现: "regime-trust gate"(arXiv:2603.13252) —— 训练副模型预测主模型的
