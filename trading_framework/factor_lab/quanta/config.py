@@ -165,6 +165,18 @@ LLM_PROVIDERS = [
         "timeout": 600,
         "daily_quota": 100,
     },
+    # gemini / codex 默认禁用 —— 2026-09-05:
+    # gemini CLI 已安装(v0.58.0)且 cli_paths 能探测到，但**未完成认证**，
+    # 调用返回 exit 41 "Please set an Auth method"。不禁用的话轮询会真的
+    # 派发给它、失败重试后再降级回 claude，白耗时间和日志。
+    #
+    # 启用步骤:
+    #   1. 在交互式终端跑一次 `gemini`，走 Google OAuth 登录(用 Gemini Pro
+    #      订阅账号，不额外计费；API Key 是另一套按量计费额度)
+    #   2. 实测 `gemini -p "<真实长度的假说 prompt>"` 能返回，确认长 prompt
+    #      非交互调用不会挂起 —— 参考 net_guard 那批教训: 第三方调用挂起
+    #      而不抛异常时，降级分支永不执行
+    #   3. 把下面的 "enabled" 改为 True
     {
         "name": "gemini",
         "cli_path": GEMINI_BIN,
@@ -173,6 +185,7 @@ LLM_PROVIDERS = [
         "env_remove": [],
         "timeout": 600,
         "daily_quota": 50,
+        "enabled": False,
     },
     {
         "name": "codex",
@@ -183,6 +196,7 @@ LLM_PROVIDERS = [
         "env_remove": [],
         "timeout": 600,
         "daily_quota": 50,
+        "enabled": False,        # codex CLI 未安装 (cli_paths 回退为裸名字)
     },
 ]
 
