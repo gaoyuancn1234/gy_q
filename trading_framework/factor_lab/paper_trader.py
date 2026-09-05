@@ -280,12 +280,25 @@ class PaperTrader:
             pending['exposure'] = 1.0
 
         # --- 2. 收盘估值 ---
+        #
+        # 停牌股用**最后成交价**估值，不是成本价。
+        # 2026-09-05: 原先取不到当日行情就回退 pos['cost_price'] —— 一只跌了
+        # 30% 之后停牌的票，在净值里显示零亏损。净值虚高、回撤与波动率被低估，
+        # 而已实现波动率正是 vol_target 的输入，于是敞口还会被算高。
+        # 与当日在 live_portfolio.compute_nav 修的是同一类问题(用成本价冒充
+        # 市价)，这里是模拟盘的那一份。
+        #
+        # 背景: A 股停牌常见，且卖单遇停牌会一直挂着重试。段1 相位5 实测有
+        # 1180 个"待卖但当日无行情"的日次(相位7 只有 205)，被卡住的仓位同时
+        # 占着 topk 名额，组合因此几乎停止轮动 —— 200 张卖单只成交 76 张。
         port_value = self.state['cash']
         for inst, pos in self.state['positions'].items():
             if inst in day_close.index:
-                port_value += pos['shares'] * day_close[inst]
+                px = float(day_close[inst])
+                pos['last_price'] = px          # 记下，供停牌期间估值
             else:
-                port_value += pos['shares'] * pos['cost_price']
+                px = float(pos.get('last_price') or pos['cost_price'])
+            port_value += pos['shares'] * px
 
         self._append_nav(date_str, port_value, self.state['cash'],
                          len(self.state['positions']))
