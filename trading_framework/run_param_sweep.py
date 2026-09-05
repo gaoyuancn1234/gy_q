@@ -57,6 +57,7 @@ def main() -> int:
     ap.add_argument('--end', default='2026-09-04')
     ap.add_argument('--tag', default='主段')
     ap.add_argument('--pred-tag', default=None)
+    ap.add_argument('--preset', default=None)
     args = ap.parse_args()
 
     import qlib
@@ -83,7 +84,8 @@ def main() -> int:
         rows = []
         for ph in range(args.phases):
             t = PaperTrader(state_dir=tempfile.mkdtemp(),
-                            pred_tag=args.pred_tag)
+                            pred_tag=args.pred_tag,
+                            preset=args.preset)
             t.config[args.param] = val
             perf = t.replay(args.start, args.end, verbose=False,
                             phase=ph, save=False)

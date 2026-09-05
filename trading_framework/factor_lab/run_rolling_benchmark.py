@@ -53,7 +53,10 @@ DEAL_PRICE = 'close'
 # 新增 tag 时必须登记在这里，否则不同测试期/口径的结果会混进同一张表 ——
 # 表头写着当前区间、数字却来自别的区间，极易误判。
 KNOWN_TAGS = ('holdout', 'closeprice', 'openprice',
-              'windowcmp', 'winseg1', 'seg2pred', 'pre2024')
+              'windowcmp', 'winseg1', 'seg2pred', 'pre2024',
+              # 2026-09-06 基本面注入前后对比: fund188 = 无基本面(alpha158_selected),
+              # fund210 = 含 22 个基本面因子(alpha158_val)
+              'fund188', 'fund210')
 
 # 从 signal_config 读取回测参数
 import yaml as _yaml

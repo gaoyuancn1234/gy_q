@@ -43,6 +43,8 @@ def main() -> int:
     ap.add_argument('--tag', default='主段')
     ap.add_argument('--pred-tag', default=None,
                     help='预测缓存后缀，如 pre2024 (段1)。默认用实盘那份')
+    ap.add_argument('--preset', default=None,
+                    help='预测缓存的 preset 名，如 alpha158_selected。默认用配置里的')
     ap.add_argument('--out', help='结果 JSON 输出路径')
     args = ap.parse_args()
 
@@ -64,7 +66,7 @@ def main() -> int:
     # 反复出现的沉默失败: 看起来跑完了，实际什么都没做。
     import pandas as pd
     from factor_lab.signal_generator import SignalGenerator
-    _sg = SignalGenerator(pred_tag=args.pred_tag)
+    _sg = SignalGenerator(pred_tag=args.pred_tag, preset=args.preset)
     _sd = pd.Index(_sg.load_predictions().index.get_level_values(0).unique())
     _lo, _hi = _sd.min(), _sd.max()
     _req_lo, _req_hi = pd.Timestamp(args.start), pd.Timestamp(args.end)
@@ -84,7 +86,7 @@ def main() -> int:
     for ph in range(args.phases):
         # 每个相位一个独立临时目录 —— 绝不写真实模拟盘状态
         trader = PaperTrader(state_dir=tempfile.mkdtemp(prefix=f'phase{ph}_'),
-                             pred_tag=args.pred_tag)
+                             pred_tag=args.pred_tag, preset=args.preset)
         # save=False: 相位扫描不能覆盖真实模拟盘状态
         perf = trader.replay(args.start, args.end, verbose=False,
                              phase=ph, save=False)

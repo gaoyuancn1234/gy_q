@@ -66,8 +66,13 @@ def cap_topk(topk: int, config: dict) -> int:
 class SignalGenerator:
     """封装 rolling 预测 → TopK 信号 pipeline"""
 
-    def __init__(self, config_path: str = 'config/signal_config.yaml', pred_tag: str = None):
+    def __init__(self, config_path: str = 'config/signal_config.yaml',
+                 pred_tag: str = None, preset: str = None):
+        # preset 覆盖: 不同因子集训练出的预测存在不同文件名里
+        # (如 alpha158_selected=188因子 / alpha158_val=210因子)。
+        # 只改 pred_tag 不够 —— 文件名里 preset 也是一段。
         self.pred_tag = pred_tag
+        self.preset_override = preset
         self.config = self._load_config(config_path)
         self._predictions = None
         self._quality_score = None
@@ -94,7 +99,8 @@ class SignalGenerator:
         # pred_tag: 不同测试期训练出的预测存在不同后缀的 pkl 里
         # (如 _pre2024 覆盖 2022-05~2023-12)。默认(空)是实盘那份。
         _tag = f"_{self.pred_tag}" if getattr(self, 'pred_tag', None) else ""
-        pkl_name = f"{cfg['rolling_config']}_{cfg['preset']}_{cfg['model']}{_tag}.pkl"
+        _preset = getattr(self, 'preset_override', None) or cfg['preset']
+        pkl_name = f"{cfg['rolling_config']}_{_preset}_{cfg['model']}{_tag}.pkl"
         pkl_path = cache_dir / pkl_name
 
         if not pkl_path.exists():
