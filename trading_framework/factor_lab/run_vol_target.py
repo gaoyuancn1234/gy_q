@@ -84,15 +84,23 @@ class VolTargetBacktester:
         命令行传 --target-vols 0 想表达"关闭"，实际得到"固定 20% 仓位"。
         实测该配置敞口 21.5%、收益 21.77%，被当成"不启用"的对照组写进汇总表，
         任何与之比较的结论都是错的。
+
+        2026-09-05: 改为复用 portfolio/rebalance_rules.compute_exposure，
+        与实盘/模拟盘同一实现。此前这里是第三份独立实现，生产已改为
+        "波动率估不出来时收缩到 UNKNOWN_VOL_EXPOSURE" 而这里仍是"满仓"，
+        回测会系统性高估实际敞口 —— 与 n_drop/vol_target 曾在模拟盘缺失
+        属同一类分叉。
         """
-        if not self.target_vol:          # None 或 0 都视为关闭
-            return 1.0
-        if len(recent_returns) < self.vol_window:
-            return 1.0                      # 历史不足时不缩放
-        vol = np.std(recent_returns[-self.vol_window:], ddof=1) * np.sqrt(TRADING_DAYS)
-        if vol <= 1e-9:
-            return 1.0
-        return float(np.clip(self.target_vol / vol, self.min_exposure, 1.0))
+        from portfolio.rebalance_rules import compute_exposure as _ce
+        # 共用实现吃的是净值序列，这里把日收益累乘还原成净值
+        navs, v = [1.0], 1.0
+        for r in recent_returns:
+            v *= (1.0 + r)
+            navs.append(v)
+        exposure, _vol = _ce(navs, self.target_vol,
+                             window=self.vol_window,
+                             min_exposure=self.min_exposure)
+        return float(exposure)
 
     def run(self, prices_df: pd.DataFrame) -> dict:
         trading_days = sorted(prices_df.index.get_level_values(0).unique())

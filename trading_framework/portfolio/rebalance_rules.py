@@ -19,6 +19,10 @@
 # 改动会静默改变已实现波动率的年化结果与实盘敞口。
 TRADING_DAYS = 242
 
+# 无法估计已实现波动率时使用的敞口 (净值历史不足 / 序列异常 / 取价失败)。
+# 取 0.6 而非 1.0: 风控在信息缺失时必须收缩而非放开。见 compute_exposure 注释。
+UNKNOWN_VOL_EXPOSURE = 0.6
+
 
 def select_sells(current: set, target: set, scores: dict,
                  n_drop: int | None) -> set:
@@ -67,20 +71,31 @@ def compute_exposure(navs: list, target_vol: float | None,
         min_exposure: 敞口下限
 
     Returns:
-        (exposure, realized_vol) — 历史不足以估计时返回 (1.0, None)
+        (exposure, realized_vol) — 无法估计波动率时 realized_vol 为 None，
+        exposure 取 UNKNOWN_VOL_EXPOSURE。
+
+    ⚠ 关于"估不出来时给多少敞口" (2026-09-05):
+    原实现四处都 `return 1.0` —— 即**不确定就满仓**。方向是反的:
+      - 净值取价失败 -> 净值序列被成本价平滑 -> 波动率算成 ~0 -> 满仓
+      - 刚建仓/刚重置 -> 历史不足 -> 满仓
+    也就是数据故障或状态未知时，这道风控自动失效并放大仓位。
+    风控在信息缺失时应当收缩。改为 UNKNOWN_VOL_EXPOSURE (默认 0.6)，
+    即先用六成仓位运行，等净值序列攒够再按实测波动率调整。
     """
     if not target_vol:
-        return 1.0, None
+        return 1.0, None                      # 显式关闭，不属于"估不出来"
     if not navs or len(navs) < window + 1:
-        return 1.0, None
+        return UNKNOWN_VOL_EXPOSURE, None
     tail = navs[-(window + 1):]
     rets = [tail[i] / tail[i - 1] - 1
             for i in range(1, len(tail)) if tail[i - 1] > 0]
     if len(rets) < window:
-        return 1.0, None
+        return UNKNOWN_VOL_EXPOSURE, None
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
     vol = (var ** 0.5) * (TRADING_DAYS ** 0.5)
     if vol <= 1e-9:
-        return 1.0, None
+        # 波动率为 0 在真实组合里不可能，几乎必然是净值序列有问题
+        # (取价失败被成本价填充、或序列里全是重复值)。按未知处理。
+        return UNKNOWN_VOL_EXPOSURE, None
     return float(min(1.0, max(min_exposure, target_vol / vol))), float(vol)

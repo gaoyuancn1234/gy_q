@@ -311,27 +311,54 @@ def calculate_affordable_allocation(targets: list, prices: dict,
 TRADING_DAYS = 242
 
 
-def compute_nav(holdings: dict, prices: dict) -> float:
-    """按当前价计算组合总净值 (现金 + 持仓市值)"""
+def compute_nav(holdings: dict, prices: dict) -> tuple:
+    """按当前价计算组合总净值 (现金 + 持仓市值)
+
+    Returns:
+        (nav, n_stale) —— n_stale 是取不到实时价、退回成本价的持仓数。
+
+    2026-09-05: 原实现 `prices.get(code) or pos.get('cost_price', 0)` 有两个
+    问题:
+      1. `or` 在价格为 0.0 时也会回退 —— 0.0 是 falsy，停牌股取到 0 会被
+         当成"没取到"，虽然结果碰巧一样，但掩盖了真实状态。
+      2. 更要命: 回退是**静默**的。取价整体失败时 NAV 变成成本价合计、
+         逐日恒定，vol_target 据此算出实现波动率 ≈ 0，exposure 直接拉满
+         100%。数据源故障时风控自动失效并放大仓位 —— 失败方向完全反了。
+    现在把 stale 数量返回给调用方，由其决定是否记录/告警/收缩。
+    """
     nav = holdings.get('cash', 0.0)
+    n_stale = 0
     for code, pos in holdings.get('positions', {}).items():
-        px = prices.get(code) or pos.get('cost_price', 0)
+        px = prices.get(code)
+        if px is None or px <= 0:
+            px = pos.get('cost_price', 0)
+            n_stale += 1
         nav += pos.get('shares', 0) * px
-    return float(nav)
+    return float(nav), n_stale
 
 
 def record_nav(holdings: dict, prices: dict, date: str = None) -> float:
     """记录每日净值 (vol targeting 需要净值序列来估计已实现波动率)
 
     同一天重复调用只保留最后一次。序列上限 500 个交易日。
+
+    取价不全的日子会打上 stale 标记并记录 stale 持仓数。compute_exposure
+    会跳过这些点 —— 否则用成本价冒充市价的"假净值"会压低实现波动率，
+    让 vol_target 在数据故障时反而放大敞口。
     """
-    nav = compute_nav(holdings, prices)
+    nav, n_stale = compute_nav(holdings, prices)
+    n_pos = len(holdings.get('positions', {}))
     date = date or datetime.now().strftime('%Y-%m-%d')
+    rec = {'date': date, 'nav': nav}
+    if n_stale:
+        rec['stale'] = n_stale
+        print(f"[live_portfolio] 警告: {n_stale}/{n_pos} 只持仓取不到实时价，"
+              f"已用成本价估值; 该日净值标记为 stale，不参与波动率估计")
     hist = holdings.setdefault('nav_history', [])
     if hist and hist[-1].get('date') == date:
-        hist[-1]['nav'] = nav
+        hist[-1] = rec
     else:
-        hist.append({'date': date, 'nav': nav})
+        hist.append(rec)
     if len(hist) > 500:
         del hist[:-500]
     return nav
@@ -364,7 +391,14 @@ def compute_exposure(holdings: dict, target_vol: float,
     算法本身与模拟盘共用 portfolio/rebalance_rules.compute_exposure，
     避免两份实现再次分叉 —— 这正是 n_drop/vol_target 在模拟盘缺失的成因。
     """
-    navs = [h['nav'] for h in (holdings.get('nav_history') or [])]
+    # 剔除 stale 净值点: 那些日子有持仓取不到实时价、用成本价充数，
+    # 净值人为平滑。留着会压低实现波动率 -> exposure 被算高 -> 数据故障时
+    # 风控反而放大仓位。宁可样本不足退回保守值，也不能用假净值。
+    hist = holdings.get('nav_history') or []
+    navs = [h['nav'] for h in hist if not h.get('stale')]
+    n_dropped = len(hist) - len(navs)
+    if n_dropped:
+        print(f"[live_portfolio] 波动率估计剔除 {n_dropped} 个 stale 净值点")
     return _compute_exposure(navs, target_vol, window=window,
                              min_exposure=min_exposure)
 
