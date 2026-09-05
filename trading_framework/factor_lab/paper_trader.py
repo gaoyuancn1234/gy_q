@@ -251,31 +251,38 @@ class PaperTrader:
             if _exp < 1.0:
                 available_cash *= _exp
             if total_weight > 0:
-                for inst, weight in list(pending['buys'].items()):
+                # 先过滤掉不可买的，再交给共用的分配函数。
+                # 2026-09-05: 原先在此内联算股数，与实盘 calculate_affordable_
+                # allocation 四条语义都不同(太贵剔除/不足一手/成本/重分配)，
+                # 同一份清单在两边买出不同股数与持仓只数。见 allocate_buys。
+                buyable, bprices = [], {}
+                for inst in pending['buys']:
                     if inst in self.state['positions']:
                         continue
                     if inst not in day_close.index:
                         continue
                     # 涨停不能买
                     if inst in prev_close_map and prev_close_map[inst] > 0:
-                        limit_ret = day_close[inst] / prev_close_map[inst] - 1
-                        if limit_ret > 0.095:
+                        if day_close[inst] / prev_close_map[inst] - 1 > 0.095:
                             continue
+                    buyable.append(inst)
+                    bprices[inst] = float(day_close[inst])
 
-                    price = day_close[inst]
-                    alloc = available_cash * (weight / total_weight)
-                    shares = int(alloc / (price * (1 + cfg['open_cost'])) / 100) * 100
-                    if shares >= 100:
-                        cost = shares * price * (1 + cfg['open_cost'])
-                        self.state['cash'] -= cost
-                        self.state['positions'][inst] = {
-                            'shares': shares,
-                            'cost_price': float(price),
-                            'entry_date': date_str,
-                        }
-                        self._append_trade(date_str, 'BUY', inst, shares, price,
-                                           shares * price * cfg['open_cost'], 'rebalance')
-                        n_trades += 1
+                from portfolio.rebalance_rules import allocate_buys
+                alloc = allocate_buys(buyable, bprices, available_cash,
+                                      open_cost=cfg['open_cost'])
+                for inst, a in alloc.items():
+                    shares, price = a['shares'], a['price']
+                    self.state['cash'] -= a['amount']
+                    self.state['positions'][inst] = {
+                        'shares': shares,
+                        'cost_price': float(price),
+                        'entry_date': date_str,
+                    }
+                    self._append_trade(date_str, 'BUY', inst, shares, price,
+                                       shares * price * cfg['open_cost'],
+                                       'rebalance')
+                    n_trades += 1
             pending['buys'] = {}
             pending['exposure'] = 1.0
 

@@ -246,64 +246,28 @@ def calculate_affordable_allocation(targets: list, prices: dict,
                                     min_lot: int = 100) -> dict:
     """跳过买不起的股票，重新分配资金
 
-    Args:
-        targets: 目标股票列表 (Qlib code)
-        prices: {instrument: price} 字典
-        available_cash: 可用资金
-        min_lot: 最小交易单位 (A股 100)
+    2026-09-05: 实现移到 portfolio/rebalance_rules.allocate_buys，与模拟盘
+    共用。此前两边各写一份、四条语义都不同(太贵剔除/不足一手/交易成本/
+    跳过的钱是否重分)，同一份买入清单会买出不同股数与不同持仓只数。
+    本函数保留是为了不改调用点。
 
-    Returns:
-        {instrument: {'shares': 200, 'amount': 7700, 'price': 38.50}}
-        跳过的股票不在结果中
+    交易成本此前完全没进预算 —— 下单金额刚好等于可用资金时，实际会因佣金
+    透支。现在按 signal_config.yaml 的 open_cost 计入。
     """
-    if not targets:
-        return {}
+    from portfolio.rebalance_rules import allocate_buys
+    return allocate_buys(targets, prices, available_cash,
+                         open_cost=_get_open_cost(), min_lot=min_lot)
 
-    # 第一轮: 筛出买得起的
-    affordable = []
-    skipped = []
-    budget_per = available_cash / len(targets)
 
-    for inst in targets:
-        price = prices.get(inst, 0)
-        if price <= 0:
-            skipped.append((inst, 'no_price'))
-            continue
-        min_cost = price * min_lot
-        if min_cost > budget_per * 1.5:
-            # 预算的 1.5 倍都买不了 100 股，跳过
-            skipped.append((inst, 'too_expensive'))
-            continue
-        affordable.append(inst)
-
-    if not affordable:
-        return {}
-
-    # 第二轮: 等权分配给可买的
-    budget_per = available_cash / len(affordable)
-    allocation = {}
-    total_used = 0
-
-    for inst in affordable:
-        price = prices[inst]
-        shares = int(budget_per / price / min_lot) * min_lot
-        if shares < min_lot:
-            shares = min_lot
-        amount = shares * price
-        if total_used + amount > available_cash:
-            # 资金不够了
-            shares = int((available_cash - total_used) / price / min_lot) * min_lot
-            if shares < min_lot:
-                continue
-            amount = shares * price
-        allocation[inst] = {
-            'shares': shares,
-            'amount': round(amount, 2),
-            'price': price,
-        }
-        total_used += amount
-
-    return allocation
+def _get_open_cost() -> float:
+    """买入费率 (signal_config.yaml)，读不到时按 0 处理"""
+    try:
+        import yaml
+        with open(PROJECT_DIR / 'config' / 'signal_config.yaml',
+                  encoding='utf-8') as f:
+            return float(yaml.safe_load(f).get('open_cost', 0.0) or 0.0)
+    except Exception:
+        return 0.0
 
 
 # ============ 净值记录与波动率目标 ============

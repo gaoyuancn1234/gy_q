@@ -111,3 +111,82 @@ def compute_exposure(navs: list, target_vol: float | None,
         # (取价失败被成本价填充、或序列里全是重复值)。按未知处理。
         return UNKNOWN_VOL_EXPOSURE, None
     return float(min(1.0, max(min_exposure, target_vol / vol))), float(vol)
+
+
+def allocate_buys(targets: list, prices: dict, available_cash: float,
+                  open_cost: float = 0.0, min_lot: int = 100,
+                  expensive_ratio: float = 1.5) -> dict:
+    """把可用资金分配到买入清单 — 回测/实盘共用的唯一实现
+
+    2026-09-05 抽出。此前实盘 (live_portfolio.calculate_affordable_allocation)
+    与模拟盘 (paper_trader 内联) 各写一份，四条语义都不同:
+
+        项目          实盘                          模拟盘
+        太贵的票       剔除后把预算重分给买得起的       无此逻辑
+        不足一手       强制买 100 股(允许超配)         直接跳过
+        交易成本       不计入预算                     计入
+        跳过的钱       重新分配                       闲置
+
+    后果是同一份买入清单在两边买出不同的股数与不同的持仓只数 —— 模拟盘会
+    系统性少投一部分钱。而 reconcile.py 只比对买卖**清单**，仓位大小不在
+    覆盖范围内，所以这处分叉一直没被发现 (vol_target 失效那处也藏在这里)。
+
+    统一后的语义 = 实盘那套(它是真在交易的) + 模拟盘的成本核算:
+
+      1. 先按等分预算筛掉"贵到 1.5 倍预算都买不了一手"的票
+      2. 把全部资金重分给剩下的，避免预算闲置
+      3. 不足一手时仍买一手 —— 小资金下宁可让个别标的超配，也不要凭空
+         少持一只。上限由 expensive_ratio 控制(最多约 1.5 倍超配)
+      4. 现金不够时按剩余资金缩减；缩到不足一手才跳过
+
+    Args:
+        targets: 买入清单，按优先级(信号分数降序)排列
+        prices: {instrument: 价格}
+        available_cash: 可用资金(已扣除波动率目标的缩减)
+        open_cost: 买入费率，如 0.0005。计入预算，避免下单后现金为负
+        min_lot: 最小交易单位，A 股 100
+        expensive_ratio: 允许的最大超配倍数
+
+    Returns:
+        {instrument: {'shares': int, 'price': float, 'amount': float}}
+        amount 含交易成本。买不起的股票不在结果里。
+    """
+    if not targets or available_cash <= 0:
+        return {}
+
+    unit = 1.0 + float(open_cost)
+
+    # 第一轮: 筛掉买不起的
+    budget_per = available_cash / len(targets)
+    affordable = []
+    for inst in targets:
+        price = prices.get(inst, 0)
+        if not price or price <= 0:
+            continue                       # 无价格，跳过
+        if price * min_lot * unit > budget_per * expensive_ratio:
+            continue                       # 1.5 倍预算都买不了一手
+        affordable.append(inst)
+    if not affordable:
+        return {}
+
+    # 第二轮: 资金重分给买得起的
+    budget_per = available_cash / len(affordable)
+    allocation = {}
+    used = 0.0
+    for inst in affordable:
+        price = prices[inst]
+        shares = int(budget_per / (price * unit) / min_lot) * min_lot
+        if shares < min_lot:
+            shares = min_lot               # 不足一手仍买一手(见 docstring 3)
+        amount = shares * price * unit
+        if used + amount > available_cash:
+            shares = int((available_cash - used) / (price * unit)
+                         / min_lot) * min_lot
+            if shares < min_lot:
+                continue                   # 剩余资金不足一手，放弃
+            amount = shares * price * unit
+        allocation[inst] = {'shares': int(shares),
+                            'price': float(price),
+                            'amount': round(float(amount), 2)}
+        used += amount
+    return allocation

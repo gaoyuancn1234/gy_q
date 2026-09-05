@@ -80,6 +80,49 @@ def check_config_consistency() -> list[str]:
     return problems
 
 
+
+# ---------------------------------------------------------------- 仓位对账
+
+def check_sizing_consistency() -> list[str]:
+    """同一份买入清单与同一笔可用资金，两条路径必须买出相同股数
+
+    2026-09-05 新增。此前对账只比对买卖**清单**，仓位大小不在覆盖范围内 ——
+    vol_target 在模拟盘里完全失效(权重归一化把 exposure 约掉了)那处分叉，
+    正是藏在这个缺口里，跑了很久没人发现。
+
+    两边现已共用 rebalance_rules.allocate_buys。本检查确保没有人再各写一份:
+    实盘走 live_portfolio.calculate_affordable_allocation，模拟盘走
+    allocate_buys，构造若干组价格/资金组合逐一比对。
+    """
+    from portfolio.live_portfolio import calculate_affordable_allocation
+    from portfolio.rebalance_rules import allocate_buys
+    from portfolio.live_portfolio import _get_open_cost
+
+    oc = _get_open_cost()
+    cases = [
+        ("常规",     {'A': 10.0, 'B': 25.0, 'C': 40.0, 'D': 8.0},  100_000),
+        ("含高价股",  {'A': 10.0, 'B': 200.0, 'C': 40.0},           100_000),
+        ("资金紧张",  {'A': 10.0, 'B': 25.0, 'C': 40.0},              6_000),
+        ("敞口收缩",  {'A': 12.5, 'B': 33.0, 'C': 47.0, 'D': 9.0},   32_000),
+        ("单只",     {'A': 63.0},                                   10_000),
+        ("含无价格",  {'A': 10.0, 'B': 0.0, 'C': 40.0},             50_000),
+    ]
+    problems = []
+    for name, px, cash in cases:
+        tg = list(px.keys())
+        live = calculate_affordable_allocation(tg, px, cash)
+        bt = allocate_buys(tg, px, cash, open_cost=oc)
+        lv = {k: v['shares'] for k, v in live.items()}
+        bv = {k: v['shares'] for k, v in bt.items()}
+        if lv != bv:
+            problems.append(f"仓位分叉 [{name}] 实盘 {lv} vs 回测 {bv}")
+        # 不得超支
+        spent = sum(v['amount'] for v in bt.values())
+        if spent > cash + 1e-6:
+            problems.append(f"超支 [{name}] 用了 {spent:,.0f} > 可用 {cash:,.0f}")
+    return problems
+
+
 # ---------------------------------------------------------------- 订单对账
 
 def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
@@ -210,7 +253,7 @@ def main() -> int:
     print(f"双路径对账  {start} ~ {end}")
     print("=" * 60)
 
-    print("\n[1/2] 配置一致性")
+    print("\n[1/3] 配置一致性")
     cfg_problems = check_config_consistency()
     if cfg_problems:
         for p in cfg_problems:
@@ -218,7 +261,15 @@ def main() -> int:
     else:
         print("  ✓ 实盘与回测读到的 n_drop / vol_target 一致")
 
-    print("\n[2/2] 逐日订单一致性")
+    print("\n[2/3] 仓位分配一致性")
+    size_problems = check_sizing_consistency()
+    if size_problems:
+        for p in size_problems:
+            print(f"  ✗ {p}")
+    else:
+        print("  ✓ 6 组价格/资金组合下，两条路径买出的股数完全相同，且不超支")
+
+    print("\n[3/3] 逐日订单一致性")
     res = reconcile_orders(start, end)
     if res['status'] != 'ok':
         print(f"  ✗ 对账无法完成: {res['reason']}")
@@ -243,19 +294,21 @@ def main() -> int:
             print(f"      买入  实盘 {d['live_buys']}")
             print(f"           回测 {d['bt_buys']}")
 
-    ok = not diffs and not cfg_problems
+    ok = not diffs and not cfg_problems and not size_problems
     print()
     if ok:
         print("✓ 两条路径逐日一致")
     else:
-        print(f"✗ 发现 {len(cfg_problems)} 处配置分叉、{len(diffs)} 个调仓日订单分叉")
+        print(f"✗ 发现 {len(cfg_problems)} 处配置分叉、"
+              f"{len(size_problems)} 处仓位分叉、{len(diffs)} 个调仓日订单分叉")
         print("  实盘与回测跑的不是同一个策略 —— 回测绩效不代表实盘。")
 
     if args.push and not ok:
         try:
             from send_signal import push_feishu
             msg = (f"🚨 双路径对账失败 ({start}~{end})\n"
-                   f"配置分叉 {len(cfg_problems)} 处，订单分叉 {len(diffs)} 个调仓日\n"
+                   f"配置分叉 {len(cfg_problems)} 处，仓位分叉 {len(size_problems)} 处，"
+                   f"订单分叉 {len(diffs)} 个调仓日\n"
                    f"实盘与回测跑的不是同一个策略，回测绩效不代表实盘。")
             push_feishu(msg, dry_run=False)
         except Exception as e:
