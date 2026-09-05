@@ -41,6 +41,8 @@ def main() -> int:
     ap.add_argument('--end', default='2026-09-04')
     ap.add_argument('--phases', type=int, default=8)
     ap.add_argument('--tag', default='主段')
+    ap.add_argument('--pred-tag', default=None,
+                    help='预测缓存后缀，如 pre2024 (段1)。默认用实盘那份')
     ap.add_argument('--out', help='结果 JSON 输出路径')
     args = ap.parse_args()
 
@@ -56,12 +58,33 @@ def main() -> int:
           f"{args.phases} 个相位")
     print("=" * 66)
 
+    # 覆盖性检查 —— 预测缓存不覆盖请求区间时必须立刻失败。
+    # 否则每个交易日都 `date not in signal_dates`、一次调仓都不发生，
+    # 回测照样跑完并给出一个纯粹由现金构成的 Sharpe。这正是本项目
+    # 反复出现的沉默失败: 看起来跑完了，实际什么都没做。
+    import pandas as pd
+    from factor_lab.signal_generator import SignalGenerator
+    _sg = SignalGenerator(pred_tag=args.pred_tag)
+    _sd = pd.Index(_sg.load_predictions().index.get_level_values(0).unique())
+    _lo, _hi = _sd.min(), _sd.max()
+    _req_lo, _req_hi = pd.Timestamp(args.start), pd.Timestamp(args.end)
+    _covered = _sd[(_sd >= _req_lo) & (_sd <= _req_hi)]
+    print(f"预测缓存 {'(默认)' if not args.pred_tag else args.pred_tag}: "
+          f"{_lo.date()} ~ {_hi.date()}，区间内 {len(_covered)} 个信号日")
+    if len(_covered) < 20:
+        print(f"\n✗ 预测缓存只覆盖请求区间 {args.start}~{args.end} 的 "
+              f"{len(_covered)} 天，无法回测。")
+        print(f"  可用缓存区间是 {_lo.date()} ~ {_hi.date()}；"
+              f"段1 请加 --pred-tag pre2024")
+        return 2
+
     import tempfile
     rows = []
     t0 = time.time()
     for ph in range(args.phases):
         # 每个相位一个独立临时目录 —— 绝不写真实模拟盘状态
-        trader = PaperTrader(state_dir=tempfile.mkdtemp(prefix=f'phase{ph}_'))
+        trader = PaperTrader(state_dir=tempfile.mkdtemp(prefix=f'phase{ph}_'),
+                             pred_tag=args.pred_tag)
         # save=False: 相位扫描不能覆盖真实模拟盘状态
         perf = trader.replay(args.start, args.end, verbose=False,
                              phase=ph, save=False)

@@ -53,7 +53,7 @@ class PaperTrader:
     """模拟盘引擎 — 收盘价成交，T+1 执行"""
 
     def __init__(self, config_path: str = 'config/signal_config.yaml',
-                 state_dir: str = None):
+                 state_dir: str = None, pred_tag: str = None):
         """
         Args:
             state_dir: 覆盖配置里的状态目录。分析类脚本(对账、相位扫描)必须
@@ -70,7 +70,7 @@ class PaperTrader:
 
         # 从 SignalGenerator 加载信号和质量分数
         from factor_lab.signal_generator import SignalGenerator
-        self.sg = SignalGenerator(config_path)
+        self.sg = SignalGenerator(config_path, pred_tag=pred_tag)
 
         self.state = self._load_state()
 
