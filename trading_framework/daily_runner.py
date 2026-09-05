@@ -622,21 +622,35 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         write_notification("signal", "模型退化-信号已拦截", err_msg, "error")
         return
 
-    # 信号时效性检查: 超过2个交易日标记为 stale
+    # 信号时效性检查
+    # 2026-09-05 两处修正:
+    #   1. 原先用日历日 `> 3` 近似交易日 —— 长假(国庆/春节最长 9 个日历日)后
+    #      新鲜信号会被误判过期，而周中隔 3 天的陈旧信号反倒漏判。改用交易日历。
+    #   2. 原先 stale 只在推送消息尾部追加一行文字，**不阻断调仓指令生成** ——
+    #      数据刷新静默失败时，系统照样按上周的信号推 "买X卖Y"。
+    #      过期信号现在禁止调仓 (仍推送持仓日报与止损告警)。
+    STALE_TRADING_DAYS = 2
     signal_stale = False
+    days_gap = None
     try:
-        signal_date = datetime.strptime(signal['date'], '%Y-%m-%d').date()
-        days_gap = (date.today() - signal_date).days
-        if days_gap > 3:  # 日历日>3 约等于交易日>2
+        from market_calendar import trading_days_between
+        days_gap = trading_days_between(signal['date'],
+                                        date.today().strftime('%Y-%m-%d'))
+        if days_gap is None:
+            # 日历覆盖不到今天(数据未刷新到位)本身就是可疑信号，按过期处理
             signal_stale = True
-            log.warning(f"信号已过期: 信号日期 {signal['date']}, 距今 {days_gap} 天")
-    except (ValueError, KeyError):
-        pass
+            log.warning(f"信号时效无法判定: 交易日历未覆盖 {signal['date']}~今天")
+        elif days_gap > STALE_TRADING_DAYS:
+            signal_stale = True
+            log.warning(f"信号已过期: 信号日期 {signal['date']}, 距今 {days_gap} 个交易日")
+    except (ValueError, KeyError) as e:
+        signal_stale = True
+        log.warning(f"信号时效检查异常，按过期处理: {e}")
 
     # 加载持仓
     holdings = load_live_holdings()
 
-    # 更新调仓计数
+    # 保留计数器仅供日志/排查; 调仓判定已不依赖它 (见下方 is_rebalance)
     holdings['rebalance_day_count'] = holdings.get('rebalance_day_count', 0) + 1
 
     # 获取价格 (当前持仓 + 目标股票)
@@ -665,11 +679,38 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
     except Exception as e:
         log.warning(f"净值记录失败 (不影响调仓): {e}")
 
-    # 判断是否为调仓日 (每 5 个交易日)
+    # 判断是否为调仓日
     # 2026-09-03: 原先硬编码 5，改配置不会生效 (与 topk/n_drop 同类问题)
+    # 2026-09-05: 原先判据是 rebalance_day_count % N == 0。该计数器名为
+    #   "交易日计数"，实际是"daily_runner 跑了几次" —— 手动补跑一次就 +2、
+    #   任务失败一天就不增、非交易日 fail-open 也 +1。而回测用的是真实交易日
+    #   索引 day_idx % rebal，两边会随时间漂移到不同调仓日。
+    #   改为按"上次调仓的信号日 → 本次信号日"在交易日历上的真实间隔判定:
+    #   与回测同口径，且同一天重复运行不会重复推进相位。
     rebalance_every = int(_load_signal_config().get('rebalance_every', 5))
-    is_rebalance = (holdings['rebalance_day_count'] % rebalance_every == 0)
-    log.info(f"交易日计数: {holdings['rebalance_day_count']}, 调仓: {'是' if is_rebalance else '否'}")
+    _last_rb = holdings.get('last_rebalance_signal_date')
+    if not _last_rb:
+        is_rebalance = True          # 首次运行 / 刚清仓，直接建仓
+        _elapsed_desc = "无上次调仓记录"
+    else:
+        from market_calendar import trading_days_between
+        _elapsed = trading_days_between(_last_rb, signal['date'])
+        if _elapsed is None:
+            # 日历答不了(未覆盖该区间)。宁可不动仓，也不要在时点不明时换手 ——
+            # 换手成本是确定的，而"该不该换"此刻是未知的。
+            is_rebalance = False
+            _elapsed_desc = f"日历无法计算 {_last_rb}~{signal['date']} 的间隔，跳过调仓"
+            log.warning(_elapsed_desc)
+        else:
+            is_rebalance = (_elapsed >= rebalance_every)
+            _elapsed_desc = f"距上次调仓 {_elapsed} 个交易日 (阈值 {rebalance_every})"
+    log.info(f"{_elapsed_desc}, 调仓: {'是' if is_rebalance else '否'}"
+             f"  [运行次数计数器: {holdings['rebalance_day_count']}]")
+
+    if is_rebalance and signal_stale:
+        # 过期信号不下单。换手成本是确定的，而这份信号是否仍然有效是未知的。
+        log.error("调仓日遇过期信号 — 已取消本次调仓指令")
+        is_rebalance = False
 
     if is_rebalance:
         # ── 调仓日: 生成调仓指令 ──
@@ -687,6 +728,7 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
             'buys': {c: signal['scores'].get(c, 0) for c in to_buy},
         }
         holdings['last_signal_date'] = signal['date']
+        holdings['last_rebalance_signal_date'] = signal['date']
         save_live_holdings(holdings)
 
         log.info(f"调仓指令: 卖{len(to_sell)} 买{len(to_buy)}")
@@ -706,8 +748,9 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
 
     # 信号过期提示
     if signal_stale:
-        days_gap = (date.today() - signal_date).days
-        message += f"\n\n⚠️ 信号已过期: 信号日期 {signal['date']}，距今 {days_gap} 天，请关注数据刷新是否正常"
+        _gap = f"{days_gap} 个交易日" if days_gap is not None else "间隔无法判定"
+        message += (f"\n\n⚠️ 信号已过期: 信号日期 {signal['date']}，距今 {_gap}"
+                    f" —— **本次调仓已取消**，请检查数据刷新是否正常")
 
     # 检查模型新鲜度
     freshness = sg.check_model_freshness()

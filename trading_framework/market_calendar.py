@@ -79,3 +79,28 @@ if __name__ == "__main__":
     d = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date.today()
     print(f"{d} 本地日历={_from_local_calendar(d)} "
           f"akshare={_from_akshare(d)} → is_trading_day={is_trading_day(d)}")
+
+
+def trading_days_between(start: str, end: str) -> int | None:
+    """本地日历上 (start, end] 之间的交易日数。答不了返回 None。
+
+    2026-09-05 新增。用于替换 daily_runner 里的 `rebalance_day_count += 1`
+    —— 那个计数器名为"交易日计数"，实为"daily_runner 跑了几次":
+      - 手动补跑一次        -> +2，调仓相位永久前移一天
+      - 任务失败/机器关机     -> 不增，相位后移
+      - 非交易日 fail-open 跑 -> +1，相位前移
+    而回测 (paper_trader) 用的是真实交易日索引 `day_idx % rebal`。两者会
+    随时间漂移到不同的调仓日 —— 与 n_drop/vol_target 曾在模拟盘缺失同类。
+    改为按信号日在日历上的真实间隔判定，与回测同口径且对补跑幂等。
+    """
+    try:
+        lines = [l.strip() for l in
+                 QLIB_CALENDAR.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except OSError:
+        return None
+    if not lines or start > end:
+        return None
+    # 两端都得在已下载区间内，否则数出来的间隔是残缺的
+    if start < lines[0] or end > lines[-1]:
+        return None
+    return sum(1 for d in lines if start < d <= end)
