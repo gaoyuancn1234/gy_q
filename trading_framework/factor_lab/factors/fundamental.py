@@ -116,21 +116,53 @@ def _check_fields_available(required_fields: list[str]) -> bool:
     return False
 
 
-def get_all_exprs() -> list[tuple[str, str]]:
+_BASE_FIELDS = ('close', 'open', 'high', 'low', 'volume',
+                'amount', 'turn', 'pctchg', 'isst')
+
+
+def _field_available(field: str) -> bool:
+    """单个字段是否存在于 Qlib bin 数据中"""
+    return _check_fields_available([field])
+
+
+def get_all_exprs(verbose: bool = False) -> list[tuple[str, str]]:
     """返回可用的基本面因子表达式
 
-    自动检测数据可用性，排除依赖不存在字段的因子。
+    按【单个字段】筛选，而不是全有或全无。
+
+    2026-09-05 修复: 原实现只要有任一字段缺失就 `return []`，整批 22 个
+    因子一起消失。后果是 alpha158_val 名义上是"alpha158_ext + 估值/基本面"，
+    实测 188 个因子 100% 是量价 —— 基本面占比 0%，而 preset 文档和名字
+    都在宣称含基本面。典型的"看起来有、实则没有"。
+
+    BaoStock 能提供 pe_ttm / total_mv，pb / ps_ttm / circ_mv 需要 Tushare。
+    逐字段筛选后，只注入 BaoStock 数据也能用上其中一部分因子。
     """
     all_factors = VALUATION_FACTORS + MARKET_CAP_FACTORS + CROSS_FACTORS
-    # 收集所有需要的基本面字段
-    fundamental_fields = set()
+
+    needed = set()
     for f in all_factors:
         for rf in f.required_fields:
-            if rf not in ('close', 'open', 'high', 'low', 'volume',
-                          'amount', 'turn', 'pctchg'):
-                fundamental_fields.add(rf)
+            if rf.lower() not in _BASE_FIELDS:
+                needed.add(rf)
 
-    if fundamental_fields and not _check_fields_available(list(fundamental_fields)):
-        return []  # 基本面数据不可用，返回空
+    avail = {fld for fld in needed if _field_available(fld)}
+    missing = needed - avail
 
-    return [(f.name, f.expr) for f in all_factors]
+    out = []
+    dropped = []
+    for f in all_factors:
+        req = {rf for rf in f.required_fields if rf.lower() not in _BASE_FIELDS}
+        if req <= avail:
+            out.append((f.name, f.expr))
+        else:
+            dropped.append((f.name, sorted(req - avail)))
+
+    if verbose or (missing and not out):
+        print(f"[fundamental] 可用字段 {sorted(avail) or '无'} | "
+              f"缺失 {sorted(missing) or '无'}")
+        print(f"[fundamental] 启用 {len(out)}/{len(all_factors)} 个因子")
+        if dropped and verbose:
+            for n, m in dropped[:10]:
+                print(f"    跳过 {n:22s} (缺 {','.join(m)})")
+    return out

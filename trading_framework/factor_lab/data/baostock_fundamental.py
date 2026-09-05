@@ -17,6 +17,8 @@
 - pe_ttm: 滚动市盈率 (= close / eps_ttm, 需要已有 close 数据)
 - total_mv: 总市值 (= close * total_share)
 """
+import time
+
 import baostock as bs
 import numpy as np
 import pandas as pd
@@ -40,11 +42,20 @@ def download_quarterly_data(instruments: list[str],
     Returns:
         DataFrame with columns: [instrument, pubDate, statDate,
                                   eps_ttm, roe_avg, net_profit, total_share, yoy_ni]
+
+    ⚠ 耗时: 串行 N只 × 年数 × 4季 × 2接口 次调用。549 只 × 2018~2026 约
+    4 万次，实测 1.5~2 小时，且 CPU 占用 ~96% (BaoStock SDK 每次调用都要
+    建帧+逐行解析，不是网络等待)。
+
+    首次注入必须全量跑一次；之后应改为增量 —— 季报一季度才更新一次，
+    每次全量重下 4 万次纯属浪费。增量做法: 读已有 parquet 缓存，只补
+    max(pubDate) 之后的季度。(2026-09-05 记录，尚未实现)
     """
     bs.login()
     all_rows = []
     total = len(instruments)
 
+    _t0 = time.time()
     for i, inst in enumerate(instruments):
         bao_code = _bao_code(inst)
 
@@ -87,7 +98,14 @@ def download_quarterly_data(instruments: list[str],
                 })
 
         if (i + 1) % 20 == 0 or (i + 1) == total:
-            print(f"  [baostock] 下载季报进度 [{i+1}/{total}]")
+            # flush 必需: 重定向到日志文件时 stdout 是块缓冲的，不 flush 就看不到
+            # 进度 —— 2026-09-05 实测本模块跑 11 分钟日志一个字都没有，
+            # 与 data_setup_sina 此前"卡在第 1 只上 8.5 小时无输出"是同一个毛病。
+            # 带上当前股票代码，卡住时最后一行就指明卡在哪只。
+            el = time.time() - _t0
+            eta = el / (i + 1) * (total - i - 1)
+            print(f"  [baostock] 下载季报 [{i+1}/{total}] {inst} "
+                  f"已用 {el/60:.1f}min ETA {eta/60:.1f}min", flush=True)
 
     bs.logout()
 
@@ -281,8 +299,12 @@ def main():
 
     # 2. 下载季报数据
     print("\n[Step 1] 下载季度财务数据...")
+    # end_year 跟随当前年份: 原先写死 2025，在 2026 年跑会漏掉最近一年半的
+    # 财报 —— 而基本面因子恰恰靠最新一期数据，漏掉等于因子失效。
+    from datetime import date
+    _end_year = date.today().year
     quarterly_df = download_quarterly_data(instruments,
-                                           start_year=2018, end_year=2025)
+                                           start_year=2018, end_year=_end_year)
 
     # 缓存
     cache_dir = Path(__file__).parent.parent / "results" / ".cache"
