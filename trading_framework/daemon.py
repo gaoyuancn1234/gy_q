@@ -187,7 +187,7 @@ def pid_alive(pid: int) -> bool:
     if IS_WINDOWS:
         result = subprocess.run(
             ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
-            capture_output=True, text=True, errors='replace'
+            capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
         return str(pid) in (result.stdout or "")
     try:

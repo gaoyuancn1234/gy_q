@@ -283,7 +283,7 @@ def verify_consistency(hypothesis: str, description: str, expr: str
         ]
         # prompt 走 stdin (Windows .cmd 包装器按换行截断 argv, 见 llm_backend._invoke)
         result = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
+            cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=CLAUDE_TIMEOUT, cwd=str(WORK_DIR),
             env=get_claude_env(),
         )
@@ -399,7 +399,7 @@ def _call_claude_factors(prompt: str) -> list[dict]:
             # 按第一个换行截断 —— Claude 只收到 "请将以下投资假说转化为 N 个
             # Qlib 表达式。"，假说/算子表/约束/输出格式全部丢失。
             result = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
+                cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=CLAUDE_TIMEOUT, cwd=str(WORK_DIR),
                 env=get_claude_env(),
             )

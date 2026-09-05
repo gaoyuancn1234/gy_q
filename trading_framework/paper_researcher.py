@@ -95,7 +95,7 @@ def search_arxiv(query: str, max_results: int = 3) -> list:
     api_url = f"https://export.arxiv.org/api/query?search_query=ti:{encoded}&max_results={max_results}"
     result = subprocess.run(
         ["curl", "-sf", "--max-time", "15", api_url],
-        capture_output=True, text=True, timeout=20)
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
 
     if result.returncode != 0 or not result.stdout:
         return []

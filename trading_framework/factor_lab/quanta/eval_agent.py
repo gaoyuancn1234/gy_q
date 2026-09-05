@@ -311,7 +311,7 @@ def generate_llm_feedback(traj: Trajectory, sota_entry: Optional[TraceEntry],
         ]
         # prompt 走 stdin (Windows .cmd 包装器按换行截断 argv, 见 llm_backend._invoke)
         result = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
+            cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=CLAUDE_TIMEOUT, cwd=str(work_dir),
             env=get_claude_env(),
         )

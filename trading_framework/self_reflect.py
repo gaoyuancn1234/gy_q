@@ -498,7 +498,7 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
     result = subprocess.run(
         cmd,
         input=prompt,
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=timeout,
         cwd=str(WORK_DIR),
         env=_CLEAN_ENV
@@ -522,12 +522,12 @@ def _call_claude_reflection(prompt: str, timeout: int) -> dict:
                 # 直接用 stdin 传，与本项目其他 CLI 调用一致。
                 subprocess.run(
                     [CLAUDE_BIN], input="/exit\n",
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
                     env=_CLEAN_ENV
                 )
                 print("  [reflect] token 刷新完成，重试反思...")
                 retry = subprocess.run(
-                    cmd, capture_output=True, text=True,
+                    cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                     timeout=timeout, cwd=str(WORK_DIR), env=_CLEAN_ENV
                 )
                 if retry.returncode == 0 and retry.stdout.strip():

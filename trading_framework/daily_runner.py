@@ -102,20 +102,48 @@ def refresh_daily_data() -> bool:
                           ("BaoStock", "qlib_engine.data_setup")):
         log.info(f"刷新数据 ({label})...")
         t0 = time.time()
+        # 实时透传子进程输出，不用 capture_output。
+        #
+        # 2026-09-05: 原先 capture_output=True 把子进程的 stdout 憋在管道里，
+        # 直到进程结束才一次性返回。data_setup_sina 里那套进度输出
+        # (每 20 只一行 + flush，注释还记着"卡在第 1 只上 8.5 小时、日志
+        # 一个字都没有"的事故) 在这条调用路径下完全失效 —— 而这正是生产
+        # 路径。结果是长达 1 小时的刷新期间日志毫无动静，"正在下载"和
+        # "已经卡死"从外部无法区分。
+        #
+        # 改为逐行读取并落进 log: 既保留 hang 时能看到最后停在哪只，
+        # 也保留失败时的尾部输出用于报错。
+        tail = []
         try:
-            r = subprocess.run(
+            proc = subprocess.Popen(
                 [sys.executable, "-X", "utf8", "-m", module,
                  "--target_dir", str(data_dir), "--universe", universe],
-                cwd=str(PROJECT_DIR), timeout=DATA_REFRESH_TIMEOUT,
-                capture_output=True, text=True, encoding="utf-8", errors="replace")
+                cwd=str(PROJECT_DIR), stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True,
+                encoding="utf-8", errors="replace", bufsize=1)
+            deadline = t0 + DATA_REFRESH_TIMEOUT
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log.info(f"  [{label}] {line}")
+                    tail.append(line)
+                    del tail[:-30]
+                if time.time() > deadline:
+                    proc.kill()
+                    raise subprocess.TimeoutExpired(module, DATA_REFRESH_TIMEOUT)
+            rc = proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            log.error(f"{label} 数据刷新超时 ({DATA_REFRESH_TIMEOUT}s)，换下一个源")
+            log.error(f"{label} 数据刷新超时 ({DATA_REFRESH_TIMEOUT}s)，换下一个源"
+                      + (f" | 最后输出: {tail[-1]}" if tail else ""))
+            try:
+                proc.kill()
+            except Exception:
+                pass
             continue
-        if r.returncode == 0:
+        if rc == 0:
             log.info(f"数据刷新完成: {universe} via {label} ({time.time() - t0:.0f}s)")
             return True
-        log.error(f"{label} 数据刷新失败 (rc={r.returncode}): "
-                  f"{(r.stderr or r.stdout or '')[-500:]}")
+        log.error(f"{label} 数据刷新失败 (rc={rc}): " + " | ".join(tail[-5:]))
     log.error("所有数据源都失败，本次不刷新数据")
     return False
 
@@ -161,13 +189,21 @@ def _update_daily_predictions() -> bool:
              f'last = pred.index.get_level_values(0).max().strftime("%Y-%m-%d"); '
              f'print(f"RESULT:{{last}}:{{len(pred)}}")'],
             capture_output=True, text=True, timeout=600,
+            # encoding/errors 必须显式指定: Windows 控制台默认 GBK，子进程输出的
+            # 中文按 GBK 编码，而 text=True 默认按 UTF-8 解码 -> UnicodeDecodeError
+            # 抛在 subprocess 的读取线程里，result.stderr 变成空字符串。
+            # 2026-09-05 实测后果: 日志只打出"增量预测子进程失败: "后面一片空白，
+            # 真正的报错完全看不到，而 daily_runner 照常往下走并推送日报。
+            encoding="utf-8", errors="replace",
             cwd=str(PROJECT_DIR),
         )
 
         if result.returncode != 0:
-            stderr = result.stderr[-500:] if result.stderr else ''
-            if 'RecorderInitializationError' not in stderr:
-                log.error(f"增量预测子进程失败: {stderr}")
+            # 失败原因可能只出现在 stdout(子进程崩在 print 之前)，两个都要看
+            detail = ((result.stderr or '') + (result.stdout or ''))[-800:].strip()
+            if 'RecorderInitializationError' not in detail:
+                log.error(f"增量预测子进程失败 (rc={result.returncode}): "
+                          f"{detail or '(子进程无任何输出)'}")
             return False
 
         output = result.stdout
@@ -251,7 +287,7 @@ def _update_shadow_predictions(dry_run: bool = False):
                      'factor_lab.generate_gate_mlp_predictions',
                      '--output-dir', output_dir,
                      '--test-end', test_end],
-                    capture_output=True, text=True, timeout=timeout_sec,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout_sec,
                     cwd=str(PROJECT_DIR),
                 )
                 if result.returncode == 0:
@@ -286,7 +322,7 @@ def _update_shadow_predictions(dry_run: bool = False):
                 )
                 result = subprocess.run(
                     [sys.executable, '-c', script],
-                    capture_output=True, text=True, timeout=timeout_sec,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout_sec,
                     cwd=str(PROJECT_DIR),
                 )
                 if result.returncode == 0 and 'RESULT:' in result.stdout:

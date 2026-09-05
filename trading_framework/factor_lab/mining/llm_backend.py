@@ -185,7 +185,7 @@ class LLMBackend:
         cmd = [provider.cli_path] + list(provider.cli_args)
 
         result = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
+            cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=provider.timeout, cwd=str(work_dir), env=env,
         )
         if result.returncode != 0 and not result.stdout.strip():
@@ -208,7 +208,7 @@ class LLMBackend:
                    + ["-o", tmp_path])
 
             subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
+                cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=provider.timeout, cwd=str(work_dir), env=env,
             )
             # -o 写入的是干净的最终回复 (无 banner/thinking)
