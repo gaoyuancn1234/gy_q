@@ -105,6 +105,7 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
         return {'status': 'error', 'reason': '交易日列表为空'}
 
     diffs = []
+    decisions = []          # 逐个调仓日的订单，供跨进程复现性比对
     n_rebalance = 0
     prev_close_map = {}
 
@@ -140,6 +141,8 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
             exp_buys = sorted(expected['buys'])
             got_sells = sorted(dec['pending_sells'])
             got_buys = sorted(dec['buys'])
+            decisions.append({'date': dec['date'],
+                              'sells': got_sells, 'buys': got_buys})
             if got_sells != exp_sells or got_buys != exp_buys:
                 diffs.append({
                     'date': dec['date'],
@@ -162,6 +165,7 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
         'days': len(trading_days),
         'rebalances': n_rebalance,
         'diffs': diffs,
+        'decisions': decisions,
     }
 
 
@@ -173,6 +177,7 @@ def main() -> int:
     ap.add_argument('--start', help='起始日 (覆盖 --days)')
     ap.add_argument('--end', help='结束日')
     ap.add_argument('--push', action='store_true', help='发现分叉时推送飞书')
+    ap.add_argument('--dump', help='把逐日订单写入该 JSON，用于跨进程复现性比对')
     args = ap.parse_args()
 
     import qlib
@@ -218,6 +223,12 @@ def main() -> int:
     diffs = res['diffs']
     print(f"\n  交易日 {res['days']}，调仓日 {res['rebalances']}，"
           f"分叉 {len(diffs)}")
+
+    if args.dump:
+        import json
+        with open(args.dump, 'w', encoding='utf-8') as f:
+            json.dump(res['decisions'], f, ensure_ascii=False, indent=1)
+        print(f"  逐日订单已写入 {args.dump}")
 
     if diffs:
         print("\n  分叉明细 (最多列 5 个):")
