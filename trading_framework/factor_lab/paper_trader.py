@@ -227,6 +227,29 @@ class PaperTrader:
         if pending['buys']:
             total_weight = sum(pending['buys'].values())
             available_cash = self.state['cash'] * 0.99  # 预留 1%
+
+            # 波动率目标: 缩减本次可投入的资金。
+            #
+            # 2026-09-05 修复。原先 exposure 只存进 pending['buys'] 的 weight
+            # 里，而分配式是 alloc = cash * (weight / sum(weights))。每个
+            # weight 都等于 exposure/topk，权重相同 -> 归一化后 = cash / n，
+            # **exposure 被整个约掉**。即 vol_target 在本引擎里完全不起作用。
+            #
+            # 实测: 同区间同相位跑 vol_target=8% 与关闭，Sharpe 0.976 /
+            # 收益 +17.01% / 交易 331 / 终值 117,006 —— 逐个数字完全一致。
+            #
+            # 而实盘 (live_portfolio.py:703) 做的是 `available_cash *= exposure`，
+            # 即真的少投一部分钱。于是实盘跑的策略与所有 paper_trader 回测
+            # 都不是同一个。这里改为与实盘同一口径。
+            #
+            # exposure 与这批买单绑定存放(而非放在实例属性上) —— 挂单是隔日
+            # 执行的，用实例属性会取到之后某次调仓算出的值。
+            #
+            # 注: reconcile.py 只比对买卖清单，仓位大小不在其覆盖范围内 ——
+            # 这处分叉正是因此才藏到今天。
+            _exp = float(pending.get('exposure', 1.0) or 1.0)
+            if _exp < 1.0:
+                available_cash *= _exp
             if total_weight > 0:
                 for inst, weight in list(pending['buys'].items()):
                     if inst in self.state['positions']:
@@ -254,6 +277,7 @@ class PaperTrader:
                                            shares * price * cfg['open_cost'], 'rebalance')
                         n_trades += 1
             pending['buys'] = {}
+            pending['exposure'] = 1.0
 
         # --- 2. 收盘估值 ---
         port_value = self.state['cash']
@@ -359,6 +383,8 @@ class PaperTrader:
                     )
                     weight = exposure / effective_topk
                     pending['buys'] = {inst: weight for inst in to_buy}
+                    # 与这批买单绑定，执行日据此缩减可用资金 (见上方注释)
+                    pending['exposure'] = float(exposure)
                     if exposure < 1.0:
                         self._last_exposure = (exposure, realized)
 
