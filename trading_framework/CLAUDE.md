@@ -256,6 +256,7 @@ schtasks /Query /TN "TradingSystem-PaperTrader"      # 工作日 18:30 模拟盘
 schtasks /Query /TN "TradingSystem-IntradayMonitor"  # 9:25-15:05 每 5 分钟
 schtasks /Query /TN "TradingSystem-FactorMiner"      # 每周二/五 22:00 因子挖掘
 schtasks /Query /TN "TradingSystem-SelfReflect"      # 每日 23:30 自我反思
+schtasks /Query /TN "TradingSystem-Reconcile"        # 每日 19:30 双路径对账
 # 五个任务的 WorkingDirectory 必须是 trading_framework —— 2026-09-04 发现
 # 原先为空，相对路径会解析到 System32
 schtasks /Change /TN "TradingSystem-DailyRunner" /DISABLE   # 临时停用
@@ -330,6 +331,43 @@ python news_sentinel.py --test-stocks SH600036 SH601318  # 测试个股新闻
 - 主段 `--pred-tags "" seg2pred` (2024-01~2026-08)
 - 用 `run_rolling_benchmark --test-start/--test-end --tag` 可指定任意区间；
   **新 tag 必须登记到 `KNOWN_TAGS`**，否则不同测试期结果会混进同一张表。
+
+### 双路径对账 (2026-09-05 新增，先跑这个再谈别的)
+
+    python reconcile.py                 # 最近 120 个交易日
+    python reconcile.py --start 2024-01-02 --end 2026-09-04   # 全区间
+    退出码 0=一致 / 1=发现分叉 / 2=无法对账
+
+定时任务 `TradingSystem-Reconcile` 每日 19:30 跑，发现分叉推飞书。
+
+**为什么它比再读一遍代码有用**: 本系统反复出现的是同一类缺陷 ——
+同一条规则写了两遍，改一处忘另一处。已发生过 5 次:
+
+    n_drop / vol_target   回测有、实盘有、模拟盘没有         2026-09-03
+    deal_price            研究用 open、生产用 close          2026-08-30
+    _exposure             回测/实盘各一份，回退方向相反       2026-09-05
+    调仓判定               回测按交易日、实盘按运行次数        2026-09-05
+    pending_orders        推送走 n_drop、存盘走全量换手       2026-09-05
+
+逐条去猜"下一处会在哪分叉"是猜不完的。对账不需要预测:它把回测决策时刻的
+输入原样喂给实盘代码路径，比对 sells/buys 是否一致。分叉不管出在代码、
+配置还是数据对齐上，都会当场暴露。
+
+**首次运行即报出 3 个真缺陷** (15 个调仓日里 14 个不一致):
+
+1. **实盘 n_drop 退化成"卖掉代码最小的 N 只"** —— get_signal 只返回 TopK
+   的 scores，而卖出候选按定义都在 TopK 之外，全部并列 -inf，排序 tiebreak
+   落到股票代码上。当初 Sharpe 0.33->1.27 的改动在实盘是随机挑选。
+2. **止损在实盘只是一句建议** —— 回测排单次日执行，实盘只在消息里写
+   "建议立即卖出"、不进 pending_orders，且原本在"非调仓日"分支里，调仓日
+   压根不检查。
+3. **回测把止损股卖掉再买回** —— 买入候选排除的是 `持仓 - 待卖` 而非全部
+   持仓，占掉一个 free_slot 把该买的挤出去。
+
+修完 82 个调仓日 / 649 交易日零分叉。
+
+**加新引擎、改任何调仓规则之后，必须跑一次对账再提交。**
+新的消费方请调用 `live_portfolio.compute_rebalance_orders`，不要自己算。
 
 ### 沉默失败是本系统最大的风险来源
 
