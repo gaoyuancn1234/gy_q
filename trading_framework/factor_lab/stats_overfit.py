@@ -202,7 +202,20 @@ def probability_of_backtest_overfitting(returns_matrix: list,
 
 def evaluate(returns: list, n_trials: int, sr_std_ann: float,
              returns_matrix: list | None = None) -> dict:
-    """对一次验收同时给出 DSR 与 PBO 结论"""
+    """对一次验收同时给出 DSR 与 PBO 结论
+
+    ⚠ 当前无调用方 (2026-09-05 核实)。factor_miner._run_overfit_check 绕过本
+    函数、直接调 deflated_sharpe，所以**DSR 生效但 PBO 从未运行**，过拟合
+    检验只有一半在跑。
+
+    接上 PBO 需要 returns_matrix —— 即同一轮里多个候选因子池各自的日收益
+    序列。Phase D 的漏斗本来就会评估多个池 (FUNNEL_STRATEGIES 有 6 种)，
+    把它们的收益序列收集起来即可，不需要额外回测。
+
+    PBO 回答的问题与 DSR 不同: DSR 问"这个夏普是不是运气"，PBO 问"我这套
+    挑选流程本身可不可靠" —— 后者正是 run_006/run_010 那 22 个因子
+    (样本内 +7.4% / 样本外 -12.9%) 暴露的问题。
+    """
     out = {"dsr": deflated_sharpe(returns, n_trials, sr_std_ann)}
     if returns_matrix:
         out["pbo"] = probability_of_backtest_overfitting(returns_matrix)

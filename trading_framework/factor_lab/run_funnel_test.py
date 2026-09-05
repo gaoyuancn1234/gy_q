@@ -12,16 +12,19 @@ import sys
 import time
 from pathlib import Path
 
-# 主路径的因子池 (非 worktree)
-MAIN_POOL_FILE = Path(__file__).resolve().parent.parent.parent.parent / (
-    "trading_framework/factor_lab/mining_results/global_factor_pool.json"
-)
-# 如果 worktree 路径下没有, 直接用绝对路径
-if not MAIN_POOL_FILE.exists():
-    MAIN_POOL_FILE = Path(
-        "/Users/jeric/Desktop/lab/qlib/trading_framework"
-        "/factor_lab/mining_results/global_factor_pool.json"
-    )
+# 因子池路径。本文件可能从 worktree 里运行(paper_researcher 会建 worktree)，
+# 此时因子池仍在主仓库里，故按候选顺序探测。
+#
+# 2026-09-05: 原先第二候选写死为 "/Users/jeric/Desktop/lab/..."，那是原作者
+# macOS 机器上的路径，在 Windows 上永远不存在 —— 回退等于回退到一个必然
+# 不存在的文件，后续只会拿到"文件不存在"而非明确的配置错误。
+_REL = "factor_lab/mining_results/global_factor_pool.json"
+_HERE = Path(__file__).resolve()
+_CANDIDATES = [
+    _HERE.parent.parent / _REL,                              # 正常: trading_framework/
+    _HERE.parent.parent.parent.parent / "trading_framework" / _REL,  # 从 worktree 回主仓库
+]
+MAIN_POOL_FILE = next((p for p in _CANDIDATES if p.exists()), _CANDIDATES[0])
 
 
 def main():
