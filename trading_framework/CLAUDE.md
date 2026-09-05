@@ -5,10 +5,13 @@
 
 ## 运行环境 (重要)
 
-- **解释器**: `C:\Program Files\Python312\python.exe` (Python 3.12.7, qlib 0.9.7)
-  2026-09-04 更正: 本文件原先写的 `C:\Users\gaoyu\.conda\envs\qlib\python.exe`
-  在当前机器上**不存在**(用户目录已是 `C:\Users\1`)。直接用 `python` 走的是
-  系统 3.13，装不了 pyqlib。
+- **解释器: 因机器而异，用前先实测**。直接用 `python` 走的是系统 3.13，
+  装不了 pyqlib，两台机器都一样。
+  - `DESKTOP-5F7SQIQ` (用户 gaoyu): `C:\Users\gaoyu\.conda\envs\qlib\python.exe`
+    (3.12.13, qlib 0.9.7 / lightgbm / lark_oapi 齐全)。定时任务用的是这个。
+  - 另一台 (用户 `1`): `C:\Program Files\Python312\python.exe` (3.12.7)
+  - 2026-09-05 核实: 两条路径互斥 —— 各自在对方机器上都不存在。改任务或
+    写脚本前先 `ls` 确认，不要照抄。
 - 平台已从 macOS 迁移到 **Windows**，注意三条差异:
   1. `multiprocessing` 只支持 `spawn`，无 `fork`。任何调用 `D.features()` 的
      脚本**必须**有 `if __name__ == '__main__':` 保护，否则子进程重新导入模块
@@ -59,9 +62,9 @@ Sharpe 1.171 / 收益 50.08% / 回撤 -10.59% / 超额 +13.96%
 ```
 trading_framework/
 ├── smart_bot.py           # 飞书机器人（ML信号/截图解析/重训）
-├── daily_runner.py        # 每日信号推送 (launchd 18:00)
+├── daily_runner.py        # 每日信号推送 (任务 DailyRunner, 18:00)
 ├── retrain_pipeline.py    # 季度重训 pipeline
-├── daemon.py              # 守护进程（自动重启）
+├── daemon.py              # 守护进程 (任务 FeishuBot, 登录后自启)
 ├── send_signal.py         # 发送调仓指令到飞书
 ├── cli_paths.py           # 外部CLI路径跨平台解析 (CLAUDE_BIN 等)
 ├── qlib_compat.py         # MLflow 3.x 兼容垫片 (导入即生效)
@@ -98,7 +101,7 @@ trading_framework/
 │   └── daily_log/             # 每日对比 + 汇总
 ├── self_reflect.py        # 每日自我反思 (23:30, Claude驱动)
 ├── factor_lab/            # 因子实验室
-│   ├── factor_miner.py        # 自动因子挖掘 (每日22:00, --daily模式)
+│   ├── factor_miner.py        # 自动因子挖掘 (每周二/五 22:00, --daily模式)
 │   ├── utils.py               # 共享工具 (atomic_json_dump, json_default)
 │   ├── signal_generator.py    # ML信号生成器
 │   ├── paper_trader.py        # 模拟盘引擎
@@ -144,7 +147,7 @@ daily_runner.py → 刷新数据 → 自动重训检查 → 生成ML信号 → �
   TopK 里 8 只并列同分 —— 系统原本会把这份随机名单当交易信号推出去。
 - 每日记录净值到 `nav_history`，波动率目标靠它估计已实现波动率。
 
-### 盘中监控 (9:25~15:05, launchd)
+### 盘中监控 (任务 TradingSystem-IntradayMonitor, 9:25~15:05)
 ```
 intraday_monitor.py → Sina实时行情 → 止损/异动/待执行订单 → 飞书推送
 ```
@@ -153,9 +156,14 @@ intraday_monitor.py → Sina实时行情 → 止损/异动/待执行订单 → �
 - 日内急跌: -5%
 - 15:00 收盘总结
 
-### 每日 22:00 因子挖掘 (任务 TradingSystem-FactorMiner，工作日)
+### 因子挖掘 (任务 TradingSystem-FactorMiner，**每周二/五 22:00**)
 
-**暂停原因 (2026-08-30)**: 挖掘的评估期与验收测试期原本完全相同
+**2026-09-05 由工作日每天改为每周 2 次。** 理由: 一次 session 跑 5 小时、
+多轮 LLM 调用，每天跑额度消耗大。而市场每天只新增 1 个交易日，对用数年数据
+训练、9 窗口评估的因子而言信息增量约等于零 —— **提高频率不增加信息，只增加
+搜索次数，而搜索次数正是过拟合的来源**(这也是新增 DSR/PBO 检验要对付的问题)。
+
+**历史: 2026-08-30 曾暂停** —— 挖掘的评估期与验收测试期原本完全相同
 (`quanta/config.py` 的 `ROLLING_EVAL_TEST_*` == `run_rolling_benchmark.TEST_*`)，
 等于用考题当练习册 —— 被选中的因子必然在样本内占优。实证: 已接受的 22 个
 因子样本内 +7.4%、样本外 **-12.9%**(符号反转)，已全部从 `mined.py` 清除
@@ -246,7 +254,7 @@ python daemon.py restart  # 重启
 schtasks /Query /TN "TradingSystem-DailyRunner"      # 每日 18:00 信号推送
 schtasks /Query /TN "TradingSystem-PaperTrader"      # 工作日 18:30 模拟盘重放
 schtasks /Query /TN "TradingSystem-IntradayMonitor"  # 9:25-15:05 每 5 分钟
-schtasks /Query /TN "TradingSystem-FactorMiner"      # 工作日 22:00 因子挖掘
+schtasks /Query /TN "TradingSystem-FactorMiner"      # 每周二/五 22:00 因子挖掘
 schtasks /Query /TN "TradingSystem-SelfReflect"      # 每日 23:30 自我反思
 # 五个任务的 WorkingDirectory 必须是 trading_framework —— 2026-09-04 发现
 # 原先为空，相对路径会解析到 System32
