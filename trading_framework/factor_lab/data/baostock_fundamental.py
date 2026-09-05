@@ -42,6 +42,15 @@ def _bao_code(instrument: str) -> str:
 # 这正是 CLAUDE.md 里"沉默失败"那一节的模式: 看起来在工作，实则什么都没做。
 _MAX_RETRY = 3
 
+# 每只股票之间的停顿(秒)。2026-09-05 持续 45 分钟高频查询后被 baostock
+# 以 error_code=10001011 拉黑，故意把请求摊开。
+REQUEST_PAUSE = 1.2
+
+# 断点文件目录 (与最终 parquet 同处)
+from pathlib import Path as _Path
+CACHE_DIR = _Path(__file__).parent.parent / "results" / ".cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _bs_query(fn, what: str, timeout: float = 30):
     """执行一次 baostock 查询; 检查 error_code，失败则重登后重试
@@ -97,10 +106,31 @@ def download_quarterly_data(instruments: list[str],
     max(pubDate) 之后的季度。(2026-09-05 记录，尚未实现)
     """
     from net_guard import run_with_timeout
+    import pandas as _pd
+
+    # 断点续传 —— 2026-09-05: 上一次跑到 360/549、拿到 11790 行，被 baostock
+    # 限流拉黑 (error_code=10001011) 后整批丢弃，45 分钟白跑。4 万次调用的任务
+    # 中途必须落盘，否则任何一次中断都要从头再来。
+    _ckpt = CACHE_DIR / "quarterly_fundamental.partial.parquet"
+    all_rows = []
+    done = set()
+    if _ckpt.exists():
+        _prev = _pd.read_parquet(_ckpt)
+        all_rows = _prev.to_dict('records')
+        done = set(_prev['instrument'].unique())
+        print(f"  [baostock] 断点续传: 已有 {len(done)} 只 / {len(all_rows)} 行，"
+              f"跳过这些股票", flush=True)
+
+    todo = [x for x in instruments if x not in done]
+    if not todo:
+        print("  [baostock] 全部股票已在断点文件中，直接返回")
+        return _pd.DataFrame(all_rows)
+
     _lg = run_with_timeout(bs.login, 30, 'baostock login')
     if getattr(_lg, 'error_code', '0') != '0':
         raise RuntimeError(f"baostock 登录失败: {_lg.error_code} {_lg.error_msg}")
-    all_rows = []
+
+    instruments = todo
     total = len(instruments)
     n_empty_streak = 0        # 连续多少只股票一行数据都没取到
 
@@ -164,6 +194,14 @@ def download_quarterly_data(instruments: list[str],
                   f"累计 {len(all_rows)} 行 已用 {el/60:.1f}min "
                   f"ETA {eta/60:.1f}min", flush=True)
 
+        # 定期落盘 —— 中断后可续，不必从头再来
+        if (i + 1) % 25 == 0:
+            _pd.DataFrame(all_rows).to_parquet(_ckpt)
+
+        # 限速 —— 上次是持续 45 分钟高频查询后被拉黑的。每只股票之间稍作停顿，
+        # 把请求摊开; 总耗时增加约 10 分钟，换取不被限流。
+        time.sleep(REQUEST_PAUSE)
+
         # 连续 20 只股票一行都没有 —— 正常情况下不可能(CSI300 成分股都有财报)，
         # 几乎必然是数据源侧的问题。宁可现在失败，也不要跑完两小时交出空表。
         if len(all_rows) == _rows_before:
@@ -178,6 +216,8 @@ def download_quarterly_data(instruments: list[str],
     bs.logout()
 
     df = pd.DataFrame(all_rows)
+    if not df.empty:
+        df.to_parquet(_ckpt)        # 成功路径也留一份，供下次增量
     df["pubDate"] = pd.to_datetime(df["pubDate"])
     df["statDate"] = pd.to_datetime(df["statDate"])
     print(f"  [baostock] 季报数据: {len(df)} 行, {df['instrument'].nunique()} 只股票")
