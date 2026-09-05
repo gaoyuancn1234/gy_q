@@ -95,29 +95,63 @@ def get_all_names() -> list[str]:
     return [f.name for f in all_factors]
 
 
+_BASE_FIELDS = ('close', 'open', 'high', 'low', 'volume',
+                'amount', 'turn', 'pctchg', 'isst')
+
+
+# 判定"字段可用"所需的最低覆盖率。低于此值说明只注入了一小部分股票，
+# 用这种字段建因子会让大多数股票该列为 NaN。
+_MIN_COVERAGE = 0.5
+
+# 抽样目录数。全量 stat 550 个目录不慢，但没必要；抽样足够且稳定。
+_PROBE_N = 60
+
+
 def _check_fields_available(required_fields: list[str]) -> bool:
-    """检查 Qlib bin 数据中是否存在所需字段"""
+    """检查 Qlib bin 数据中是否存在所需字段
+
+    2026-09-06 修复。原实现**只看 iterdir() 遇到的第一个目录**就下结论:
+
+        for stock_dir in data_dir.iterdir():
+            if stock_dir.is_dir() and stock_dir.name.startswith('s'):
+                ...
+                return True / False        # 第一个就 return
+
+    而 iterdir() 的顺序由文件系统决定，实测第一个是 `sh000300` —— **沪深300
+    指数本身**，不是股票。指数没有 PE/PB，于是函数返回 False，判定全部估值
+    字段缺失。实际 550 个目录里 549 个都有数据，只有那一个指数没有，而它恰好
+    排在最前面。
+
+    表现是: D.features 取回 $pe_ttm 等五个字段 100% 非空，get_all_exprs()
+    却报告"缺失 ['circ_mv','pb','pe_ttm','ps_ttm','total_mv']、启用 0/22"。
+    两个说法直接矛盾 —— 这类矛盾必定是 bug。
+
+    改为抽样多只并要求覆盖率达标: 单点判断在这种数据上本就不可靠，且注入
+    中途失败会留下"一部分股票有、一部分没有"的状态，覆盖率能把它暴露出来，
+    单点判断则可能恰好命中有数据的那只而误报可用。
+    """
     import os
     from pathlib import Path
     data_dir = Path(os.path.expanduser('~/.qlib/qlib_data/cn_data_bs/features'))
     if not data_dir.exists():
         return False
-    # 检查第一个股票目录
-    for stock_dir in data_dir.iterdir():
-        if stock_dir.is_dir() and stock_dir.name.startswith('s'):
-            for field in required_fields:
-                if field in ('close', 'open', 'high', 'low', 'volume',
-                             'amount', 'turn', 'pctchg'):
-                    continue  # 基础字段肯定存在
-                bin_file = stock_dir / f'{field}.day.bin'
-                if not bin_file.exists():
-                    return False
-            return True
-    return False
 
+    fields = [f for f in required_fields if f.lower() not in _BASE_FIELDS]
+    if not fields:
+        return True
 
-_BASE_FIELDS = ('close', 'open', 'high', 'low', 'volume',
-                'amount', 'turn', 'pctchg', 'isst')
+    # 排除指数目录 (sh000300 等)，它们不会有基本面字段
+    dirs = [d for d in data_dir.iterdir()
+            if d.is_dir() and d.name.startswith(('sh6', 'sh68', 'sz0', 'sz3'))]
+    if not dirs:
+        return False
+    probe = dirs[:_PROBE_N]
+
+    for field in fields:
+        n_have = sum(1 for d in probe if (d / f'{field}.day.bin').exists())
+        if n_have / len(probe) < _MIN_COVERAGE:
+            return False
+    return True
 
 
 def _field_available(field: str) -> bool:
