@@ -707,6 +707,24 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
     log.info(f"{_elapsed_desc}, 调仓: {'是' if is_rebalance else '否'}"
              f"  [运行次数计数器: {holdings['rebalance_day_count']}]")
 
+    # ── 止损检查 (每日，调仓日也做) ──
+    # 2026-09-05 双路径对账发现的语义分叉:
+    #   回测: 止损触发 -> 排进 pending['sells'] -> 次日收盘真的卖出
+    #   实盘: 只发一句"建议立即卖出"的文字，不写 pending_orders，
+    #         盘中监控的待执行提醒也看不到它; 且这段原本在"非调仓日"分支里,
+    #         调仓日压根不检查止损。
+    # 即回测绩效里含了一套实盘只当建议的止损机制，两者不是同一个策略。
+    # 现在止损单进入 pending_orders，与调仓卖单同一条执行路径。
+    stop_alerts = check_stop_loss(holdings, prices)
+    if stop_alerts:
+        _pend = holdings.setdefault('pending_orders', {'sells': [], 'buys': {}})
+        _ps = _pend.setdefault('sells', [])
+        for a in stop_alerts:
+            _code = a.get('instrument') or a.get('code')
+            if _code and _code not in _ps:
+                _ps.append(_code)
+        log.warning(f"止损触发 {len(stop_alerts)} 只，已排入待执行卖单")
+
     if is_rebalance and signal_stale:
         # 过期信号不下单。换手成本是确定的，而这份信号是否仍然有效是未知的。
         log.error("调仓日遇过期信号 — 已取消本次调仓指令")
@@ -717,12 +735,15 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         message = generate_live_instructions(signal, holdings, prices)
 
         # 保存待执行订单到 holdings
-        target_set = set(signal['target_stocks'])
-        current_set = set(holdings.get('positions', {}).keys())
-        # 排序保证确定性（集合差集迭代顺序随 Python 哈希随机化变化）
-        to_sell = sorted(current_set - target_set)
-        to_buy = [c for c in signal['target_stocks'] if c not in current_set]
+        # 与推送给用户的指令共用同一实现 —— 此前这里是全量换手 (无 n_drop、
+        # 买入无上限)，而飞书消息走的是 n_drop 限制版，同一次调仓给出两条
+        # 互相矛盾的指令，盘中监控读的正是这份错的。见 compute_rebalance_orders
+        from portfolio.live_portfolio import compute_rebalance_orders
+        _orders = compute_rebalance_orders(signal, holdings)
+        to_sell = _orders['sells']
+        to_buy = _orders['buys']
 
+        # to_sell 已由 compute_rebalance_orders 并入既有止损单，此处直接落盘
         holdings['pending_orders'] = {
             'sells': to_sell,
             'buys': {c: signal['scores'].get(c, 0) for c in to_buy},
@@ -736,8 +757,8 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
         # ── 非调仓日: 日报 ──
         message = get_daily_report(holdings, prices)
 
-        # 止损检查
-        alerts = check_stop_loss(holdings, prices)
+        # 止损展示 (触发判定与排单已在上方统一完成，这里只呈现)
+        alerts = stop_alerts
         if alerts:
             alert_names = [f"{a['name']}({a['loss_pct']:.1%})" for a in alerts]
             message += f"\n\n🚨 止损触发: {', '.join(alert_names)}"

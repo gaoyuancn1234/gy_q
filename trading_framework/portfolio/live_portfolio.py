@@ -574,6 +574,59 @@ def get_model_version() -> str:
         return "M01"
 
 
+# ============ 调仓订单计算 (单一实现) ============
+
+def compute_rebalance_orders(signal: dict, holdings: dict) -> dict:
+    """由信号与当前持仓算出本次调仓的买卖清单
+
+    2026-09-05 抽出。此前同一件事有两份实现且结论不同:
+
+        generate_live_instructions (推给用户的消息)
+            select_sells(..., n_drop=4)      -> 最多卖 4 只
+            to_buy[:free]                    -> 只买腾出的坑位
+
+        daily_runner 存进 holdings['pending_orders']
+            sorted(current_set - target_set) -> 全量换手，无 n_drop
+            to_buy 无上限
+
+    后果是同一次调仓给出两条互相矛盾的指令: 18:00 飞书推"卖4买4"，次日
+    9:30 盘中监控读 pending_orders 提醒"待执行 卖12买12"。若照后者执行，
+    就是回测中吃掉本金约 14% 的全量换手。daily_runner 的日志行
+    "调仓指令: 卖N 买M" 报的也是这份错数。
+
+    两处现在共用本函数。新增消费方请调用它，不要再各算一遍。
+
+    Returns:
+        {'sells': [...], 'buys': [...], 'holds': set, 'n_drop': int|None}
+        sells/buys 均已排序，保证可复现 (集合迭代顺序随哈希随机化变化)。
+    """
+    target_set = set(signal['target_stocks'])
+    current_set = set(holdings.get('positions', {}).keys())
+    topk = signal['effective_topk']
+
+    n_drop = _get_vol_target_config().get('n_drop')
+    sells = select_sells(current_set, target_set,
+                         scores=signal.get('scores') or {},
+                         n_drop=n_drop)
+
+    # 已挂但未执行的止损单也要算作"即将卖出"，否则腾出的坑位数会少算，
+    # 买入数量与回测对不上 (回测的 current_holds 就是扣掉 pending sells 的)。
+    pending_sells = set(holdings.get('pending_orders', {}).get('sells', []))
+    sells = sells | (pending_sells & current_set)
+
+    holds = current_set - sells
+    # 只买入被腾出的坑位数，保持持仓数稳定
+    free = max(0, topk - len(holds))
+    buys = [c for c in signal['target_stocks'] if c not in current_set][:free]
+
+    return {
+        'sells': sorted(sells),
+        'buys': buys,
+        'holds': holds,
+        'n_drop': n_drop,
+    }
+
+
 # ============ 指令生成 ============
 
 def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> str:
@@ -603,14 +656,10 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
     #   全量换手  Sharpe 0.24(段1) / 0.48(2024-26)
     #   n_drop=2  Sharpe 1.27(段1) / 1.16(2024-26)
     # 规则实现在 portfolio/rebalance_rules.py，与模拟盘共用同一份
-    _n_drop = _get_vol_target_config().get('n_drop')
-    to_sell = select_sells(current_set, target_set,
-                           scores=signal.get('scores') or {},
-                           n_drop=_n_drop)
-    to_hold = current_set - to_sell
-    # 只买入被腾出的坑位数，保持持仓数稳定
-    _free = max(0, topk - len(to_hold))
-    to_buy_codes = [c for c in signal['target_stocks'] if c not in current_set][:_free]
+    _orders = compute_rebalance_orders(signal, holdings)
+    to_sell = set(_orders['sells'])
+    to_hold = _orders['holds']
+    to_buy_codes = _orders['buys']
 
     model_ver = get_model_version()
     lines = [

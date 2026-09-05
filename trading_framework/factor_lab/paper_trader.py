@@ -314,8 +314,30 @@ class PaperTrader:
                 current_holds = current_set - set(pending['sells'])
                 # 只买入被腾出的坑位数，保持持仓数稳定 (与实盘一致)
                 free_slots = max(0, effective_topk - len(current_holds))
+                # 候选里必须排除**全部现有持仓**，而不只是 current_holds。
+                # 2026-09-05 双路径对账发现: 一只被止损排进待卖、但仍留在
+                # TopK 里的股票，不在 current_holds 中，于是会被"卖掉再买回"。
+                # 执行阶段该买单会因 `inst in positions` 被跳过，但它已经占掉
+                # 一个 free_slot，把真正该买的股票挤出去 —— 资金被少投出去一份。
+                # 实盘 (compute_rebalance_orders) 排除的是全部持仓，是对的。
                 to_buy = [i for i in day_signal.head(effective_topk).index
-                          if i not in current_holds][:free_slots]
+                          if i not in current_holds and i not in current_set
+                          ][:free_slots]
+
+                # 记录决策时刻的输入与输出，供 reconcile.py 做等价比对。
+                # 必须在这里记 —— 决策发生在"执行完昨日挂单"之后，从外部
+                # 取快照会差一步状态，比出来的是测量偏差而非真分叉。
+                self.last_decision = {
+                    'date': date_str,
+                    'positions': sorted(current_set),
+                    'pending_sells': sorted(pending['sells']),
+                    'effective_topk': effective_topk,
+                    'regime': regime,
+                    'target_stocks': list(day_signal.head(effective_topk).index),
+                    'scores': day_signal.to_dict(),
+                    'sells': sorted(to_sell),
+                    'buys': list(to_buy),
+                }
                 if to_buy:
                     # 波动率目标: 按已实现波动率缩放本次投入的权益敞口
                     exposure, realized = compute_exposure(

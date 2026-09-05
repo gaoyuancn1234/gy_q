@@ -204,7 +204,16 @@ class SignalGenerator:
         day_signal = day_signal.sort_values(ascending=False)
 
         target_stocks = list(day_signal.head(effective_topk).index)
-        scores = day_signal.head(effective_topk).to_dict()
+        # scores 必须是**全池**分数，不能只给 TopK。
+        # 2026-09-05: 原先是 day_signal.head(effective_topk).to_dict()，
+        # 而卖出候选按定义就是"不在 TopK 里"的持仓 —— 于是 select_sells 里
+        # 每一个候选都 scores.get(c, -inf) 取不到值、一起并列 -inf，排序
+        # 退化成按股票代码字母序。n_drop 本该"卖掉分数最低的 N 只"，实盘
+        # 实际执行的是"卖掉代码最小的 N 只"。
+        # 双路径对账发现: 2026-03~09 的 15 个调仓日里 14 个卖出清单与回测
+        # 不同(买入清单 15/15 全同)，即 n_drop 这项 Sharpe 0.33->1.27 的
+        # 改动在实盘被降级成了随机挑选。
+        scores = day_signal.to_dict()
 
         # 质量分数
         q_val = None

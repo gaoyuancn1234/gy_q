@@ -48,6 +48,18 @@ def select_sells(current: set, target: set, scores: dict,
     if n_drop is None or not all_out:
         return all_out
     scores = scores or {}
+    # 排序依据全缺失时必须出声 —— 否则所有候选并列 -inf，排序静默退化成
+    # 按股票代码字母序，"卖掉最差的 N 只"变成"卖掉代码最小的 N 只"，
+    # 而调用方看到的仍是一个长度正确的卖出清单。
+    # 2026-09-05 实盘就是这样跑的: get_signal 只返回 TopK 的分数，而卖出
+    # 候选按定义都在 TopK 之外，无一命中。
+    n_scored = sum(1 for c in all_out if c in scores)
+    if n_scored == 0:
+        print(f"[rebalance_rules] 警告: {len(all_out)} 个卖出候选无一有分数，"
+              f"n_drop 排序已退化为按代码字母序 —— 请检查 scores 是否只含 TopK")
+    elif n_scored < len(all_out):
+        print(f"[rebalance_rules] 提示: {len(all_out) - n_scored}/{len(all_out)} "
+              f"个卖出候选无分数，将被排在最前(视为最差)")
     # 显式排序: 直接迭代集合会因字符串哈希随机化导致同配置两次结果不同
     # (CLAUDE.md 记录过 Sharpe 0.318 vs 0.247 的复现失败)
     ranked = sorted(all_out, key=lambda c: (scores.get(c, float('-inf')), c))
