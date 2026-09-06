@@ -629,20 +629,36 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
     #   2. 原先 stale 只在推送消息尾部追加一行文字，**不阻断调仓指令生成** ——
     #      数据刷新静默失败时，系统照样按上周的信号推 "买X卖Y"。
     #      过期信号现在禁止调仓 (仍推送持仓日报与止损告警)。
-    STALE_TRADING_DAYS = 2
+    #   3. 2026-09-06 修正假阳性: 原先要求"今天"也落在交易日历区间内，而日历
+    #      只含交易日 —— 周末/节假日跑必然落到区间外，被判"无法判定->过期"。
+    #      实测当日(周六) dry run 因此取消了调仓，而信号日 2026-09-04 正是
+    #      最近的交易日、完全新鲜。现在分开看信号滞后与数据管线滞后。
+    STALE_TRADING_DAYS = 2      # 有行情却没信号，最多容忍 2 个交易日
+    MAX_CALENDAR_LAG = 12       # 数据管线滞后上限(日历日)。国庆最长约 9
     signal_stale = False
     days_gap = None
     try:
-        from market_calendar import trading_days_between
-        days_gap = trading_days_between(signal['date'],
-                                        date.today().strftime('%Y-%m-%d'))
+        from market_calendar import calendar_status
+        _st = calendar_status(signal['date'])
+        days_gap = _st['trading_gap']
+        _lag = _st['calendar_lag']
+
         if days_gap is None:
-            # 日历覆盖不到今天(数据未刷新到位)本身就是可疑信号，按过期处理
             signal_stale = True
-            log.warning(f"信号时效无法判定: 交易日历未覆盖 {signal['date']}~今天")
+            log.warning(f"信号时效无法判定: 交易日历读不到或不覆盖 {signal['date']}")
         elif days_gap > STALE_TRADING_DAYS:
             signal_stale = True
-            log.warning(f"信号已过期: 信号日期 {signal['date']}, 距今 {days_gap} 个交易日")
+            log.warning(f"信号已过期: 信号日期 {signal['date']}，"
+                        f"其后已有 {days_gap} 个交易日无信号")
+        elif _lag is not None and _lag > MAX_CALENDAR_LAG:
+            # 日历不再前进时 trading_gap 会假性为 0 —— 看起来"没有新交易日"，
+            # 实际是数据没刷新。必须单独判，否则管线挂掉反而查不出来。
+            signal_stale = True
+            log.warning(f"数据管线滞后: 交易日历止于 {_st['calendar_end']}，"
+                        f"距今 {_lag} 个日历日，超过上限 {MAX_CALENDAR_LAG}")
+        else:
+            log.info(f"信号时效正常: 日历止于 {_st['calendar_end']}，"
+                     f"信号后无信号交易日 {days_gap} 天，管线滞后 {_lag} 日历日")
     except (ValueError, KeyError) as e:
         signal_stale = True
         log.warning(f"信号时效检查异常，按过期处理: {e}")
@@ -769,7 +785,8 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
 
     # 信号过期提示
     if signal_stale:
-        _gap = f"{days_gap} 个交易日" if days_gap is not None else "间隔无法判定"
+        _gap = (f"其后 {days_gap} 个交易日无信号" if days_gap is not None
+                else "间隔无法判定")
         message += (f"\n\n⚠️ 信号已过期: 信号日期 {signal['date']}，距今 {_gap}"
                     f" —— **本次调仓已取消**，请检查数据刷新是否正常")
 

@@ -104,3 +104,54 @@ def trading_days_between(start: str, end: str) -> int | None:
     if start < lines[0] or end > lines[-1]:
         return None
     return sum(1 for d in lines if start < d <= end)
+
+
+def calendar_status(signal_date: str, today: str = None) -> dict:
+    """信号相对交易日历的新鲜度
+
+    2026-09-06 新增，取代直接用 trading_days_between(signal, today) 判时效。
+
+    原做法要求 today 也落在已下载的交易日历区间内，而**日历只含交易日** ——
+    周六/周日/节假日跑就必然落到区间外，被判成"无法判定 -> 按过期处理"。
+    实测 2026-09-06(周六) 的 dry run 即因此取消了调仓，而信号日 2026-09-04
+    正是最近的交易日、完全新鲜。日历不含非交易日是正常的，不是数据故障。
+
+    改为分开看两件事:
+
+      trading_gap    日历上 (signal_date, 日历末端] 的交易日数。
+                     衡量"有行情但没信号"的天数 —— 这才是信号本身的滞后。
+      calendar_lag   今天 − 日历末端，按**日历日**算。
+                     衡量数据管线的滞后。周末是 2，国庆最长约 9。
+                     它变大说明刷新没跑成，此时 trading_gap 会假性为 0
+                     (日历不再前进，看起来"没有新的交易日")，必须单独看。
+
+    Returns:
+        {'trading_gap': int|None, 'calendar_lag': int|None,
+         'calendar_end': str|None}
+        日历读不到或 signal_date 早于日历起点时相应字段为 None。
+    """
+    from datetime import date as _date, datetime as _dt
+
+    try:
+        lines = [l.strip() for l in
+                 QLIB_CALENDAR.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except OSError:
+        return {'trading_gap': None, 'calendar_lag': None, 'calendar_end': None}
+    if not lines:
+        return {'trading_gap': None, 'calendar_lag': None, 'calendar_end': None}
+
+    cal_end = lines[-1]
+    today = today or _date.today().strftime("%Y-%m-%d")
+
+    # signal_date 早于日历起点 -> 数不出来
+    gap = None
+    if signal_date >= lines[0]:
+        gap = sum(1 for d in lines if signal_date < d <= cal_end)
+
+    try:
+        lag = (_dt.strptime(today, "%Y-%m-%d").date()
+               - _dt.strptime(cal_end, "%Y-%m-%d").date()).days
+    except ValueError:
+        lag = None
+
+    return {'trading_gap': gap, 'calendar_lag': lag, 'calendar_end': cal_end}
