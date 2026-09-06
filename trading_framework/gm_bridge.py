@@ -105,12 +105,18 @@ def init(context):
     set_account_id(env('GM_ACCOUNT_ID'))
     action = getattr(context, 'gm_bridge_action', 'check')
 
-    if action == 'check':
-        _do_check()
-    elif action == 'place':
-        _do_place()
-    elif action == 'sync':
-        _do_sync()
+    try:
+        if action == 'check':
+            _do_check()
+        elif action == 'place':
+            _do_place()
+        elif action == 'sync':
+            _do_sync()
+    finally:
+        # run() 会一直阻塞等行情事件。本桥接是一次性动作，做完必须主动停，
+        # 否则进程挂住 —— 实测被 timeout 杀掉时退出码 124，看起来像失败。
+        from gm.api import stop
+        stop()
 
 
 def _account_snapshot() -> dict:
@@ -256,19 +262,19 @@ def main() -> int:
 
     action = 'check' if args.check else ('place' if args.place else 'sync')
 
-    from gm.api import run, MODE_LIVE
-    import gm.api as gmapi
-
-    # 掘金通过模块级 init(context) 回调进入，动作用模块全局传递
-    global _ACTION
-    _ACTION = action
+    # gm.run() 内部用 optparse 解析 sys.argv，会把本脚本的 --check/--place
+    # 当成自己的选项并报 "no such option"。解析完就把 argv 清干净。
+    sys.argv = [sys.argv[0]]
 
     def _init(context):
         context.gm_bridge_action = action
         init(context)
 
-    # run() 会阻塞直到策略停止; 这里的策略只在 init 里干活然后退出
+    # 掘金按模块级函数名回调，替换后 run() 才会走到我们的分支
     sys.modules[__name__].init = _init
+
+    from gm.api import run, MODE_LIVE
+    # run() 会阻塞直到策略停止; 本策略只在 init 里干活
     run(strategy_id=env('GM_STRATEGY_ID'), filename=Path(__file__).name,
         mode=MODE_LIVE, token=env('GM_TOKEN'))
     return 0
