@@ -324,28 +324,32 @@ class SignalGenerator:
         if 'error' in sig:
             return sig
 
-        target_set = set(sig['target_stocks'])
-        current_set = set(current_positions.keys())
         topk = sig['effective_topk']
         weight = 1.0 / topk
 
-        # 显式排序: 直接迭代集合会因 Python 字符串哈希随机化导致同一输入
-        # 两次得到不同顺序。to_sell 的顺序会影响资金不足时先卖谁，
-        # 进而影响实际成交 —— CLAUDE.md 记录过同类事故(Sharpe 0.318 vs 0.247)。
-        # 按信号分数升序卖出(最差的先走)，与 rebalance_rules.select_sells 一致。
-        scores = sig.get('scores') or {}
-        to_sell = [
-            {'instrument': inst, 'reason': 'not_in_topk'}
-            for inst in sorted(current_set - target_set,
-                               key=lambda c: (scores.get(c, float('-inf')), c))
-        ]
+        # 2026-09-06: 改为委托给 live_portfolio.compute_rebalance_orders。
+        #
+        # 原实现自己算了一套:
+        #     to_sell = sorted(current_set - target_set, ...)   # 全量换手，无 n_drop
+        #     to_buy  = 全部不在持仓的 target                     # 无坑位上限
+        #
+        # 与 daily_runner 里那处 pending_orders 是**同一个 bug 的第三份实现**
+        # (那处已于 2026-09-05 修复: 推送走 n_drop、存盘走全量换手，同一次
+        # 调仓给出两条互相矛盾的指令，盘中监控读的正是错的那份)。
+        #
+        # 本函数目前**无任何调用者**，所以没造成实际损失。但它的名字看起来
+        # 就是"获取调仓指令"的正规入口，接新消费方时极易误用并静默拿到全量
+        # 换手 —— 换手成本曾吃掉本金约 14%。委托而非删除，是为了让这个名字
+        # 继续可用且不可能再分叉。
+        from portfolio.live_portfolio import compute_rebalance_orders
+        _orders = compute_rebalance_orders(
+            sig, {'positions': dict(current_positions)})
 
-        to_buy = []
-        for inst in sig['target_stocks']:      # 已按分数降序，顺序确定
-            if inst not in current_set:
-                to_buy.append({'instrument': inst, 'weight': round(weight, 4)})
-
-        to_hold = sorted(current_set & target_set)
+        to_sell = [{'instrument': i, 'reason': 'not_in_topk'}
+                   for i in _orders['sells']]
+        to_buy = [{'instrument': i, 'weight': round(weight, 4)}
+                  for i in _orders['buys']]
+        to_hold = sorted(_orders['holds'])
 
         return {
             'date': sig['date'],

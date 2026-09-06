@@ -157,6 +157,66 @@ def _download_index(ak, start_date: str, end_date: str):
     return _normalize(df, start_date, end_date, is_index=True)
 
 
+# 本下载器自己产出的字段。除此之外出现在旧数据集里的 bin，都是别处注入的
+# (估值 pe_ttm/pb/ps_ttm/total_mv/circ_mv、资金流、北向等)，重建时必须搬过来。
+_OWN_FIELDS = {
+    'open', 'high', 'low', 'close', 'volume', 'amount',
+    'turn', 'pctchg', 'isst', 'factor', 'change', 'vwap',
+}
+
+
+def _carry_over_injected(build_path, target_path) -> int:
+    """把旧数据集里"非本源产出"的字段搬进新数据集
+
+    2026-09-06 新增。此前每次刷新都会静默抹掉注入的字段:
+
+      1. 重建走 .building 旁路目录，只含本下载器产出的 9 个字段
+      2. os.replace 原子替换后，旧目录连同注入的 5 个估值字段一起 rmtree
+
+    实测当天注入了 549 只的 pe_ttm/pb/ps_ttm/total_mv/circ_mv，跑完一次
+    daily_runner 后 550 个目录里**有 pe_ttm 的为 0**。
+
+    危险的是它完全静默: preset 名 alpha158_val 不变，因子数从 210 悄悄退回
+    188。而 fundamental._check_fields_available 当时只看 iterdir() 的第一个
+    目录(恰好是指数 sh000300、本就没有估值字段)，永远报"字段缺失" ——
+    两个 bug 互相掩盖，注入做过也看不出来做没做成。这多半就是 CLAUDE.md
+    长期记着"188 因子"的原因。
+
+    Returns: 搬运的文件数
+    """
+    import shutil as _sh
+    from pathlib import Path as _P
+    build_path, target_path = _P(build_path), _P(target_path)
+    if not target_path.exists():
+        return 0
+
+    n = 0
+    for inst_dir in target_path.glob('features/*'):
+        if not inst_dir.is_dir():
+            continue
+        dst_dir = build_path / 'features' / inst_dir.name
+        for b in inst_dir.glob('*.bin'):
+            field = b.name.split('.')[0].lower()
+            if field in _OWN_FIELDS:
+                continue
+            if not dst_dir.exists():
+                # 新数据集里没有这只股票(如已退市)，跳过 —— 搬过去也没有
+                # 对应的日历行，反而会造成长度不一致
+                continue
+            dst = dst_dir / b.name
+            if not dst.exists():
+                _sh.copy2(b, dst)
+                n += 1
+    if n:
+        fields = sorted({b.name.split('.')[0]
+                         for d in target_path.glob('features/*')
+                         if d.is_dir()
+                         for b in d.glob('*.bin')
+                         if b.name.split('.')[0].lower() not in _OWN_FIELDS})
+        print(f"[sina] 已保留注入字段 {fields}: 搬运 {n} 个文件")
+    return n
+
+
 def _swap_in(build_path, target_path, attempts: int = 12, wait: float = 10.0):
     """把 build_path 原子换成 target_path
 
@@ -170,6 +230,13 @@ def _swap_in(build_path, target_path, attempts: int = 12, wait: float = 10.0):
     old_path = target_path.with_name(target_path.name + ".old")
     if old_path.exists():
         shutil.rmtree(old_path, ignore_errors=True)
+
+    # 换入前先把旧数据集里注入的字段搬进 build —— 否则随旧目录一起被删
+    try:
+        _carry_over_injected(build_path, target_path)
+    except OSError as e:
+        print(f"[sina] 警告: 搬运注入字段失败 ({e})，"
+              f"替换后需重新运行注入脚本")
 
     for i in range(1, attempts + 1):
         try:
