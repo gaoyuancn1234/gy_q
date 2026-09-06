@@ -665,9 +665,19 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
             min_exposure=_vt.get('vol_min_exposure', 0.2))
         if exposure < 1.0:
             available_cash *= exposure
-            lines.append(f"【风控】实现波动 {realized:.1%} > 目标 "
-                         f"{_vt['vol_target']:.0%}，敞口降至 {exposure:.0%}，"
-                         f"可用资金 {available_cash:,.0f}")
+            # realized 可能是 None —— 2026-09-05 把 compute_exposure 的
+            # "估不出波动率"分支从 return 1.0 改成 return (0.6, None) 之后，
+            # 出现了"敞口 < 1 但 realized 为 None"这一组合。原文案直接
+            # f"{realized:.1%}"，遇到 None 会 TypeError 打掉整个 daily_runner。
+            # 触发条件是净值历史不足 (刚清仓/刚建仓)，正是最需要推送的时候。
+            if realized is None:
+                lines.append(f"【风控】波动率无法估计(净值历史不足)，"
+                             f"敞口保守收缩至 {exposure:.0%}，"
+                             f"可用资金 {available_cash:,.0f}")
+            else:
+                lines.append(f"【风控】实现波动 {realized:.1%} > 目标 "
+                             f"{_vt['vol_target']:.0%}，敞口降至 {exposure:.0%}，"
+                             f"可用资金 {available_cash:,.0f}")
             lines.append("")
 
     if to_buy_codes:
