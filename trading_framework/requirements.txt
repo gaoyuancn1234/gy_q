@@ -36,3 +36,9 @@ redis                  # 可选: 临时文件存储。不可用时 TempFileStore
 # 2026-09-05 移除 faiss-cpu / onnxruntime / tokenizers / huggingface_hub:
 # README 把它们列为"记忆系统(Faiss 向量检索)"依赖，但全库对这四个包
 # 零引用 —— 该功能从未实现。装它们会白白拉进数百 MB 且拖慢环境搭建。
+
+# --- 掘金量化仿真 (可选，只在接模拟盘时需要) ---
+# 会把 protobuf 降到 3.20.3。实测 qlib 0.9.7 / lightgbm 4.6 / pandas 2.3 /
+# lark_oapi 均不受影响。仅装 SDK 不够 —— 交易接口要求掘金终端常驻运行，
+# 且账户接口只在 run(strategy_id=..., mode=MODE_LIVE) 启动的策略里返回数据。
+gm                     # gm_bridge.py
