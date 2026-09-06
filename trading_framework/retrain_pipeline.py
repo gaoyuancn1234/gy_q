@@ -146,6 +146,41 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
     _data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if _universe == 'csi300' else _universe}"
     qlib.init(provider_uri=_data_dir, region='cn')
 
+    # 因子集指纹校验 —— 拒绝在不同因子集上做增量扩展。
+    #
+    # 2026-09-06 新增。extend 只训练新窗口、把结果追加到旧预测上。若 preset
+    # 的因子集在两次训练之间变了，得到的是"旧日期来自 A 模型、新日期来自 B
+    # 模型"的拼接序列，而 rolling JSON 只记 preset 名、看不出差别。
+    #
+    # 真实случай: alpha158_val = 去冗余量价 + fundamental.get_all_exprs()，
+    # 而后者取决于 qlib bin 里有没有估值字段 —— 注入前 188 因子、注入后 210，
+    # **名字完全一样**。飞书发一句"重训"就会产出混合序列并写回生产 pkl。
+    from factor_lab.factors.presets import factor_fingerprint
+    _fp = factor_fingerprint(PRESET)
+    _old_fp = (old_info or {}).get('factor_fingerprint')
+    if old_pred is not None and _old_fp:
+        if (_old_fp.get('hash') != _fp['hash']
+                or _old_fp.get('n_factors') != _fp['n_factors']):
+            raise RuntimeError(
+                f"因子集已变化，不能做增量扩展。\n"
+                f"  现有预测: {_old_fp.get('n_factors')} 因子 "
+                f"(hash={_old_fp.get('hash')})\n"
+                f"  当前 {PRESET}: {_fp['n_factors']} 因子 "
+                f"(hash={_fp['hash']})\n"
+                f"  增量扩展只训练新窗口并追加到旧预测上，因子集不同会产出"
+                f"前后两个模型拼接的信号序列。\n"
+                f"  需要全量重训: python -m factor_lab.run_rolling_benchmark "
+                f"--configs {CONFIG_NAME} --presets {PRESET} --models LightGBM "
+                f"--tag <新tag>，验证通过后再替换生产缓存。")
+    elif old_pred is not None and not _old_fp:
+        # 旧结果没记指纹(2026-09-06 之前生成的)。无法判定是否同一因子集，
+        # 宁可拦下也不要产出静默混合的序列。
+        raise RuntimeError(
+            f"现有预测缓存未记录因子指纹(2026-09-06 之前生成)，无法确认与当前"
+            f" {PRESET}({_fp['n_factors']} 因子) 是否同一套因子。\n"
+            f"  请全量重训一次以写入指纹，或人工确认后在 JSON 里补\n"
+            f"  \"factor_fingerprint\": {_fp} 再重试。")
+
     new_preds = []
     new_window_details = []
 
@@ -252,6 +287,7 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
     # 更新 JSON
     all_window_details = old_windows + new_window_details
     result = {
+        "factor_fingerprint": _fp,      # 见上方校验，供下次扩展比对
         "config_name": CONFIG_NAME,
         "preset": PRESET,
         "model": MODEL_NAME,

@@ -193,3 +193,42 @@ def build_handler(preset_name: str, start_time: str, end_time: str,
         include_alpha158=preset["include_alpha158"],
     )
     return handler
+
+
+def factor_fingerprint(preset_name: str) -> dict:
+    """因子集指纹 — 用于判定"同一个 preset 名，因子集是否还是同一套"
+
+    2026-09-06 新增。起因是一处会静默产生混合模型的缺陷:
+
+    rolling 结果 JSON 只记 `preset: alpha158_val`，不记因子数。而
+    alpha158_val 的构成是 `_get_selected_exprs() + fundamental.get_all_exprs()`
+    —— fundamental 那部分取决于 qlib bin 里有没有估值字段。注入估值数据前
+    它返回 []，preset 是 188 因子; 注入后返回 22 个，同一个名字变成 210 因子。
+
+    **名字没变，内容变了，元数据看起来完全一致。**
+
+    而 retrain_pipeline.extend_rolling_predictions 只训练新窗口、把结果
+    追加到旧预测上。于是重训一次就会得到: 旧日期来自 188 因子模型、新日期
+    来自 210 因子模型的拼接序列，写回生产 pkl，没有任何提示。
+    飞书发一句"重训"就能触发。
+
+    指纹记因子数与名字集合的哈希，两者任一变化都能查出来。
+
+    Returns:
+        {'preset': str, 'n_factors': int, 'hash': str}
+        n_factors 含 alpha158 的基础因子数。
+    """
+    import hashlib
+
+    if preset_name not in FACTOR_PRESETS:
+        raise ValueError(f"未知预设: {preset_name}")
+    pre = FACTOR_PRESETS[preset_name]
+
+    extra = pre["extra_factors"]
+    if callable(extra):
+        extra = extra()
+    names = sorted(n for n, _ in extra)
+
+    base = get_alpha158_feature_count() if pre.get("include_alpha158") else 0
+    h = hashlib.sha256("|".join(names).encode("utf-8")).hexdigest()[:16]
+    return {"preset": preset_name, "n_factors": base + len(names), "hash": h}
