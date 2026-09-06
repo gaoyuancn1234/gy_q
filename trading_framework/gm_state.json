@@ -1,10 +1,134 @@
 {
-  "status": "ok",
-  "snapshot": {
-    "nav": 0.0,
-    "available": 0.0,
-    "market_value": 0.0,
-    "positions": []
-  },
-  "updated": "2026-09-06T20:31:45"
+  "status": "dry_run",
+  "orders": [
+    {
+      "code": "SH601018",
+      "side": "BUY",
+      "volume": 1200,
+      "price": 3.47,
+      "amount": 4166.08,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601901",
+      "side": "BUY",
+      "volume": 600,
+      "price": 6.92,
+      "amount": 4154.08,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601607",
+      "side": "BUY",
+      "volume": 200,
+      "price": 16.62,
+      "amount": 3325.66,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SZ000166",
+      "side": "BUY",
+      "volume": 900,
+      "price": 4.59,
+      "amount": 4133.07,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601456",
+      "side": "BUY",
+      "volume": 400,
+      "price": 8.93,
+      "amount": 3573.79,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601985",
+      "side": "BUY",
+      "volume": 400,
+      "price": 9.08,
+      "amount": 3633.82,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601878",
+      "side": "BUY",
+      "volume": 400,
+      "price": 9.47,
+      "amount": 3789.89,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601377",
+      "side": "BUY",
+      "volume": 700,
+      "price": 5.96,
+      "amount": 4174.09,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SZ002736",
+      "side": "BUY",
+      "volume": 400,
+      "price": 10.26,
+      "amount": 4106.05,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601881",
+      "side": "BUY",
+      "volume": 300,
+      "price": 12.43,
+      "amount": 3730.86,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601059",
+      "side": "BUY",
+      "volume": 200,
+      "price": 17.12,
+      "amount": 3425.71,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH601288",
+      "side": "BUY",
+      "volume": 600,
+      "price": 6.96,
+      "amount": 4178.09,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH600919",
+      "side": "BUY",
+      "volume": 300,
+      "price": 12.28,
+      "amount": 3685.84,
+      "resp": null,
+      "dry_run": true
+    },
+    {
+      "code": "SH600061",
+      "side": "BUY",
+      "volume": 600,
+      "price": 6.53,
+      "amount": 3919.96,
+      "resp": null,
+      "dry_run": true
+    }
+  ],
+  "exposure": 0.6,
+  "cash_for_buy": 60000.0,
+  "updated": "2026-09-06T20:44:15"
 }

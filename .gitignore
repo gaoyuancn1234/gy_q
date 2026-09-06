@@ -78,3 +78,4 @@ test_*.py
 # 配置备份 (改参数前的快照，本地留存即可)
 *.bak_*
 *.rejected_*
+trading_framework/gm_state.json

@@ -91,6 +91,26 @@ def _load_holdings() -> dict:
     return json.loads(HOLDINGS_FILE.read_text(encoding='utf-8'))
 
 
+LOG_FILE = PROJECT_DIR / 'logs' / 'gm_bridge.log'
+_LOG_BUF = []
+
+
+def log(msg: str = ''):
+    """写日志文件而不是 print
+
+    掘金策略上下文里 print 不输出(实测 --place 全程无任何 stdout，
+    连异常都看不到)，只能靠落盘。凡是对外发生效果的动作必须留下痕迹，
+    否则失败与"没跑"无法区分 —— 本项目已在飞书推送、任务退出码、
+    数据下载三处栽过同一个坑。
+    """
+    _LOG_BUF.append(str(msg))
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOG_FILE.write_text('\n'.join(_LOG_BUF), encoding='utf-8')
+    except OSError:
+        pass
+
+
 def _save_state(payload: dict):
     payload['updated'] = datetime.now().isoformat(timespec='seconds')
     STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
@@ -101,20 +121,40 @@ def _save_state(payload: dict):
 
 def init(context):
     """掘金策略入口。run() 启动后由掘金调用。"""
+    import traceback
+    from datetime import datetime as _dt
+    _LOG_BUF.clear()
+    # 用环境变量传参 —— gm.run(filename=...) 会**按文件名重新导入本模块**，
+    # main() 里对 sys.modules[__name__].init 的替换在新副本里不存在，
+    # context 上挂的属性也读不到。实测因此一直走 'check' 分支:
+    # 传 --place --dry-run，日志却打印 "gm_bridge check"。
+    import os as _os
+    action = _os.environ.get('GM_BRIDGE_ACTION', 'check')
+    dry = _os.environ.get('GM_BRIDGE_DRY') == '1'
+    log(f'=== gm_bridge {action}{" (空跑)" if dry else ""} '
+        f'{_dt.now():%Y-%m-%d %H:%M:%S} ===')
+
     from gm.api import set_account_id
     set_account_id(env('GM_ACCOUNT_ID'))
-    action = getattr(context, 'gm_bridge_action', 'check')
+    log(f'account_id 已设置')
 
     try:
         if action == 'check':
             _do_check()
         elif action == 'place':
-            _do_place()
+            _do_place(dry_run=dry)
         elif action == 'sync':
             _do_sync()
+    except Exception as e:
+        # 掘金会吞掉策略回调里的异常 —— 不写下来就完全看不到
+        log(f'✗ 异常: {type(e).__name__}: {e}')
+        log(traceback.format_exc())
+        _save_state({'status': 'error', 'action': action,
+                     'error': f'{type(e).__name__}: {e}'})
     finally:
         # run() 会一直阻塞等行情事件。本桥接是一次性动作，做完必须主动停，
         # 否则进程挂住 —— 实测被 timeout 杀掉时退出码 124，看起来像失败。
+        log('=== 结束 ===')
         from gm.api import stop
         stop()
 
@@ -138,18 +178,21 @@ def _account_snapshot() -> dict:
 def _do_check():
     snap = _account_snapshot()
     if snap['nav'] is None:
-        print('✗ 账户无数据 — 检查 GM_ACCOUNT_ID 是否与该策略绑定的仿真账户一致')
+        log('✗ 账户无数据 — 检查 GM_ACCOUNT_ID 是否与该策略绑定的仿真账户一致')
         _save_state({'status': 'no_account', 'snapshot': snap})
         return
-    print(f"✓ 总资产 {snap['nav']:,.0f}  可用 {snap['available']:,.0f}  "
+    log(f"✓ 总资产 {snap['nav']:,.0f}  可用 {snap['available']:,.0f}  "
           f"持仓 {len(snap['positions'])} 只")
     for p in snap['positions']:
-        print(f"    {p['code']} {p['volume']}股 成本 {p['vwap']} 现价 {p['price']}")
+        log(f"    {p['code']} {p['volume']}股 成本 {p['vwap']} 现价 {p['price']}")
     _save_state({'status': 'ok', 'snapshot': snap})
 
 
-def _do_place():
-    """把 pending_orders 送进仿真账户，逐笔回查委托状态"""
+def _do_place(dry_run: bool = False):
+    """把 pending_orders 送进仿真账户，逐笔回查委托状态
+
+    dry_run=True 时走完全部计算(取价、敞口、分配、股数)但不提交委托。
+    """
     from gm.api import order_volume, get_orders, OrderSide_Buy, OrderSide_Sell, \
         OrderType_Limit, PositionEffect_Open, PositionEffect_Close
 
@@ -159,11 +202,11 @@ def _do_place():
     buys = dict(pending.get('buys') or {})
 
     if not sells and not buys:
-        print('无待执行订单')
+        log('无待执行订单')
         _save_state({'status': 'no_orders'})
         return
 
-    print(f'待执行: 卖 {len(sells)} 只，买 {len(buys)} 只')
+    log(f'待执行: 卖 {len(sells)} 只，买 {len(buys)} 只')
 
     # 卖出用现有持仓股数; 买入股数由 live_portfolio 的分配决定，
     # 这里从 holdings 里取不到，改为按当前可用资金等分 —— 与实盘同一函数
@@ -172,18 +215,44 @@ def _do_place():
 
     snap = _account_snapshot()
     if snap['nav'] is None:
-        print('✗ 账户无数据，拒绝下单')
+        log('✗ 账户无数据，拒绝下单')
         _save_state({'status': 'no_account'})
         return
 
     held = {p['code']: p['volume'] for p in snap['positions']}
     placed = []
 
+    # 波动率目标 —— 必须与实盘同一口径。
+    # 2026-09-06: 初版直接用 snap['available'] 全额分配，而 daily_runner
+    # 生成指令时已按 vol_target 把可用资金缩到 60%。两边不一致就等于在
+    # 仿真里跑另一个策略，测出来的滑点无法与回测比较 —— 正是 reconcile.py
+    # 专门在防的那类分叉。
+    from portfolio.live_portfolio import compute_exposure as _live_exposure
+    from portfolio.live_portfolio import _get_vol_target_config
+    _vt = _get_vol_target_config()
+    cash_for_buy = float(snap['available'] or 0)
+    exposure, realized = 1.0, None
+    if _vt.get('vol_target'):
+        exposure, realized = _live_exposure(
+            holdings, _vt['vol_target'],
+            window=_vt.get('vol_window', 20),
+            min_exposure=_vt.get('vol_min_exposure', 0.2))
+        if exposure < 1.0:
+            cash_for_buy *= exposure
+    _rz = f'{realized:.1%}' if realized is not None else '无法估计(净值历史不足)'
+    log(f'  敞口 {exposure:.0%} (实现波动 {_rz})，'
+          f'可用 {snap["available"]:,.0f} -> 买入预算 {cash_for_buy:,.0f}')
+
     # --- 卖出 ---
     for code in sells:
         vol = held.get(code, 0)
         if vol <= 0:
-            print(f'  跳过卖出 {code}: 仿真账户无持仓')
+            log(f'  跳过卖出 {code}: 仿真账户无持仓')
+            continue
+        if dry_run:
+            log(f'  [空跑] 卖 {code} {int(vol)}股')
+            placed.append({'code': code, 'side': 'SELL', 'volume': int(vol),
+                           'resp': None, 'dry_run': True})
             continue
         o = order_volume(symbol=to_gm_symbol(code), volume=int(vol),
                          side=OrderSide_Sell, order_type=OrderType_Limit,
@@ -197,14 +266,36 @@ def _do_place():
         codes = list(buys.keys())
         quotes = current(symbols=[to_gm_symbol(c) for c in codes]) or []
         px = {from_gm_symbol(q['symbol']): q.get('price') for q in quotes}
-        alloc = allocate_buys(codes, px, float(snap['available'] or 0),
+        noquote = [c for c in codes if not px.get(c)]
+        if noquote:
+            log(f'  ⚠ {len(noquote)} 只取不到实时价，会被分配函数跳过: {noquote}')
+        alloc = allocate_buys(codes, px, cash_for_buy,
                               open_cost=_get_open_cost())
+        skipped = [c for c in codes if c not in alloc]
+        if skipped:
+            log(f'  跳过 {len(skipped)} 只(买不起或无价): {skipped}')
         for code, a in alloc.items():
+            if dry_run:
+                log(f'  [空跑] 买 {code} {a["shares"]}股 ×{a["price"]:.2f}'
+                      f' ≈ {a["amount"]:,.0f}')
+                placed.append({'code': code, 'side': 'BUY',
+                               'volume': int(a['shares']), 'price': a['price'],
+                               'amount': a['amount'], 'resp': None,
+                               'dry_run': True})
+                continue
             o = order_volume(symbol=to_gm_symbol(code), volume=int(a['shares']),
                              side=OrderSide_Buy, order_type=OrderType_Limit,
                              position_effect=PositionEffect_Open, price=0)
             placed.append({'code': code, 'side': 'BUY', 'volume': int(a['shares']),
                            'price': a['price'], 'resp': _order_id(o)})
+
+    if dry_run:
+        total = sum(p.get('amount', 0) for p in placed if p['side'] == 'BUY')
+        log(f'\n[空跑] 共 {len(placed)} 笔，买入金额合计 {total:,.0f}，'
+              f'未提交任何委托')
+        _save_state({'status': 'dry_run', 'orders': placed,
+                     'exposure': exposure, 'cash_for_buy': cash_for_buy})
+        return
 
     # --- 必须回查，不拿"没抛异常"当成交 ---
     orders = get_orders() or []
@@ -217,12 +308,12 @@ def _do_place():
         p['filled_vwap'] = o.get('filled_vwap') if o else None
         if o:
             n_ok += 1
-        print(f"  {p['side']} {p['code']} {p['volume']}股 -> "
+        log(f"  {p['side']} {p['code']} {p['volume']}股 -> "
               f"status={p['status']} 成交 {p['filled']} @ {p['filled_vwap']}")
 
-    print(f'已下 {len(placed)} 笔，回查到 {n_ok} 笔委托')
+    log(f'已下 {len(placed)} 笔，回查到 {n_ok} 笔委托')
     if n_ok < len(placed):
-        print(f'⚠ 有 {len(placed) - n_ok} 笔在委托列表里查不到 —— 不要当成已下单')
+        log(f'⚠ 有 {len(placed) - n_ok} 笔在委托列表里查不到 —— 不要当成已下单')
     _save_state({'status': 'placed', 'orders': placed,
                  'n_placed': len(placed), 'n_confirmed': n_ok})
 
@@ -243,9 +334,9 @@ def _do_sync():
     rows = [{'code': from_gm_symbol(r['symbol']), 'side': r.get('side'),
              'volume': r.get('volume'), 'price': r.get('price'),
              'created_at': str(r.get('created_at'))} for r in reps]
-    print(f'当日成交 {len(rows)} 笔')
+    log(f'当日成交 {len(rows)} 笔')
     for r in rows[:20]:
-        print(f"    {r['code']} {r['side']} {r['volume']}股 @ {r['price']}")
+        log(f"    {r['code']} {r['side']} {r['volume']}股 @ {r['price']}")
     _save_state({'status': 'synced', 'executions': rows,
                  'snapshot': _account_snapshot()})
 
@@ -258,6 +349,8 @@ def main() -> int:
     g.add_argument('--check', action='store_true', help='只查账户')
     g.add_argument('--place', action='store_true', help='读 pending_orders 下单')
     g.add_argument('--sync', action='store_true', help='回读成交')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='与 --place 合用: 走完全部计算但不提交委托')
     args = ap.parse_args()
 
     action = 'check' if args.check else ('place' if args.place else 'sync')
@@ -266,12 +359,9 @@ def main() -> int:
     # 当成自己的选项并报 "no such option"。解析完就把 argv 清干净。
     sys.argv = [sys.argv[0]]
 
-    def _init(context):
-        context.gm_bridge_action = action
-        init(context)
-
-    # 掘金按模块级函数名回调，替换后 run() 才会走到我们的分支
-    sys.modules[__name__].init = _init
+    import os
+    os.environ['GM_BRIDGE_ACTION'] = action
+    os.environ['GM_BRIDGE_DRY'] = '1' if args.dry_run else '0'
 
     from gm.api import run, MODE_LIVE
     # run() 会阻塞直到策略停止; 本策略只在 init 里干活
