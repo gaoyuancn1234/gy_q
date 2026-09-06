@@ -8,7 +8,7 @@
     "created_date": "2026-02-20",
     "updated_date": "2026-02-20",
     "branch": "paper/2512.23515",
-    "worktree_path": "/Users/jeric/Desktop/lab/qlib-papers/paper_001",
+    "worktree_path": null,
     "pdf_path": "papers/pdfs/2512.23515.pdf",
     "progress_summary": "TITLE: Alpha-R1: Alpha Screening with LLM Reasoning via Reinforcement Learning",
     "phases_completed": [
@@ -18,11 +18,12 @@
     "notes": "",
     "sessions": {
       "read": "f02e9184-39d9-48cb-a398-e34ca18ed072"
-    }
+    },
+    "note": "worktree 未在 Windows 上重建 (原 macOS 路径已失效)。需要时用 paper_researcher 重新创建。"
   },
   "paper_002": {
     "arxiv_id": "2606.20625",
-    "title": "",
+    "title": "AlphaMemo: Structured Search-Process Memory for Self-Evolving Alpha Mining Agents",
     "url": "https://arxiv.org/abs/2606.20625",
     "source": "arxiv",
     "status": "pending",
@@ -30,7 +31,7 @@
     "created_date": "2026-08-30",
     "updated_date": "2026-08-30",
     "branch": "paper/2606.20625",
-    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\paper_002",
+    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\AlphaMemo",
     "pdf_path": "papers\\pdfs\\2606.20625.pdf",
     "progress_summary": "PDF 已下载, worktree 已创建",
     "phases_completed": [
@@ -40,7 +41,7 @@
   },
   "paper_003": {
     "arxiv_id": "2605.23959",
-    "title": "",
+    "title": "When Alpha Disappears: A One-Switch Benchmark for Decision-Time Leakage in Financial Backtests",
     "url": "https://arxiv.org/abs/2605.23959",
     "source": "arxiv",
     "status": "pending",
@@ -48,7 +49,7 @@
     "created_date": "2026-08-30",
     "updated_date": "2026-08-30",
     "branch": "paper/2605.23959",
-    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\paper_003",
+    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\WhenAlphaDisappears",
     "pdf_path": "papers\\pdfs\\2605.23959.pdf",
     "progress_summary": "PDF 已下载, worktree 已创建",
     "phases_completed": [
@@ -58,7 +59,7 @@
   },
   "paper_004": {
     "arxiv_id": "2502.16789",
-    "title": "",
+    "title": "AlphaAgent: LLM-Driven Alpha Mining with Regularized Exploration to Counteract Alpha Decay",
     "url": "https://arxiv.org/abs/2502.16789",
     "source": "arxiv",
     "status": "pending",
@@ -66,7 +67,7 @@
     "created_date": "2026-08-30",
     "updated_date": "2026-08-30",
     "branch": "paper/2502.16789",
-    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\paper_004",
+    "worktree_path": "C:\\Users\\gaoyu\\Desktop\\quant\\qlib-papers\\AlphaAgent",
     "pdf_path": "papers\\pdfs\\2502.16789.pdf",
     "progress_summary": "PDF 已下载, worktree 已创建",
     "phases_completed": [
