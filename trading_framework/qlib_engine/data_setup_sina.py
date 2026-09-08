@@ -238,6 +238,15 @@ def _swap_in(build_path, target_path, attempts: int = 12, wait: float = 10.0):
         print(f"[sina] 警告: 搬运注入字段失败 ({e})，"
               f"替换后需重新运行注入脚本")
 
+    # 换入前确认 build 确实完整。2026-09-07 事故: 另一个进程把 .building
+    # 删了，本函数照旧先把生产目录改名让位，再去换一个已经不存在的目录 ——
+    # 生产数据就此消失。换名是破坏性的，动手前必须先验源。
+    for need in ("calendars", "instruments", "features"):
+        if not (build_path / need).exists():
+            raise RuntimeError(
+                f"拒绝替换: {build_path} 缺少 {need}/，不是一个完整数据集。"
+                f"生产目录 {target_path} 未被改动。")
+
     for i in range(1, attempts + 1):
         try:
             if target_path.exists():
@@ -246,17 +255,24 @@ def _swap_in(build_path, target_path, attempts: int = 12, wait: float = 10.0):
             shutil.rmtree(old_path, ignore_errors=True)
             print(f"[sina] 数据集已原子替换 (第 {i} 次尝试)")
             return
-        except PermissionError as e:
-            # 有可能 target 已经改名成功、build 那步失败，先把状态还原
+        except OSError as e:
+            # 原先只捕 PermissionError。2026-09-07 实际抛的是 FileNotFoundError
+            # (build 被另一进程删掉)，回滚分支根本没执行 —— 生产目录停在
+            # "已改名让位、新数据没换进来"的中间态，等于数据没了。
+            # 回滚对任何 OSError 都必须做，它是这段代码唯一的安全网。
             if old_path.exists() and not target_path.exists():
                 try:
                     os.replace(old_path, target_path)
-                except OSError:
-                    pass
-            if i == attempts:
+                    print(f"[sina] 替换失败，已回滚到原数据集")
+                except OSError as re:
+                    raise RuntimeError(
+                        f"替换失败且回滚失败: {e} | 回滚错误: {re} | "
+                        f"原数据集在 {old_path}，需手工改回 {target_path}") from e
+            if not isinstance(e, PermissionError) or i == attempts:
+                # 非占用类错误重试无意义，直接抛
                 raise RuntimeError(
-                    f"数据集替换失败({attempts} 次): {e} | "
-                    f"完整数据已保留在 {build_path}，"
+                    f"数据集替换失败({i}/{attempts} 次): {type(e).__name__}: {e} | "
+                    f"完整数据在 {build_path}(若仍存在)，"
                     f"等占用进程退出后执行改名即可，无需重下。") from e
             print(f"[sina] 替换被占用，{wait:.0f}s 后重试 ({i}/{attempts}): {e}")
             time.sleep(wait)

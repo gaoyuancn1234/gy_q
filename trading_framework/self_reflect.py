@@ -258,6 +258,43 @@ def collect_strategy_data() -> dict:
     else:
         data["live_holdings"] = {"error": "live_holdings.json 不存在"}
 
+    # 4b. 模拟盘绩效
+    #
+    # 2026-09-07 新增。此前 collect_strategy_data 只收因子池和 live_holdings，
+    # 于是反思对着一个**按设计就是空的**实盘账户下结论 —— 当天给出
+    # "实盘零持仓零信号、系统处于冷启动状态，评分 3/10"，而同一时刻模拟盘
+    # 有 2.5 年连续记录、8 相位 Sharpe 1.221、超额 +11.19%，且是全系统唯一
+    # 被 reconcile.py 逐日验证过与实盘决策一致的那条路径。
+    #
+    # 反思的输入决定它能想到什么。看不到唯一在正常运转的东西，它只会反复
+    # 报告"系统没在运转"。
+    perf_file = BOT_DIR / "factor_lab" / "paper_trading" / "replay_performance.json"
+    state_file = BOT_DIR / "factor_lab" / "paper_trading" / "state.json"
+    if perf_file.exists():
+        try:
+            perf = json.loads(perf_file.read_text(encoding='utf-8'))
+            pt = {k: perf.get(k) for k in
+                  ("start_date", "end_date", "total_return", "annual_return",
+                   "sharpe", "max_drawdown", "bench_return", "excess_return",
+                   "n_trades", "trading_days", "final_nav", "regime_counts")}
+            if state_file.exists():
+                st = json.loads(state_file.read_text(encoding='utf-8'))
+                pt["current_positions"] = len(st.get("positions", {}))
+                pt["current_cash"] = st.get("cash")
+                pt["pending_orders"] = st.get("pending_orders")
+            data["paper_trading"] = pt
+        except Exception as e:
+            data["paper_trading"] = {"error": str(e)}
+    else:
+        data["paper_trading"] = {"error": "replay_performance.json 不存在(模拟盘未跑过)"}
+
+    # 4c. 管线自检 —— 有确定答案的不要让 LLM 猜
+    try:
+        from pipeline_health import run as _health_run
+        data["pipeline_health"] = _health_run()
+    except Exception as e:
+        data["pipeline_health"] = {"error": f"{type(e).__name__}: {e}"}
+
     # 5. 模型配置
     config_file = BOT_DIR / "config" / "signal_config.yaml"
     if config_file.exists():
@@ -368,6 +405,23 @@ def _build_reflection_prompt(system_data: dict, strategy_data: dict,
     holdings = strategy_data.get("live_holdings", {})
     holdings_text = json.dumps(holdings, ensure_ascii=False, indent=2)[:1500] if not holdings.get("error") else holdings["error"]
 
+    paper = strategy_data.get("paper_trading", {})
+    paper_text = (json.dumps(paper, ensure_ascii=False, indent=2)[:1500]
+                  if not paper.get("error") else paper["error"])
+
+    health = strategy_data.get("pipeline_health", {})
+    health_text = json.dumps(health, ensure_ascii=False, indent=2)[:2500]
+
+    # 近期改动 —— 缺陷多半就在最近碰过的代码里
+    try:
+        _git = subprocess.run(
+            ["git", "log", "--oneline", "-15", "--since=3.days"],
+            cwd=str(WORK_DIR), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30)
+        commits_text = (_git.stdout or "").strip() or "(近3天无提交)"
+    except Exception as e:
+        commits_text = f"(读取失败: {e})"
+
     config = strategy_data.get("model_config", {})
     config_text = json.dumps(config, ensure_ascii=False, indent=2)[:500] if not config.get("error") else config["error"]
 
@@ -418,6 +472,16 @@ def _build_reflection_prompt(system_data: dict, strategy_data: dict,
 ### 实盘持仓
 {holdings_text}
 
+注: 当前采用"只观察不下单"的运行方式，实盘账户按设计保持空仓 ——
+**空仓不是故障，不要据此判定系统未运转**。策略的真实表现看下面的模拟盘。
+
+### 模拟盘绩效 (系统的主要业绩依据)
+{paper_text}
+
+模拟盘是唯一被 reconcile.py 逐日验证与实盘决策一致的路径(调仓日 0 分叉)，
+评价策略请以它为准。绩效应看多相位均值而非单次回测 —— 单次回测只是一次抽样，
+相位间 Sharpe 标准差约 0.13。
+
 ## 三、市场环境
 
 ### 宏观新闻
@@ -426,17 +490,57 @@ def _build_reflection_prompt(system_data: dict, strategy_data: dict,
 ### 最新研究论文
 {papers_text}
 
+### 管线自检结果 (自动判定，不需你重新判断)
+{health_text}
+
+### 近3天代码改动
+{commits_text}
+
 ## 反思任务
 
-请从以下维度进行综合反思，输出 JSON 格式：
+**首要任务是找出这套系统的代码与管线缺陷，尤其是"静默失败"。**
+绩效数字随时可查，不需要你复述；找出没人发现的问题才有价值。
 
-1. **系统健康** (1-2句概述)
-2. **策略绩效诊断**: 因子池质量如何？挖掘效率？模型是否需要重训？
-3. **因子分析**: 哪些方向表现强？哪些方向枯竭？有衰减迹象吗？
-4. **市场研判**: 宏观环境对策略的影响，是否需要调整？
-5. **研究方向**: 基于论文和市场环境，有什么值得探索的新方向？
-6. **行动计划**: 方向性建议 (不修改代码)，按优先级排列
-7. **优先级排序**: 最值得投入精力的1-2件事
+### 什么是静默失败
+
+本系统最大的风险来源不是策略参数，而是"看起来正常工作、实则什么都没做"。
+2026-09-07 一天内查出 6 个，**全部退出码为 0、日志里没有异常**:
+
+1. 飞书主动推送连续数周从未生效 —— 收件人环境变量在模板里是注释掉的，
+   push 函数在凭证缺失时只 log 一行就 return，消息丢弃、不排队、退出码 0。
+   而机器人能正常对话(它回复收到的消息)，"能对话"掩盖了"推不出来"。
+2. 交易日判断卡死整条链路 —— 第三方库的网络调用没有 timeout 参数，源挂了
+   就永久阻塞。**挂起不抛异常**，所以写好的 except 降级分支永远不执行。
+3. 预测扩展抛 NameError —— 用了一个不存在的变量名，每天必失败，
+   但调用方只 log 一句"子进程失败"就继续用旧数据。
+4. 因子指纹闭不上环 —— 检查方要求 JSON 里有某字段，但没有任何代码在写它。
+5. 原子替换的回滚只捕 PermissionError —— 实际抛的是 FileNotFoundError，
+   回滚分支没执行，生产数据停在中间态。
+6. 掘金下单传 price=0 的限价单 —— 必然拒单，而此前只做过空跑验证，
+   空跑根本不调下单接口，所以这条路径从未真正执行过。
+
+共同模式:
+  - 只验证了"没抛异常"，没验证"预期效果真的发生了"
+  - 同一条规则写了两遍，改一处忘另一处(本系统已发生 6 次)
+  - 兜底/降级分支从未被触发过，因此从未被测试过
+  - 配置项写了但从未生效(拼写、注释掉、被覆盖)
+
+### 请重点检查
+
+1. **状态是否按预期推进** — 自检已给出数据/预测/模拟盘/任务的推进情况。
+   若某环停滞，判断是哪段代码该推进它却没做到。
+2. **今天改动的代码** — 缺陷多半在最近碰过的地方。看提交记录里的改动，
+   是否引入了上述模式(尤其"只在异常路径里的代码从未被执行")。
+3. **日志中的"失败但继续"** — 凡是 log 了错误却没有改变控制流的地方，
+   都要问一句: 它掩盖了什么? 后续步骤拿到的是不是过期/空数据?
+4. **重复实现** — 同一规则是否存在两份代码。
+5. **有效性可疑的配置** — 配置项是否真的被读取并生效。
+
+不要为了凑数编造问题。**没发现新缺陷就明说"未发现"** —— 报一个不存在的
+问题比漏报更浪费时间。发现的每一条都要给出: 在哪个文件、什么条件下触发、
+后果是什么、怎么验证它确实存在。
+
+其次(次要)才是: 因子池质量、挖掘效率、市场环境、研究方向。
 
 请严格输出以下 JSON 格式（不要输出其他内容）：
 ```json
@@ -448,6 +552,17 @@ def _build_reflection_prompt(system_data: dict, strategy_data: dict,
         "status": "healthy/warning/critical",
         "issues": ["问题描述"]
     }},
+    "code_defects": [
+        {{
+            "title": "缺陷一句话概括",
+            "file": "文件路径:行号 (定位不到写文件名即可)",
+            "trigger": "什么条件下触发",
+            "impact": "后果 —— 特别说明它是否静默(退出码是否仍为0)",
+            "verify": "怎么验证它确实存在 (一条命令或一个可观察的现象)",
+            "confidence": "high/medium/low",
+            "severity": "P0/P1/P2"
+        }}
+    ],
     "strategy_diagnosis": {{
         "factor_pool_quality": "因子池质量评估 (2-3句)",
         "mining_efficiency": "挖掘效率分析 (2-3句)",

@@ -265,7 +265,7 @@ class ExperimentManager:
         if filtered:
             try:
                 from portfolio.live_portfolio import get_stock_names
-                names = get_stock_names()
+                names = get_stock_names(list(filtered))
                 filter_note = "过滤: " + ", ".join(
                     f"{names.get(c, c)}" for c in filtered)
             except Exception:

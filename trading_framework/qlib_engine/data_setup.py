@@ -137,6 +137,11 @@ def _get_index_membership(start_date: str, end_date: str,
     return snapshots_to_intervals(snapshots)
 
 
+# 尚未观测到调出的成分股，其存续区间的开放式终点。
+# 用远期哨兵而非"今天"，这样数据集不必每天重建 instruments 也不会过期。
+OPEN_INTERVAL_END = "2099-12-31"
+
+
 def snapshots_to_intervals(snapshots: dict) -> tuple:
     """把 {日期: 成分股集合} 快照转成 (历史并集, 各股存续区间)
 
@@ -172,7 +177,19 @@ def snapshots_to_intervals(snapshots: dict) -> tuple:
             if present:
                 prev = d
         if run_start is not None:
-            runs.append((run_start, sorted_dates[-1]))
+            # 仍在最后一个快照里 = 至今仍是成分股，区间不能截止在快照日。
+            #
+            # 2026-09-08: 原先写 sorted_dates[-1]，即最后一次采样日。快照是
+            # 月末采样，于是每只在册股票的存续期都停在上一个采样点 ——
+            # qlib 据此判定"之后没有任何股票属于该指数"，
+            # D.features(D.instruments('csi300'), ...) 对更晚的日期返回**空**，
+            # 而 qlib 对此不报错。后果: 预测扩展训练完也生成不出新日期，
+            # 信号被永久钉在最后一次采样日，且全程退出码 0。
+            #
+            # 不构成前视偏差: 只把"最后一次观测时仍在册"这一状态延续到未来，
+            # 没有用到任何未来信息。历史上已调出的股票走的是上面 not present
+            # 分支，区间照旧在调出时点截断。
+            runs.append((run_start, OPEN_INTERVAL_END))
         intervals[inst] = runs
 
     current = snapshots[sorted_dates[-1]]

@@ -26,6 +26,8 @@ from net_guard import run_with_timeout
 
 # 单次取价的总预算 (秒)。超时即降级到本地缓存，绝不允许无限期挂住。
 PRICE_FETCH_TIMEOUT = 90
+# 取名称的预算。名字只是显示用，取不到就用代码，不该拖住下单。
+NAME_FETCH_TIMEOUT = 30
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 HOLDINGS_FILE = PROJECT_DIR / "portfolio" / "live_holdings.json"
@@ -40,7 +42,7 @@ _stock_names_cache = {}
 
 def qlib_to_display(code: str) -> str:
     """SH600036 → 招商银行(600036)"""
-    names = get_stock_names()
+    names = get_stock_names([code])
     num = code[2:]  # 600036
     name = names.get(code, code)
     return f"{name}({num})"
@@ -58,27 +60,75 @@ def bao_to_qlib(code: str) -> str:
     return code.replace(".", "").upper()
 
 
-def get_stock_names() -> dict:
-    """获取 CSI300 股票中文名映射 {SH600036: '招商银行'}"""
+def _fetch_names_sina(codes: list) -> dict:
+    """新浪实时行情顺带返回名称 —— 一次请求取回全部代码"""
+    import requests
+
+    out = {}
+    syms = [f"{c[:2].lower()}{c[2:]}" for c in codes]
+    for i in range(0, len(syms), 60):
+        r = requests.get("https://hq.sinajs.cn/list=" + ",".join(syms[i:i + 60]),
+                         timeout=15,
+                         headers={"Referer": "https://finance.sina.com.cn"})
+        r.raise_for_status()
+        r.encoding = "gbk"
+        for line in r.text.strip().split("\n"):
+            if '="' not in line:
+                continue
+            sym = line.split("hq_str_")[1].split("=")[0]
+            fields = line.split('"')[1].split(",")
+            if fields and fields[0]:
+                out[f"{sym[:2].upper()}{sym[2:]}"] = fields[0]
+    return out
+
+
+def get_stock_names(codes: list | None = None) -> dict:
+    """股票中文名映射 {SH600036: '招商银行'}
+
+    2026-09-08: 加硬超时并改用新浪为主源。
+
+    这是 baostock 无超时阻塞的**第五处**(前四处见 CLAUDE.md 沉默失败 #8)。
+    当天 daily_runner 在生成调仓指令前卡死 11 分钟就是卡在这一行 ——
+    上面 get_current_prices 早已改成"新浪→BaoStock→缓存"，这个函数却漏了，
+    于是取价一路顺畅、取名字把整条链路挂住。名字只是显示用，
+    **绝不该阻塞下单**: 取不到就回落成代码本身。
+
+    Args:
+        codes: 要取名字的代码。缺省用当前持仓 + 缓存里已知的代码。
+    """
     global _stock_names_cache
-    if _stock_names_cache:
+
+    want = [c for c in (codes or []) if c not in _stock_names_cache]
+    if _stock_names_cache and not want:
         return _stock_names_cache
 
+    if want:
+        try:
+            _stock_names_cache.update(
+                run_with_timeout(lambda: _fetch_names_sina(want),
+                                 NAME_FETCH_TIMEOUT, "新浪取名称"))
+        except Exception as e:
+            print(f"[stock_names] 新浪取名失败 ({type(e).__name__}): {e}，用代码代替")
+        return _stock_names_cache
+
+    # 无指定代码: 取一次沪深300 名单打底。失败不阻塞，返回空映射即可。
     with _bs_lock:
         try:
-            lg = bs.login()
-            if lg.error_code != '0':
-                return _stock_names_cache
+            def _bs_names() -> dict:
+                lg = bs.login()
+                if lg.error_code != '0':
+                    raise ConnectionError(f"BaoStock 登录失败: {lg.error_msg}")
+                out = {}
+                rs = bs.query_hs300_stocks()
+                while rs.error_code == '0' and rs.next():
+                    row = rs.get_row_data()
+                    out[bao_to_qlib(row[1])] = row[2]
+                return out
 
-            rs = bs.query_hs300_stocks()
-            while rs.error_code == '0' and rs.next():
-                row = rs.get_row_data()
-                bao_code = row[1]
-                name = row[2]
-                qlib_code = bao_to_qlib(bao_code)
-                _stock_names_cache[qlib_code] = name
+            _stock_names_cache.update(
+                run_with_timeout(_bs_names, NAME_FETCH_TIMEOUT, "BaoStock 取名称"))
         except Exception as e:
-            print(f"[stock_names] 获取失败: {e}")
+            print(f"[stock_names] 获取失败 ({type(e).__name__}): {e}，用代码代替")
         finally:
             try:
                 bs.logout()
@@ -495,7 +545,7 @@ def apply_trades(parsed_trades: list, holdings: dict = None) -> str:
                 old['cost_price'] = round(new_total / old['shares'], 4)
             else:
                 holdings['positions'][code] = {
-                    'name': get_stock_names().get(code, code),
+                    'name': get_stock_names([code]).get(code, code),
                     'shares': shares,
                     'cost_price': price,
                     'entry_date': datetime.now().strftime('%Y-%m-%d'),
@@ -610,7 +660,7 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
     quality = signal.get('quality_score')
     target_set = set(signal['target_stocks'])
     current_set = set(holdings['positions'].keys())
-    names = get_stock_names()
+    names = get_stock_names(sorted(target_set | current_set))
 
     # 计算卖出 — 受 n_drop 换手限制
     #

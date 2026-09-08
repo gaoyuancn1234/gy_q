@@ -1170,6 +1170,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     """
     from factor_lab.quanta.config import (
         DAILY_TOTAL_TIMEOUT, DAILY_N_DIRECTIONS, DAILY_BREADTH_STEPS,
+        DAILY_TARGET_POOL_SIZE,
         USE_MULTISTAGE,
         IMPORTANCE_SCREEN_ENABLED, IMPORTANCE_MIN_THRESHOLD,
     )
@@ -1294,7 +1295,19 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     breadth_deadline = time.time() + breadth_time
     breadth_round = 0
 
-    while time.time() < breadth_deadline:
+    def _pool_full() -> bool:
+        """FactorMiner Alg.1 的主终止条件: |L| >= K
+
+        挖够就收工，不把时间盒耗满 —— 多跑的每一轮都是一次额外试验，
+        而 DSR 要按试验次数扣分，白挖反而让验收更难过。
+        """
+        n = global_pool.size
+        if n >= DAILY_TARGET_POOL_SIZE:
+            print(f"    因子池已达目标规模 {n}/{DAILY_TARGET_POOL_SIZE}，提前收工")
+            return True
+        return False
+
+    while time.time() < breadth_deadline and not _pool_full():
         pending_dirs = registry.get_pending(limit=20)
         if smoke_test:
             pending_dirs = pending_dirs[:2]
@@ -1350,7 +1363,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
     depth_deadline = time.time() + depth_time
     depth_round = 0
 
-    while time.time() < depth_deadline:
+    while time.time() < depth_deadline and not _pool_full():
         depth_dirs = registry.get_depth_targets(limit=10)
         if not depth_dirs:
             depth_dirs = registry.get_explorable(limit=5)

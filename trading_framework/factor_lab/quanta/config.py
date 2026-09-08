@@ -129,7 +129,17 @@ EVOLVED_N_ROUNDS = 6              # 演化轮次 (smoke: 2)  0=orig, 1=mut, 2=cr
 ACCUMULATED_EVAL = True           # Step 4 Backtest 时包含 FactorPool 全局因子 (跨方向累积)
 
 # --- Daily Session (每日渐进式挖掘) ---
-DAILY_TOTAL_TIMEOUT = 5 * 3600   # 每日 session 总超时 (5h, 22:00→03:00)
+# 2026-09-08: 22:00→03:00 改为中午 12:00 开跑。原时段要求整夜开机，
+# 9/7 那次 22:00 启动、00:12 关机被 STATUS_CONTROL_C_EXIT 强杀，
+# runs/ 空、零产出 —— 跑不完的任务等于没跑。挖掘只用历史数据，与盘中无关。
+DAILY_TOTAL_TIMEOUT = 5 * 3600   # 每日 session 总超时 (5h, 12:00→17:00)
+
+# 目标库规模 —— FactorMiner (arXiv 2602.14670) Algorithm 1 的**主**终止条件:
+#     until |L| >= K  or  budget exhausted
+# 原实现只落了后半句(纯时间盒)，于是即使早已挖够也要把 5 小时耗满，
+# 白白增加搜索次数 = 增加多重检验的过拟合风险，而 DSR 要按试验次数惩罚。
+# 达到 K 就收工，时间盒退回为兜底护栏。
+DAILY_TARGET_POOL_SIZE = 30
 DAILY_N_DIRECTIONS = 5            # 每次规划方向数
 DAILY_BREADTH_STEPS = 5           # 广度阶段每个方向的步数
 DAILY_EXHAUSTED_FAILURES = 3     # 连续失败 N 次标记方向为 exhausted

@@ -90,6 +90,39 @@ def _get_universe_config() -> tuple:
 DATA_REFRESH_TIMEOUT = 3600
 
 
+def _last_closed_trading_day(now=None):
+    """最近一个已收盘的交易日
+
+    收盘后(>=15:05)的今天算已收盘；否则往前找。找不到就返回 None，
+    调用方按"无法判定"处理 —— 宁可多下一次，不要漏下。
+    """
+    from datetime import date, timedelta
+    from market_calendar import is_trading_day
+    now = now or datetime.now()
+    d = now.date()
+    if not (is_trading_day(d) and now.hour * 60 + now.minute >= 15 * 60 + 5):
+        d -= timedelta(days=1)
+    for _ in range(15):
+        if is_trading_day(d):
+            return d
+        d -= timedelta(days=1)
+    return None
+
+
+def _data_is_current(data_dir) -> bool:
+    """qlib 日历是否已覆盖最近一个已收盘交易日"""
+    try:
+        cal = Path(str(data_dir)).expanduser() / "calendars" / "day.txt"
+        lines = [l.strip() for l in cal.read_text(encoding="utf-8").splitlines() if l.strip()]
+        target = _last_closed_trading_day()
+        if not lines or target is None:
+            return False
+        return lines[-1] >= target.isoformat()
+    except Exception as e:
+        log.warning(f"数据新鲜度判断失败 ({type(e).__name__}: {e})，按需刷新")
+        return False
+
+
 def refresh_daily_data() -> bool:
     """增量刷新行情数据
 
@@ -98,6 +131,14 @@ def refresh_daily_data() -> bool:
     新浪失败才回落到 BaoStock，两条路都在子进程里跑并设硬超时。
     """
     universe, data_dir = _get_universe_config()
+
+    # 数据已覆盖到"最近一个已收盘的交易日"就不必再下 —— 全量重下要 40 分钟，
+    # 而当天的日线要收盘后才有 (新浪日线接口盘中不返回当日半截 K 线，已实测)。
+    # 2026-09-08: 没有这道判断时，盘中每跑一次 daily_runner 就白下 40 分钟。
+    if _data_is_current(data_dir):
+        log.info("数据已覆盖至最近收盘交易日，跳过刷新")
+        return True
+
     for label, module in (("新浪", "qlib_engine.data_setup_sina"),
                           ("BaoStock", "qlib_engine.data_setup")):
         log.info(f"刷新数据 ({label})...")
@@ -170,17 +211,32 @@ def _update_daily_predictions() -> bool:
         pred = pd.read_pickle(PRED_PKL)
         pred_last = pred.index.get_level_values(0).max()
 
-        # 读取 test_end 配置
-        import yaml
-        config_path = PROJECT_DIR / "config" / "signal_config.yaml"
-        with open(config_path, encoding='utf-8') as f:
-            sig_cfg = yaml.safe_load(f)
-        test_end = sig_cfg.get('test_end', '2026-06-30')
+        # 扩展目标 = 数据日历的最后一天，不是配置里的 test_end。
+        #
+        # 2026-09-08: 原先读 sig_cfg['test_end']，那是个写死的日期('2026-09-02')，
+        # 没有任何流程会更新它。预测一旦追平这个日期就再也不前进 ——
+        # 而 daily_runner 把"没扩展出新日期"打印成"预测已覆盖所有数据日期"，
+        # 退出码 0、日志看着正常。实测数据到 09-07、信号却卡在 09-04 不动，
+        # 下游"信号时效"只算出 1 天滞后，判定正常，也不会告警。
+        # test_end 保留作研究用(指定回测区间)，但不再当作生产的扩展天花板。
+        _, _data_dir = _get_universe_config()
+        _cal = Path(str(_data_dir)).expanduser() / "calendars" / "day.txt"
+        _days = [l.strip() for l in _cal.read_text(encoding="utf-8").splitlines() if l.strip()]
+        test_end = _days[-1]
+        if pred_last.strftime('%Y-%m-%d') >= test_end:
+            log.info(f"预测已覆盖数据日历末日 {test_end}，无需扩展")
+            return False
 
         # 用子进程调用 extend_rolling_predictions (避免 qlib.init 冲突)
         log.info(f"当前预测最新日期: {pred_last.strftime('%Y-%m-%d')}，检查增量预测...")
+        # -X utf8 必须显式传给子进程: 父进程的 -X utf8 不会被继承，子进程
+        # stdout 用 Windows 控制台默认的 GBK 编码，打印任何非 GBK 字符
+        # (⚠ / ✓ 这类，代码里到处都是) 就抛 UnicodeEncodeError 把自己搞崩。
+        # 2026-09-08 实测: 扩展跑完 11 个窗口，最后卡在一个 ⚠ 上前功尽弃，
+        # 而外层只看到 rc!=0，看不出是编码问题。
+        _child_env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
         result = subprocess.run(
-            [sys.executable, '-c',
+            [sys.executable, '-X', 'utf8', '-c',
              'import multiprocessing; '
              '"fork" in multiprocessing.get_all_start_methods() and multiprocessing.set_start_method("fork", force=True); '
              'import sys; sys.path.insert(0, "."); '
@@ -195,7 +251,7 @@ def _update_daily_predictions() -> bool:
             # 2026-09-05 实测后果: 日志只打出"增量预测子进程失败: "后面一片空白，
             # 真正的报错完全看不到，而 daily_runner 照常往下走并推送日报。
             encoding="utf-8", errors="replace",
-            cwd=str(PROJECT_DIR),
+            cwd=str(PROJECT_DIR), env=_child_env,
         )
 
         if result.returncode != 0:
@@ -220,7 +276,11 @@ def _update_daily_predictions() -> bool:
                                  f"{new_last.strftime('%Y-%m-%d')}")
                         return True
                     else:
-                        log.info("预测已覆盖所有数据日期，无需更新")
+                        # 说实话: 扩展跑了但没产出新日期。这不等于"已经最新"，
+                        # 可能是窗口生成、数据对齐或指纹校验挡住了。
+                        log.warning(
+                            f"增量预测未推进: 目标 {test_end}，扩展后仍是 "
+                            f"{new_last.strftime('%Y-%m-%d')} —— 信号将继续使用旧日期")
                         return False
         elif '预测已是最新' in output:
             log.info("预测已是最新，无需更新")
@@ -905,7 +965,9 @@ def _run_experiment_updates(live_signal: dict, prices: dict,
         macro_news = sentinel.fetch_macro_news()
 
         # 持仓列表 (用于宏观分析)
-        stock_names = get_stock_names()
+        # 传入实际要用的代码: 无参调用会去 BaoStock 拉整个沪深300 名单，
+        # 而 BaoStock 已长期不可用，每次白等一个超时 (2026-09-08)。
+        stock_names = get_stock_names(list(holdings.get('positions', {})))
         holdings_list = []
         for code in holdings.get('positions', {}):
             holdings_list.append({

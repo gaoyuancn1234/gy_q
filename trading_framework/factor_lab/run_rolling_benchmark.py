@@ -743,6 +743,24 @@ def run_rolling_single(preset: str, model_name: str,
     bt_result = run_backtest(combined_pred)
     total_time = time.time() - total_start
 
+    # 因子集指纹 (2026-09-07 新增)
+    #
+    # retrain_pipeline.extend_rolling_predictions 会读这一项，来判断"现有预测
+    # 与当前 preset 是不是同一套因子"——不同则拒绝增量扩展，否则会产出前后两个
+    # 模型拼接的信号序列。但此前只有 retrain_pipeline 自己写，**全量重训这条
+    # 路径不写**，于是重训之后 JSON 里依旧没有指纹，第二天的增量扩展照样被
+    # "未记录因子指纹"拦下，只能再全量重训一次 —— 一个永远闭不上的环。
+    #
+    # preset 名不足以标识因子集: alpha158_val 在估值字段注入前是 188 因子、
+    # 注入后是 210，名字一模一样。指纹记的是因子数与内容 hash。
+    try:
+        from factor_lab.factors.presets import factor_fingerprint
+        _fp = factor_fingerprint(preset)
+    except Exception as e:                      # 拿不到就如实留空，不编一个
+        print(f"  [警告] 因子指纹计算失败({type(e).__name__}: {e})，"
+              f"本次结果不带指纹，下次增量扩展会要求全量重训")
+        _fp = None
+
     result = {
         "config_name": config_name,
         "config_description": config['description'],
@@ -750,6 +768,7 @@ def run_rolling_single(preset: str, model_name: str,
         "model": model_name,
         "variant": variant,
         "n_windows": len(windows),
+        "factor_fingerprint": _fp,
         "windows": window_details,
         "overall": bt_result,
         # 参数快照 (2026-09-04 新增)
@@ -804,6 +823,20 @@ def print_comparison_table(all_results: list[dict]):
           f"vol_target={f'{_vt:.0%}' if _vt else '关闭'} | "
           f"资金={_sig_cfg.get('initial_cash'):,.0f} | 种子={N_SEEDS}")
     print(f"成交价: {_dp} ({DEAL_PRICE}, T+1) | 基准: 沪深300")
+    # 2026-09-07: 本表用于**因子集/模型之间横向比较**，不要当作实盘策略绩效。
+    #
+    # hifi(VolTargetBacktester) 自己内联了一套调仓逻辑: 卖出选择不走
+    # rebalance_rules.select_sells、买入分配不走 allocate_buys、也没有
+    # 自适应 TopK(固定用 topk，而实盘按信号质量取 12/16/16)。
+    # 实测同一份 210 因子预测: 本引擎报总收益 32.18%(超额 -2.13%)，
+    # 模拟盘引擎报 47.87%(超额 +13.56%)。两者持仓只数(15.5 vs 15)、
+    # 交易笔数(709 vs 685)、敞口都接近 —— 差距来自**持有了不同的股票**，
+    # 且集中在 2024Q1/2024Q3/2026Q3 三个季度，不是均匀的成本拖累。
+    #
+    # 只有 paper_trader 那条路径被 reconcile.py 逐日证明与实盘一致
+    # (82 个调仓日 0 分叉)。报绩效请用 run_phase_test.py。
+    print("⚠ 本表引擎非实盘路径 —— 仅供横向比较，绝对绩效请用 "
+          "run_phase_test.py (paper_trader 引擎，已过对账)")
     print()
 
     # 按 Sharpe 降序排列

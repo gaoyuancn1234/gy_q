@@ -15,6 +15,22 @@ one-switch 实验里改成开盘价，超额从 27.11% 掉到 11.90% —— 腰�
 对 10 万资金 / 16 只 / 每只约 6 千元买 CSI300 成分股而言，真实冲击本就接近零，
 这条限制不影响结论。
 
+下单时点: 09:40 (2026-09-08 由 14:50 改)
+------------------------------------
+开盘 9:30 后 10 分钟下单，避开开盘集合竞价(9:15~9:25)的撮合排队与波动。
+
+**这与回测口径不一致，是已知且刻意接受的**: signal_config 的
+deal_price=close，回测按"次日收盘价成交"计价；实际执行在 09:40，
+成交价约等于开盘后十分钟的价格。两者之差是尾盘到次日早盘的漂移。
+
+为什么仍这么定: CLAUDE.md 的 one-switch 实验显示开盘价口径超额 27.11%、
+收盘价 11.90%，当初选 close 的理由是"开盘价是实盘最难兑现的价格"。
+但那是 2026-08-30 的单次回测(彼时数据有错位、无多种子集成、TopK=8)，
+且从未做过相位配对检验 —— 按本项目规矩属于一个抽样，不足以定论。
+真正能定论的是这套桥接本身: 它按真实盘口撮合，能直接量出 09:40 的实际
+成交价与回测假设差多少。先跑起来收数据，再回头决定要不要把 deal_price
+改成 open 并重跑全部验证。
+
 架构
 ----
 必须作为**掘金策略**运行 —— 账户接口(get_cash/get_position/order_volume)
@@ -159,10 +175,36 @@ def init(context):
         stop()
 
 
-def _account_snapshot() -> dict:
+def _account_snapshot(retries: int = 10, wait: float = 1.0) -> dict:
+    """取账户快照，等到账户数据真正同步过来为止
+
+    2026-09-07: 首次 --check 报 "✓ 总资产 0 可用 0"，4 分钟后同一账户报
+    100,000。日志显示 init() 在"连接交易服务成功"的同一秒就调了 get_cash()
+    —— 连接建立与账户数据下发不是同一件事，查早了拿到的是空壳。
+
+    危险的不是慢，是 **0 被当成有效值**: nav=0 会一路写进 gm_state.json 的
+    "status": "ok"，下游据此判断就会错，而下单必然失败。这与本项目栽过的
+    几次是同一类 —— 把"还没拿到"错当成"拿到了，值是空"。
+
+    所以这里重试到 nav 为正数为止；始终取不到就如实返回 None，让上层报错。
+    """
+    import time as _t
     from gm.api import get_cash, get_position
-    cash = get_cash() or {}
-    pos = get_position() or []
+
+    cash, pos = {}, []
+    for i in range(retries):
+        cash = get_cash() or {}
+        pos = get_position() or []
+        if (cash.get('nav') or 0) > 0:
+            if i:
+                log(f'  账户数据在第 {i + 1} 次查询到位 (等待 {i * wait:.0f}s)')
+            break
+        _t.sleep(wait)
+    else:
+        log(f'  ⚠ 等待 {retries * wait:.0f}s 后账户总资产仍为 '
+            f'{cash.get("nav")!r} — 可能是账户未入金，也可能是终端未同步')
+        cash.setdefault('nav', None)
+
     return {
         'nav': cash.get('nav'),
         'available': cash.get('available'),
@@ -177,8 +219,11 @@ def _account_snapshot() -> dict:
 
 def _do_check():
     snap = _account_snapshot()
-    if snap['nav'] is None:
-        log('✗ 账户无数据 — 检查 GM_ACCOUNT_ID 是否与该策略绑定的仿真账户一致')
+    # nav 为 0 与 None 一样不可用: 零余额账户下什么单都会失败。原先只判 None，
+    # 于是"查早了拿到 0"被报成 ✓ 并写进 status: ok —— 见 _account_snapshot 注释。
+    if not snap['nav']:
+        log(f'✗ 账户不可用 (总资产 {snap["nav"]!r}) — 检查: '
+            f'GM_ACCOUNT_ID 是否与该策略绑定的仿真账户一致 / 该账户是否已入金')
         _save_state({'status': 'no_account', 'snapshot': snap})
         return
     log(f"✓ 总资产 {snap['nav']:,.0f}  可用 {snap['available']:,.0f}  "
@@ -244,6 +289,22 @@ def _do_place(dry_run: bool = False):
           f'可用 {snap["available"]:,.0f} -> 买入预算 {cash_for_buy:,.0f}')
 
     # --- 卖出 ---
+    #
+    # 2026-09-07: 原先传 price=0 且 order_type=OrderType_Limit。限价单必须有
+    # 价格，price=0 会被拒单 —— 而此前只做过空跑验证(空跑根本不调 order_volume)，
+    # 所以这条路径从未真正下出过一笔。
+    #
+    # 限价单成交在**对手价**而非自己的限价，所以留一点缓冲只影响"能不能成交"，
+    # 不抬高成本: 买单挂 现价×1.01 仍按卖一价成交。缓冲取 1%(A股涨跌停 ±10%，
+    # 不会触板)。实际成交价由 --sync 回读，滑点照样能量。
+    from gm.api import current as _gm_current
+    _LIMIT_BUFFER = 0.01
+
+    sell_px = {}
+    if sells:
+        _q = _gm_current(symbols=[to_gm_symbol(c) for c in sells]) or []
+        sell_px = {from_gm_symbol(q['symbol']): q.get('price') for q in _q}
+
     for code in sells:
         vol = held.get(code, 0)
         if vol <= 0:
@@ -254,11 +315,16 @@ def _do_place(dry_run: bool = False):
             placed.append({'code': code, 'side': 'SELL', 'volume': int(vol),
                            'resp': None, 'dry_run': True})
             continue
+        ref = sell_px.get(code)
+        if not ref:
+            log(f'  跳过卖出 {code}: 取不到实时价，无法定限价(停牌?)')
+            continue
+        limit = round(ref * (1 - _LIMIT_BUFFER), 2)
         o = order_volume(symbol=to_gm_symbol(code), volume=int(vol),
                          side=OrderSide_Sell, order_type=OrderType_Limit,
-                         position_effect=PositionEffect_Close, price=0)
+                         position_effect=PositionEffect_Close, price=limit)
         placed.append({'code': code, 'side': 'SELL', 'volume': int(vol),
-                       'resp': _order_id(o)})
+                       'limit': limit, 'ref_price': ref, 'resp': _order_id(o)})
 
     # --- 买入 ---
     if buys:
@@ -283,11 +349,15 @@ def _do_place(dry_run: bool = False):
                                'amount': a['amount'], 'resp': None,
                                'dry_run': True})
                 continue
+            # 见上方卖出处的说明: price=0 的限价单会被拒，且成交在对手价，
+            # 挂 1% 缓冲只保证成交、不抬高实际成本。
+            limit = round(a['price'] * (1 + _LIMIT_BUFFER), 2)
             o = order_volume(symbol=to_gm_symbol(code), volume=int(a['shares']),
                              side=OrderSide_Buy, order_type=OrderType_Limit,
-                             position_effect=PositionEffect_Open, price=0)
+                             position_effect=PositionEffect_Open, price=limit)
             placed.append({'code': code, 'side': 'BUY', 'volume': int(a['shares']),
-                           'price': a['price'], 'resp': _order_id(o)})
+                           'price': a['price'], 'limit': limit,
+                           'resp': _order_id(o)})
 
     if dry_run:
         total = sum(p.get('amount', 0) for p in placed if p['side'] == 'BUY')

@@ -157,7 +157,12 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
     # **名字完全一样**。飞书发一句"重训"就会产出混合序列并写回生产 pkl。
     from factor_lab.factors.presets import factor_fingerprint
     _fp = factor_fingerprint(PRESET)
-    _old_fp = (old_info or {}).get('factor_fingerprint')
+    # 2026-09-07: 原先写的是 old_info —— 该变量在本函数里从不存在，
+    # 这一行必然抛 NameError，整个增量扩展从未成功执行过。后果是静默的:
+    # daily_runner 只 log 一句"增量预测子进程失败"就继续，用旧预测出信号，
+    # 于是预测停在 2026-08-28、信号一天比一天旧，直到"信号已过期"拦下调仓。
+    # 本地正确的变量名是 old_json(上面从 json_path 读出来的)。
+    _old_fp = (old_json or {}).get('factor_fingerprint')
     if old_pred is not None and _old_fp:
         if (_old_fp.get('hash') != _fp['hash']
                 or _old_fp.get('n_factors') != _fp['n_factors']):
