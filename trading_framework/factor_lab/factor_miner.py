@@ -969,13 +969,35 @@ def _build_synthetic_parent(d_entry: dict, d_idx: int,
     from factor_lab.quanta.trajectory import Trajectory
 
     direction_name = d_entry.get("direction", "")
-    best_factor = None
-    best_icir = 0.0
 
-    for pf in global_pool.get_all():
-        if pf.direction == direction_name and abs(pf.icir) > abs(best_icir):
-            best_factor = pf
-            best_icir = pf.icir
+    def _best(cands):
+        return max(cands, key=lambda f: abs(f.icir), default=None)
+
+    allf = list(global_pool.get_all())
+
+    # 1) 按 direction_id 匹配 —— 稳定键，跨 session 可靠
+    best_factor = _best([f for f in allf
+                         if getattr(f, "direction_id", -1) == d_idx])
+
+    # 2) 退回方向名精确匹配 —— 兼容加 direction_id 之前入池的老因子
+    if not best_factor:
+        best_factor = _best([f for f in allf if f.direction == direction_name])
+
+    # 3) 仍找不到就用池内最优因子当 parent。
+    #
+    # 2026-09-08: 原实现在这里直接 return None，深度阶段整个跳过。
+    # 因子入池时记的 direction 是 LLM 当时自起的中文名(如"价量背离")，
+    # 而查找用的是注册表里的方向名(如"VWAP偏离回归") —— 实测池里 4 个因子
+    # 只有 1 个碰巧对上，于是每次深度挖掘都报"无可用 parent"直接跳过。
+    # 后果: 40% 的时间预算(115/288 分钟)长期白烧，而 mutation 正是
+    # FactorMiner 论文里的主要产出来源，池子因此长期停在 4 个因子。
+    # 变异一个好因子仍然有价值 —— 方向本身是通过 hypothesis 另行传入的，
+    # 不该因为名字对不上就放弃整个阶段。
+    if not best_factor and allf:
+        best_factor = _best(allf)
+        if best_factor:
+            print(f"    方向无对应因子，改用池内最优 {best_factor.name} "
+                  f"(|ICIR|={abs(best_factor.icir):.3f}) 作 parent")
 
     if not best_factor:
         return None
@@ -1010,6 +1032,7 @@ def _try_admit_to_pool(traj, factor_pool, iteration):
             icir=traj.icir,
             hypothesis=traj.hypothesis,
             direction=traj.direction,
+            direction_id=getattr(traj, "direction_id", -1),
             source_traj_id=traj.id,
             iteration=iteration,
         )
@@ -1274,6 +1297,7 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
                 icir=traj.icir,
                 hypothesis=traj.hypothesis,
                 direction=traj.direction,
+                direction_id=getattr(traj, "direction_id", -1),
                 source_traj_id=traj.id,
                 iteration=iteration,
             )

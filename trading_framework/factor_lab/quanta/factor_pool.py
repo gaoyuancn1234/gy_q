@@ -29,6 +29,10 @@ class PoolFactor:
     icir: float = 0.0
     hypothesis: str = ""
     direction: str = ""
+    # 方向的稳定标识。direction 存的是 LLM 当时自起的中文名，跨 session
+    # 与注册表里的方向名对不上(实测 4 个因子只有 1 个碰巧一致)，
+    # 靠它做精确匹配会让深度挖掘永远找不到 parent。
+    direction_id: int = -1
     source_traj_id: str = ""
     iteration: int = 0
     admitted_at: str | float = ""
@@ -55,6 +59,7 @@ class FactorPool:
     def try_admit(self, name: str, expr: str,
                   rank_ic: float = 0.0, icir: float = 0.0,
                   hypothesis: str = "", direction: str = "",
+                  direction_id: int = -1,
                   source_traj_id: str = "", iteration: int = 0,
                   ) -> tuple[bool, str]:
         """尝试将因子加入池
@@ -112,6 +117,7 @@ class FactorPool:
             name=name, expr=expr,
             rank_ic=rank_ic, icir=icir,
             hypothesis=hypothesis, direction=direction,
+            direction_id=direction_id,
             source_traj_id=source_traj_id, iteration=iteration,
             admitted_at=datetime.now().isoformat(),
         ))
