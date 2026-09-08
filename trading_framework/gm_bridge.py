@@ -114,6 +114,15 @@ LOG_FILE = PROJECT_DIR / 'logs' / 'gm_bridge.log'
 _LOG_BUF = []
 
 
+def _push_feishu(msg: str) -> None:
+    """推飞书。失败不能影响主流程 —— 但也不能静默吞掉。"""
+    try:
+        from daily_runner import push_feishu
+        push_feishu(msg)
+    except Exception as e:
+        log(f'  飞书推送失败: {type(e).__name__}: {e}')
+
+
 def log(msg: str = ''):
     """写日志文件而不是 print
 
@@ -410,8 +419,65 @@ def _do_sync():
     log(f'当日成交 {len(rows)} 笔')
     for r in rows[:20]:
         log(f"    {r['code']} {r['side']} {r['volume']}股 @ {r['price']}")
-    _save_state({'status': 'synced', 'executions': rows,
-                 'snapshot': _account_snapshot()})
+    snap = _account_snapshot()
+    _save_state({'status': 'synced', 'executions': rows, 'snapshot': snap})
+    _mirror_to_live_holdings(snap)
+
+
+def _mirror_to_live_holdings(snap: dict) -> None:
+    """把掘金仿真账户的真实持仓回写到 live_holdings.json
+
+    2026-09-08: 补这一步之前存在一个数据源断层 ——
+
+      盘中监控(每5分钟)、飞书"持仓"命令、止损检查、自我反思，
+      读的全是 portfolio/live_holdings.json。而那个文件原本只能靠
+      "截图 + 回复已执行" 更新。改成掘金自动下单之后没人再截图，
+      于是 live_holdings 永远是空的。
+
+    实测后果: 监控当天 09:25~15:05 醒来 68 次，68 次都记
+    "空仓且无待执行订单" —— 而掘金账户里是有仓位的。
+    也就是说**真实持仓完全没有止损保护**: 模型让持有 8 个交易日，
+    中间某只跌 20% 也没有任何人在看。
+
+    掘金是成交的唯一真相来源(它按真实盘口撮合)，所以以它为准回写，
+    而不是反过来。cost_price 用 vwap(持仓均价)，与 live_holdings 里
+    "实际成交价" 的语义一致。
+    """
+    if not snap or snap.get('nav') is None:
+        log('  账户快照无效，跳过回写 live_holdings(不写入不可信数据)')
+        return
+    try:
+        from portfolio.live_portfolio import load_live_holdings, save_live_holdings
+    except Exception as e:
+        log(f'  回写 live_holdings 失败(导入): {type(e).__name__}: {e}')
+        return
+
+    h = load_live_holdings()
+    old_codes = set((h.get('positions') or {}).keys())
+
+    positions = {}
+    for p in snap.get('positions') or []:
+        vol = int(p.get('volume') or 0)
+        if vol <= 0:
+            continue
+        positions[p['code']] = {
+            'name': p.get('name') or p['code'],
+            'shares': vol,
+            'cost_price': float(p.get('vwap') or p.get('price') or 0),
+            'entry_date': (h.get('positions', {}).get(p['code'], {})
+                           .get('entry_date') or datetime.now().strftime('%Y-%m-%d')),
+        }
+
+    h['positions'] = positions
+    h['cash'] = float(snap.get('available') or 0)
+    h['last_update'] = datetime.now().isoformat(timespec='seconds')
+    h['synced_from'] = 'gm_bridge'      # 标明这份持仓的来源，便于排查
+    save_live_holdings(h)
+
+    new_codes = set(positions)
+    log(f'  已回写 live_holdings: {len(positions)} 只持仓, 现金 '
+        f'{h["cash"]:,.0f} (新增 {len(new_codes - old_codes)}, '
+        f'移除 {len(old_codes - new_codes)})')
 
 
 # ---------------------------------------------------------------- 入口
@@ -438,8 +504,24 @@ def main() -> int:
 
     from gm.api import run, MODE_LIVE
     # run() 会阻塞直到策略停止; 本策略只在 init 里干活
-    run(strategy_id=env('GM_STRATEGY_ID'), filename=Path(__file__).name,
-        mode=MODE_LIVE, token=env('GM_TOKEN'))
+    try:
+        run(strategy_id=env('GM_STRATEGY_ID'), filename=Path(__file__).name,
+            mode=MODE_LIVE, token=env('GM_TOKEN'))
+    except Exception as e:
+        # 终端没开时 gm 抛 {"status": 1001, "message": "无法连接到终端服务"}。
+        # 2026-09-08: 裸抛的话定时任务只留下一个非零退出码和一段
+        # 英文堆栈，看不出"是掘金终端没启动"这个唯一需要人干预的原因。
+        # SDK 连的是本机终端(127.0.0.1:7001)，终端不在就什么都做不了。
+        msg = str(e)
+        if '1001' in msg or '无法连接到终端' in msg:
+            log('✗ 连不上掘金终端 —— 请启动掘金量化终端并保持登录。')
+            log('  SDK 通过本机 127.0.0.1:7001 与终端通信，终端不在则无法下单/回读。')
+            _save_state({'status': 'terminal_offline',
+                         'action': action, 'error': msg})
+            _push_feishu('⚠ 掘金终端未启动，今日下单/回读跳过。'
+                         '请打开掘金量化终端并登录，否则仿真盘不会有任何成交。')
+            return 2
+        raise
     return 0
 
 

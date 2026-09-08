@@ -97,15 +97,32 @@ def _checks() -> list[dict]:
     except Exception as e:
         add("因子指纹", False, f"检查失败: {type(e).__name__}: {e}")
 
-    # --- 4. 模拟盘是否跟得上 ---
+    # --- 4. 掘金仿真账户 ---
+    #
+    # 2026-09-08 由"模拟盘重放"换成这个。重放每天把 2024 年至今重算一遍,
+    # 649 天里 648 天的结果和昨天完全相同,只为多算 1 天 —— 检查它等于
+    # 每天确认历史没变。而掘金是真正在成交的账户,按真实盘口撮合,
+    # 它有没有仓位、有没有成交才是"这套系统今天到底干活了没有"的答案。
+    # paper_trader 引擎本身保留: 它是唯一过了对账的回测引擎,
+    # run_phase_test / 参数配对检验都靠它,只是不再每天跑。
     try:
-        perf = json.loads((BOT_DIR / "factor_lab/paper_trading/replay_performance.json")
-                          .read_text(encoding="utf-8"))
-        add("模拟盘", True,
-            f"覆盖至 {perf.get('end_date')}，Sharpe {perf.get('sharpe'):.3f}，"
-            f"超额 {perf.get('excess_return'):.2%}，交易 {perf.get('n_trades')} 笔")
+        gm = json.loads((BOT_DIR / "gm_state.json").read_text(encoding="utf-8"))
+        snap = gm.get("snapshot") or {}
+        st = gm.get("status")
+        npos = len(snap.get("positions") or [])
+        nav = snap.get("nav")
+        upd = (gm.get("updated") or "")[:10]
+        if st == "terminal_offline":
+            add("掘金仿真", False, f"终端未启动 (最后更新 {upd}) —— 不会有任何成交")
+        elif nav is None:
+            add("掘金仿真", False, f"账户快照无效 (status={st})")
+        else:
+            add("掘金仿真", True,
+                f"nav {nav:,.0f}，持仓 {npos} 只，最后更新 {upd}")
+    except FileNotFoundError:
+        add("掘金仿真", False, "gm_state.json 不存在 —— 桥接从未成功运行过")
     except Exception as e:
-        add("模拟盘", False, f"检查失败: {type(e).__name__}: {e}")
+        add("掘金仿真", False, f"检查失败: {type(e).__name__}: {e}")
 
     # --- 5. 定时任务上次退出码 ---
     try:

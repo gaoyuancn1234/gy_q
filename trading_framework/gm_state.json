@@ -1,10 +1,6 @@
 {
-  "status": "ok",
-  "snapshot": {
-    "nav": 100000.0,
-    "available": 100000.0,
-    "market_value": 0.0,
-    "positions": []
-  },
-  "updated": "2026-09-07T13:10:47"
+  "status": "terminal_offline",
+  "action": "sync",
+  "error": "{\"status\": 1001, \"message\": \"无法连接到终端服务\", \"function\": \"run\"}",
+  "updated": "2026-09-08T20:37:02"
 }

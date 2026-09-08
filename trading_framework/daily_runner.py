@@ -874,6 +874,7 @@ def generate_and_push(dry_run: bool = False, degraded: list = None):
     write_notification("signal", "每日信号", message)
 
 
+
 def _run_shadow_updates(live_signal: dict, prices: dict,
                         dry_run: bool) -> str:
     """为所有 active shadow 生成信号并记录对比"""

@@ -104,17 +104,28 @@ def collect_today_data() -> dict:
         except Exception as e:
             data["errors"].append(f"读取 daily_runner log 失败: {e}")
 
-    # 4. 收集盘中监控日志
-    monitor_log = LOGS_DIR / "intraday_monitor.log"
-    if monitor_log.exists():
+    # 4. 收集掘金仿真状态 (2026-09-08 由"盘中监控日志"替换)
+    #
+    # 盘中监控已移除: 它每 5 分钟轮询 live_holdings，但那个文件靠"截图+已执行"
+    # 更新，改成掘金自动下单后就再没人截图 —— 实测当天醒来 68 次、68 次都记
+    # "空仓且无待执行订单"，而掘金账户里是有仓位的。且它的告警无法执行:
+    # 唯一成交时点是 14:50 掘金自动挂单，盘中提醒不导向任何动作。
+    # 止损不受影响 —— 它在 daily_runner 的下单路径里，不在监控里。
+    gm_state = BOT_DIR / "gm_state.json"
+    if gm_state.exists():
         try:
-            with open(monitor_log, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            if today in content:
-                idx = content.index(today)
-                data["monitor_log"] = content[idx:][:2000]
+            gm = json.loads(gm_state.read_text(encoding='utf-8'))
+            snap = gm.get("snapshot") or {}
+            data["gm_sim"] = {
+                "status": gm.get("status"),
+                "updated": gm.get("updated"),
+                "nav": snap.get("nav"),
+                "available": snap.get("available"),
+                "position_count": len(snap.get("positions") or []),
+                "executions_today": len(gm.get("executions") or []),
+            }
         except Exception as e:
-            data["errors"].append(f"读取 monitor log 失败: {e}")
+            data["errors"].append(f"读取 gm_state 失败: {e}")
 
     # 5. 收集实验盘日志
     exp_log = BOT_DIR / "experiment" / "daily_log" / f"{today}.json"
