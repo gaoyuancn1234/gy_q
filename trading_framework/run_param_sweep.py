@@ -67,9 +67,14 @@ def main() -> int:
     from factor_lab.paper_trader import PaperTrader
 
     def parse(v):
-        if str(v).lower() in ('none', 'off', '0', '关闭'):
+        if str(v).lower() in ('none', 'off', '关闭'):
             return None
-        return float(v) if '.' in str(v) else int(v)
+        # '0' 对数值参数是"关闭"，但对字符串参数(如 adaptive_strategy)
+        # 没有这个语义，所以只在能转成数字时才当 0 处理。
+        try:
+            return float(v) if '.' in str(v) else int(v)
+        except ValueError:
+            return str(v)      # 字符串参数原样传入，如 A_topk_adaptive
 
     values = [parse(v) for v in args.values]
 

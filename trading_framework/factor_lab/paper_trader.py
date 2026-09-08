@@ -327,6 +327,14 @@ class PaperTrader:
         signal_dates = set(signal.index.get_level_values(0).unique())
 
         if day_idx % rebal == 0 and date in signal_dates:
+            # adaptive_strategy 之前是个纯装饰的配置项 —— 代码无条件按信号
+            # 质量套用 TOPK_BY_REGIME，把它改成任何值都不会有效果，它只在
+            # 启动横幅里被打印。2026-09-08 补上真正的开关，否则无法做
+            # "自适应 vs 固定 TopK" 的配对检验(没有对照组)。
+            # 置为 none/off/空 即关闭，直接用配置里的 topk。
+            _adaptive = str(cfg.get('adaptive_strategy') or '').strip().lower()
+            _adaptive_on = _adaptive not in ('', 'none', 'off', 'false')
+
             # 信号质量 → regime
             lo, hi = cfg['adaptive_thresholds']
             valid_q = quality_score[quality_score.index < date]
@@ -343,7 +351,8 @@ class PaperTrader:
 
             # 资金上限: 与 SignalGenerator 共用同一规则。
             # 此前直接用 TOPK_BY_REGIME，绕过上限 —— 实测持有 16 只而非 8 只。
-            effective_topk = cap_topk(TOPK_BY_REGIME[regime], cfg)
+            _base_topk = TOPK_BY_REGIME[regime] if _adaptive_on else cfg['topk']
+            effective_topk = cap_topk(_base_topk, cfg)
 
             # 获取当日信号
             if date in signal_dates:
