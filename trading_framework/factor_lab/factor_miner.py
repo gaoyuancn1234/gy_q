@@ -1224,7 +1224,12 @@ def run_daily_session(smoke_test: bool = False, dry_run: bool = False):
 
     # 全局 FactorPool (跨天累积)
     global_pool = FactorPool(save_dir=MINING_DIR)
-    global_pool.load(GLOBAL_POOL_FILE)
+    # 已有挖掘历史(方向注册表存在)却读不到因子池 = 异常，必须炸而不是当空池。
+    # 静默空池的后果: 挖掘把已入池因子重新准入一遍，且相关性去重失效
+    # (空池跟谁都不相关)，等于把去冗余这道闸拆了还没人知道。
+    # 全新安装时注册表也不存在，此时空池是正常的。
+    _has_history = (MINING_DIR / "direction_registry.json").exists()
+    global_pool.load(GLOBAL_POOL_FILE, required=_has_history)
     print(f"  全局因子池: {global_pool.size} 个因子")
 
     # Experience Memory (FactorMiner 跨 session 经验记忆)

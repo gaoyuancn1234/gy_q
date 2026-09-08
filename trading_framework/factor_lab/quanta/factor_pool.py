@@ -277,24 +277,35 @@ class FactorPool:
 
     def save(self, filename: str = "factor_pool.json"):
         path = self.save_dir / filename
+        # 用 asdict 而不是手写字段列表。
+        #
+        # 2026-09-08 教训: 当天给 PoolFactor 加了 direction_id(修复深度挖掘
+        # 找不到 parent 的问题)，但这里的手写列表没同步 —— 字段在内存里有、
+        # 一存盘就丢，下次加载后修复自动失效，且不报任何错。
+        # 序列化必须跟着 dataclass 走，加字段不该需要改两处。
+        import dataclasses
         data = {
             "total_attempted": self._total_attempted,
-            "factors": [
-                {
-                    "name": f.name, "expr": f.expr,
-                    "rank_ic": f.rank_ic, "icir": f.icir,
-                    "hypothesis": f.hypothesis, "direction": f.direction,
-                    "source_traj_id": f.source_traj_id, "iteration": f.iteration,
-                    "admitted_at": f.admitted_at, "last_validated": f.last_validated,
-                }
-                for f in self._factors
-            ],
+            "factors": [dataclasses.asdict(f) for f in self._factors],
         }
         atomic_json_dump(path, data, indent=2, ensure_ascii=False)
 
-    def load(self, filename: str = "factor_pool.json"):
+    def load(self, filename: str = "factor_pool.json", required: bool = False):
+        """从磁盘加载因子池
+
+        Args:
+            required: True 表示"这个池本该存在"。用于全局池 ——
+                文件缺失时静默返回空池，挖掘会当成从零开始，把已有因子
+                重新准入一遍，且相关性去重形同虚设(空池跟谁都不相关)。
+                会话池则相反: 文件不存在就是全新一轮，属正常。
+        """
         path = self.save_dir / filename
         if not path.exists():
+            if required:
+                raise FileNotFoundError(
+                    f"因子池文件不存在: {path} —— "
+                    f"调用方声明这个池必须存在。静默当成空池会让挖掘重复"
+                    f"准入已有因子、且相关性去重失效(空池跟谁都不相关)。")
             return
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
