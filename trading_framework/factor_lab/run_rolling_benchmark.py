@@ -134,7 +134,8 @@ RESULTS_DIR = PROJECT_DIR / "factor_lab" / "results" / "rolling"
 
 
 def generate_rolling_windows(config_name: str, config: dict,
-                             test_start: str, test_end: str) -> list[dict]:
+                             test_start: str, test_end: str,
+                             data_end: str | None = None) -> list[dict]:
     """生成 walk-forward 滚动窗口列表
 
     窗口从 test_start 的预测期开始，向后推导训练/验证期。
@@ -182,6 +183,19 @@ def generate_rolling_windows(config_name: str, config: dict,
             train_start = expand_start
         else:
             train_start = valid_start - relativedelta(years=train_years)
+
+        # 数据可得性闸: 预测区间可以延伸到未来(这正是 test_end 取"今天+5个月"
+        # 的用意 —— 给每日增量预测留空间)，但**训练集和验证集必须有真实数据**。
+        #
+        # 2026-09-09: retrain_pipeline 默认 test_end = 今天+5个月，于是生成了
+        # Window 13 (valid 2026-10-01~12-31，整段在未来)，训练时 qlib 抛
+        # "Empty data from dataset"，整个重训以 rc=1 失败。这个默认值只要
+        # 数据没长到那么远就必然失败。
+        #
+        # 跳过而不是报错: 数据长够了这些窗口自然会被创建，daily_runner 每天
+        # 的增量扩展会接着补上，不需要人工干预。
+        if data_end is not None and valid_end > pd.Timestamp(data_end):
+            break
 
         fmt = lambda d: d.strftime('%Y-%m-%d')
         windows.append({

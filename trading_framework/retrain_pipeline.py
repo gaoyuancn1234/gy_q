@@ -107,8 +107,19 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
         old_windows = []
 
     # 生成所有 windows (从 TEST_START 到 new_test_end)
-    all_windows = generate_rolling_windows(CONFIG_NAME, config, TEST_START, new_test_end)
-    print(f"  总 windows: {len(all_windows)} (覆盖 {TEST_START} ~ {new_test_end})")
+    #
+    # data_end 传真实的数据末日: new_test_end 默认是"今天+5个月"(给每日增量
+    # 预测留空间)，但窗口的训练/验证集必须有数据 —— 不传这个参数会生成
+    # 验证区间整段在未来的窗口，训练时 qlib 抛 "Empty data from dataset"。
+    with open(CONFIG_FILE, encoding='utf-8') as _f:
+        _u = yaml.safe_load(_f).get('instruments', 'csi300')
+    _cal_path = (Path(f"~/.qlib/qlib_data/cn_data_{'bs' if _u == 'csi300' else _u}")
+                 .expanduser() / "calendars" / "day.txt")
+    data_end = _cal_path.read_text(encoding='utf-8').split()[-1]
+    all_windows = generate_rolling_windows(CONFIG_NAME, config, TEST_START,
+                                           new_test_end, data_end=data_end)
+    print(f"  总 windows: {len(all_windows)} (覆盖 {TEST_START} ~ {new_test_end}"
+          f", 数据止于 {data_end})")
 
     # 筛选需要处理的 windows:
     # 1. 全新的 window (pred_start > old_last)
@@ -455,6 +466,21 @@ def check_window_health() -> list:
         windows = json.load(f).get('windows', [])
     if not windows:
         return []
+
+    # 走过退化兜底的窗口要单独报出来。
+    #
+    # 2026-09-09: 兜底窗口存的 best_iteration 是兜底轮数(如 290)，
+    # 检查 `best_iteration < 20` 时一律放行 —— 于是"验证集正常、训到 290 轮"
+    # 和"验证集完全无区分能力、被迫兜底到 290 轮"在报告里长得一模一样。
+    # 数据本身(fallback_rounds)一直有记录，只是没人看。
+    #
+    # 不判为退化: 实测 win11 的验证期是 2026 Q2(日均 IC +0.0094、正 IC 占比
+    # 48%，等于抛硬币)，而它预测的 Q3 实测 IC +0.0502 —— 兜底模型的样本外
+    # 表现是健康的。所以这是"该知情"，不是"该拦截"。
+    fb = [w.get('window_num') for w in windows if w.get('fallback_rounds')]
+    if fb:
+        print(f"\n  ℹ 窗口 {fb} 走了退化兜底: 验证集无区分能力，改用固定轮数训练。"
+              f"\n    这些窗口的 best_iteration 是兜底轮数，不代表验证集认可该轮数。")
 
     degraded = [w for w in windows
                 if w.get('best_iteration') is not None
