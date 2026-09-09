@@ -14,6 +14,10 @@ import pandas as pd
 
 DEFAULT_QLIB_DIR = "~/.qlib/qlib_data/cn_data_bs"
 
+# 注入字段尾部前向填充的上限(交易日)。估值源常比行情晚 1~2 天，需要补齐
+# 否则 qlib 二元运算会因长度不等而崩;但源真的坏掉时不能无限伪造下去。
+MAX_FFILL_DAYS = 5
+
 
 def _load_calendar(qlib_dir: str = DEFAULT_QLIB_DIR) -> dict[str, int]:
     """加载日历，返回 {日期字符串: 索引} 映射"""
@@ -40,13 +44,24 @@ def _write_bin(data: np.ndarray, path: Path):
 
 
 def _read_existing_bin(bin_path: Path):
-    """读取已有 bin 文件，返回 (start_idx, end_idx, data_array) 或 None"""
+    """读取已有 bin 文件，返回 (start_idx, end_idx, data_array) 或 None
+
+    qlib bin 格式只有**一个**头(起始日历索引)，其后紧跟数据。
+    2026-09-09 之前这里按两个头(start+end)读写 —— 读写自洽所以本模块从不报错，
+    但 qlib 按单头解析，于是每个注入字段:
+      1. 第一天读到的是 end 索引本身(如 2105)，一个量级离谱的假值;
+      2. 其余每天整体错位一天(qlib 在 T 日读到的其实是 T-1 的值)。
+    5 个估值字段、22 个基本面因子全部受影响。详见 CLAUDE.md —— data_setup.py
+    当初修过同一个 bug，但本文件漏了。
+    """
     if not bin_path.exists():
         return None
     arr = np.fromfile(bin_path, dtype=np.float32)
     if len(arr) < 2:
         return None
-    return int(arr[0]), int(arr[1]), arr[2:]
+    start = int(arr[0])
+    data = arr[1:]
+    return start, start + len(data) - 1, data
 
 
 def _merge_and_write_bin(bin_path: Path, new_start: int, new_end: int,
@@ -69,23 +84,50 @@ def _merge_and_write_bin(bin_path: Path, new_start: int, new_end: int,
         merged_start = new_start
         merged_end = new_end
 
+    # 尾部前向填充到与该股票行情数据同一个终点。
+    #
+    # 2026-09-09: 估值源(东财)天生比行情晚 1~2 个交易日。覆盖区间一旦不齐，
+    # qlib 在 ops.py 做二元运算(如 $close/$pe_ttm)时按 numpy 长度对齐，
+    # 直接抛 "operands could not be broadcast together with shapes
+    # (1699,) (1701,)" —— 差值恰好等于缺的交易日数。缺口每天都存在，
+    # 所以每次行情刷新后训练都会炸。
+    #
+    # 用前向填充而不是留 NaN: 留 NaN 会让 22 个基本面因子在最近几天全空，
+    # 恰好是生成当日信号要用的那几天。前向填充只用过去的值，不构成前视;
+    # 但设上限，避免数据源真的坏掉时无限期伪造出"最新"估值。
+    #
+    # 放在这里而不是 inject_field: inject_dataframe(实际生产路径)绕开了
+    # inject_field 直接调本函数 —— 加在上游会写在没人走的分支里。
+    ref = _read_existing_bin(bin_path.parent / "close.day.bin")
+    if ref is not None and merged_end < ref[1]:
+        pad_to = min(ref[1], merged_end + MAX_FFILL_DAYS)
+        last_val = new_data.get(merged_end)
+        if last_val is None or (isinstance(last_val, float) and np.isnan(last_val)):
+            known = [i for i in new_data if i <= merged_end
+                     and not np.isnan(new_data[i])]
+            last_val = new_data[max(known)] if known else None
+        if last_val is not None:
+            for idx in range(merged_end + 1, pad_to + 1):
+                new_data.setdefault(idx, last_val)
+            merged_end = pad_to
+
     length = merged_end - merged_start + 1
-    arr = np.full(length + 2, np.nan, dtype=np.float32)
+    # 单头: arr[0]=起始日历索引, arr[1:] 才是数据 —— 与 qlib 的解析一致
+    arr = np.full(length + 1, np.nan, dtype=np.float32)
     arr[0] = np.float32(merged_start)
-    arr[1] = np.float32(merged_end)
 
     # 先填入旧数据
     if existing is not None:
         old_start, _, old_arr = existing
         for i in range(len(old_arr)):
-            pos = old_start + i - merged_start + 2
-            if 2 <= pos < len(arr):
+            pos = old_start + i - merged_start + 1
+            if 1 <= pos < len(arr):
                 arr[pos] = old_arr[i]
 
     # 新数据覆盖
     for idx, val in new_data.items():
-        pos = idx - merged_start + 2
-        if 2 <= pos < len(arr):
+        pos = idx - merged_start + 1
+        if 1 <= pos < len(arr):
             arr[pos] = np.float32(val)
 
     _write_bin(arr, bin_path)

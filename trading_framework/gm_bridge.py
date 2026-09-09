@@ -145,6 +145,15 @@ def _save_state(payload: dict):
                           encoding='utf-8')
 
 
+def _load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 # ---------------------------------------------------------------- 策略回调
 
 def init(context):
@@ -159,6 +168,7 @@ def init(context):
     import os as _os
     action = _os.environ.get('GM_BRIDGE_ACTION', 'check')
     dry = _os.environ.get('GM_BRIDGE_DRY') == '1'
+    force = _os.environ.get('GM_BRIDGE_FORCE') == '1'
     log(f'=== gm_bridge {action}{" (空跑)" if dry else ""} '
         f'{_dt.now():%Y-%m-%d %H:%M:%S} ===')
 
@@ -170,7 +180,7 @@ def init(context):
         if action == 'check':
             _do_check()
         elif action == 'place':
-            _do_place(dry_run=dry)
+            _do_place(dry_run=dry, force=force)
         elif action == 'sync':
             _do_sync()
     except Exception as e:
@@ -245,10 +255,23 @@ def _do_check():
     _save_state({'status': 'ok', 'snapshot': snap})
 
 
-def _do_place(dry_run: bool = False):
+def _do_place(dry_run: bool = False, force: bool = False):
     """把 pending_orders 送进仿真账户，逐笔回查委托状态
 
     dry_run=True 时走完全部计算(取价、敞口、分配、股数)但不提交委托。
+
+    幂等保护 (2026-09-09 新增)
+    --------------------------
+    2026-09-09 早上 GmPlace 在非预定时间(10:18，预定 14:50)意外触发并
+    真实下了 13 笔买单，根因未查清(疑似改动 Set-ScheduledTask 触发器后
+    Windows 的 StartWhenAvailable 追赶行为)。危险的不是"为什么提前跑了"，
+    是**如果 14:50 按计划再跑一次会发生什么**: 买入那段完全不看 `held`
+    (当前持仓)，只看 pending_orders 和当下可用现金——重复触发会用剩余
+    现金对同一批股票再买一轮，仓位不知不觉翻倍，而 rc 依然是 0。
+
+    与其去猜清楚 Windows 为什么会双发(这类问题没有能验证"以后不会再发生"
+    的修法)，不如让下单本身对重复触发免疫: 记录"这批 pending_orders 对应
+    哪个信号日期已经下过单"，同一信号日期的重复触发直接跳过。
     """
     from gm.api import order_volume, get_orders, OrderSide_Buy, OrderSide_Sell, \
         OrderType_Limit, PositionEffect_Open, PositionEffect_Close
@@ -257,13 +280,23 @@ def _do_place(dry_run: bool = False):
     pending = holdings.get('pending_orders') or {}
     sells = list(pending.get('sells') or [])
     buys = dict(pending.get('buys') or {})
+    signal_date = holdings.get('last_signal_date')
+
+    if not force and not dry_run:
+        prev = _load_state()
+        if (prev.get('status') in ('placed', 'dry_run')
+                and prev.get('signal_date') == signal_date
+                and signal_date is not None):
+            log(f'信号日期 {signal_date} 已下过单 (状态={prev.get("status")}, '
+               f'{prev.get("updated","?")})，本次跳过。传 --force 强制重下。')
+            return
 
     if not sells and not buys:
         log('无待执行订单')
-        _save_state({'status': 'no_orders'})
+        _save_state({'status': 'no_orders', 'signal_date': signal_date})
         return
 
-    log(f'待执行: 卖 {len(sells)} 只，买 {len(buys)} 只')
+    log(f'待执行: 卖 {len(sells)} 只，买 {len(buys)} 只 (信号日期 {signal_date})')
 
     # 卖出用现有持仓股数; 买入股数由 live_portfolio 的分配决定，
     # 这里从 holdings 里取不到，改为按当前可用资金等分 —— 与实盘同一函数
@@ -375,7 +408,7 @@ def _do_place(dry_run: bool = False):
         total = sum(p.get('amount', 0) for p in placed if p['side'] == 'BUY')
         log(f'\n[空跑] 共 {len(placed)} 笔，买入金额合计 {total:,.0f}，'
               f'未提交任何委托')
-        _save_state({'status': 'dry_run', 'orders': placed,
+        _save_state({'status': 'dry_run', 'signal_date': signal_date, 'orders': placed,
                      'exposure': exposure, 'cash_for_buy': cash_for_buy})
         return
 
@@ -396,7 +429,7 @@ def _do_place(dry_run: bool = False):
     log(f'已下 {len(placed)} 笔，回查到 {n_ok} 笔委托')
     if n_ok < len(placed):
         log(f'⚠ 有 {len(placed) - n_ok} 笔在委托列表里查不到 —— 不要当成已下单')
-    _save_state({'status': 'placed', 'orders': placed,
+    _save_state({'status': 'placed', 'signal_date': signal_date, 'orders': placed,
                  'n_placed': len(placed), 'n_confirmed': n_ok})
 
 
@@ -490,6 +523,8 @@ def main() -> int:
     g.add_argument('--sync', action='store_true', help='回读成交')
     ap.add_argument('--dry-run', action='store_true',
                     help='与 --place 合用: 走完全部计算但不提交委托')
+    ap.add_argument('--force', action='store_true',
+                    help='与 --place 合用: 忽略"同一信号日期已下过单"的幂等跳过')
     args = ap.parse_args()
 
     action = 'check' if args.check else ('place' if args.place else 'sync')
@@ -501,6 +536,7 @@ def main() -> int:
     import os
     os.environ['GM_BRIDGE_ACTION'] = action
     os.environ['GM_BRIDGE_DRY'] = '1' if args.dry_run else '0'
+    os.environ['GM_BRIDGE_FORCE'] = '1' if args.force else '0'
 
     from gm.api import run, MODE_LIVE
     # run() 会阻塞直到策略停止; 本策略只在 init 里干活

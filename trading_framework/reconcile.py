@@ -318,4 +318,6 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    from scheduled_log import redirect_to_file
+    redirect_to_file("reconcile")
     sys.exit(main())

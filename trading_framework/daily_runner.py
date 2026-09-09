@@ -343,7 +343,7 @@ def _update_shadow_predictions(dry_run: bool = False):
                     Path(cand.get('signal_config_path', '')).parent.parent
                     / "state" / sid)
                 result = subprocess.run(
-                    [sys.executable, '-m',
+                    [sys.executable, '-X', 'utf8', '-m',
                      'factor_lab.generate_gate_mlp_predictions',
                      '--output-dir', output_dir,
                      '--test-end', test_end],
@@ -381,7 +381,7 @@ def _update_shadow_predictions(dry_run: bool = False):
                     f'print(f"RESULT:{{len(pred)}}")'
                 )
                 result = subprocess.run(
-                    [sys.executable, '-c', script],
+                    [sys.executable, '-X', 'utf8', '-c', script],
                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout_sec,
                     cwd=str(PROJECT_DIR),
                 )

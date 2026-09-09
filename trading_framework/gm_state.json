@@ -1,6 +1,0 @@
-{
-  "status": "terminal_offline",
-  "action": "sync",
-  "error": "{\"status\": 1001, \"message\": \"无法连接到终端服务\", \"function\": \"run\"}",
-  "updated": "2026-09-08T20:37:02"
-}
