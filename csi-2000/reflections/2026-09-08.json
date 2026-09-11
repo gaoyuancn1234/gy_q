@@ -1,0 +1,9 @@
+{
+  "score": 0,
+  "summary": "Claude CLI 错误 (exit=1)",
+  "raw_output": "You've hit your limit · resets 1am (Asia/Shanghai)",
+  "stderr": "",
+  "error": "returncode=1: ",
+  "date": "2026-09-08",
+  "generated_at": "2026-09-08T23:45:25.613126"
+}

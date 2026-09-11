@@ -1,0 +1,70 @@
+{
+  "total_attempted": 8,
+  "factors": [
+    {
+      "name": "QA_SKEWMOM_MASTR",
+      "expr": "Mul(Mean(Power(Delta($close,1),3),10),Div($close,Mean($close,20)+1e-8))",
+      "rank_ic": -0.03264563881438957,
+      "icir": -0.5352941750840372,
+      "hypothesis": "在A股CSI300中，当个股10日价格变动的三阶原始矩（负偏度代理）持续为负、且收盘价仍高于20日均线时，价格分布形态已提前揭示机构以稀疏但幅度剧烈的抛单实施高位隐性减仓——极端负收益日拉低三阶矩，换手率信号尚不异常，市场整体低估下行压力。「分布负偏 × 价格相对强势」的双重条件在动量延续机制下预示短期价格持续下行：强势区机构减仓摩擦更低，动量耗尽后加速回调，因子值越低（负偏越深且强势越突出）后续跌幅越大。",
+      "direction": "价格收益分布三阶矩（已实现偏度代理）× 截面相对价格强势",
+      "direction_id": 32,
+      "source_traj_id": "T0003",
+      "iteration": 1,
+      "admitted_at": "2026-09-09T11:26:26.893324",
+      "last_validated": ""
+    },
+    {
+      "name": "QA_TREND_ACCEL_R2",
+      "expr": "Mul(Mul(Sign(Slope($close, 5)), Rsquare($close, 20)), If(Greater(Mul(Slope($close, 5), Slope($close, 20)), 0), 1, 0))",
+      "rank_ic": -0.02748417467630212,
+      "icir": -0.4591629421575101,
+      "hypothesis": "当短期趋势（5日）与中期趋势（20日）方向一致时，价格动量更具持续性。具体而言，若5日收益率斜率与20日收益率斜率同号且短期斜率强度更大，说明趋势正在加速而非衰减，后续收益率倾向于延续当前方向。这种多尺度趋势共振反映了不同持仓周期的投资者形成了方向共识，减少了反向博弈力量。",
+      "direction": "多尺度趋势一致性",
+      "direction_id": -1,
+      "source_traj_id": "T0005",
+      "iteration": 0,
+      "admitted_at": "2026-09-07T13:40:17.881392",
+      "last_validated": ""
+    },
+    {
+      "name": "QA_SLOPE_CONVEX_DIFF",
+      "expr": "Sub(Slope($close, 10), Slope($close, 20))",
+      "rank_ic": -0.024857121678655083,
+      "icir": -0.4420250615868188,
+      "hypothesis": "基于 日收益率序列凸性（价格加速度） 的量价因子",
+      "direction": "日收益率序列凸性（价格加速度）",
+      "direction_id": -1,
+      "source_traj_id": "T0004",
+      "iteration": 0,
+      "admitted_at": "2026-09-07T23:38:04.349015",
+      "last_validated": ""
+    },
+    {
+      "name": "QA_PVCORR_REGIME_REVERT",
+      "expr": "Mul(Sign(Delta($close, 10)), Corr($close, $turn, 20))",
+      "rank_ic": -0.01478951799203636,
+      "icir": -0.2261097608654269,
+      "hypothesis": "在 A 股 CSI300 中，个股 20 日滚动收盘价与换手率的时序 Pearson 相关系数能有效刻画量价同步程度。当该相关系数偏负（价升量缩 = 主力低调出货，或价跌量涨 = 恐慌踩踏）时，当前价格运动缺乏真实成交的持续性支撑，供需结构内部失衡，短期内大概率触发均值回归。回归幅度与量价背离深度正相关，预计在 5~10 个交易日内兑现。",
+      "direction": "量价时序相关性背离（收盘价 vs 换手率 Rolling Corr）",
+      "direction_id": 32,
+      "source_traj_id": "T0001",
+      "iteration": 0,
+      "admitted_at": "2026-09-09T10:47:40.438731",
+      "last_validated": ""
+    },
+    {
+      "name": "QA_AMP_SQUEEZE_VOLDRY",
+      "expr": "Mul(Sub(Mean(Div(Sub($high,$low),$close),20),Mean(Div(Sub($high,$low),$close),5)),Sub(Mean($volume,20),Mean($volume,5)))",
+      "rank_ic": -0.008752451086319472,
+      "icir": -0.12710228875744203,
+      "hypothesis": "当股票日内振幅（(高-低)/收盘）经历持续压缩后，往往预示着多空力量在积蓄能量，一旦突破将产生趋势性行情。振幅压缩期间成交量同步萎缩的标的，突破后的动量更强，因为这表明筹码充分换手、浮筹减少，供给侧阻力更小。我们用近5日振幅相对近20日振幅的压缩比率，叠加量能萎缩信号，预测未来短期收益方向。",
+      "direction": "波动率-量价联合",
+      "direction_id": -1,
+      "source_traj_id": "T0006",
+      "iteration": 0,
+      "admitted_at": "2026-09-07T14:02:26.716086",
+      "last_validated": ""
+    }
+  ]
+}

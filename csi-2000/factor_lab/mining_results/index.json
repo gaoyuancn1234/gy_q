@@ -1,0 +1,23 @@
+{
+  "run_001": {
+    "date": "2026-09-08",
+    "factors_tested": 7,
+    "promising_count": 2,
+    "beat_baseline": null,
+    "focus": ""
+  },
+  "run_002": {
+    "date": "2026-09-08",
+    "factors_tested": 14,
+    "promising_count": 2,
+    "beat_baseline": null,
+    "focus": ""
+  },
+  "run_003": {
+    "date": "2026-09-09",
+    "factors_tested": 3,
+    "promising_count": 3,
+    "beat_baseline": false,
+    "focus": ""
+  }
+}

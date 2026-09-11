@@ -1,0 +1,146 @@
+{
+  "factor_fingerprint": {
+    "preset": "alpha158",
+    "n_factors": 158,
+    "hash": "e3b0c44298fc1c14"
+  },
+  "config_name": "D_expand_3v_3r",
+  "preset": "alpha158",
+  "model": "LightGBM",
+  "n_windows": 11,
+  "windows": [
+    {
+      "window_num": 1,
+      "train_start": "2019-10-01",
+      "train_end": "2023-09-30",
+      "pred_start": "2024-01-01",
+      "pred_end": "2024-03-31",
+      "n_samples": 115908,
+      "best_iteration": 438,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 442.4
+    },
+    {
+      "window_num": 2,
+      "train_start": "2019-10-01",
+      "train_end": "2023-12-31",
+      "pred_start": "2024-04-01",
+      "pred_end": "2024-06-30",
+      "n_samples": 114172,
+      "best_iteration": 349,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 377.5
+    },
+    {
+      "window_num": 3,
+      "train_start": "2019-10-01",
+      "train_end": "2024-03-31",
+      "pred_start": "2024-07-01",
+      "pred_end": "2024-09-30",
+      "n_samples": 127813,
+      "best_iteration": 497,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 485.0
+    },
+    {
+      "window_num": 4,
+      "train_start": "2019-10-01",
+      "train_end": "2024-06-30",
+      "pred_start": "2024-10-01",
+      "pred_end": "2024-12-31",
+      "n_samples": 118906,
+      "best_iteration": 405,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 481.1
+    },
+    {
+      "window_num": 5,
+      "train_start": "2019-10-01",
+      "train_end": "2024-09-30",
+      "pred_start": "2025-01-01",
+      "pred_end": "2025-03-31",
+      "n_samples": 113581,
+      "best_iteration": 175,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 362.0
+    },
+    {
+      "window_num": 6,
+      "train_start": "2019-10-01",
+      "train_end": "2024-12-31",
+      "pred_start": "2025-04-01",
+      "pred_end": "2025-06-30",
+      "n_samples": 115414,
+      "best_iteration": 484,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 556.2
+    },
+    {
+      "window_num": 7,
+      "train_start": "2019-10-01",
+      "train_end": "2025-03-31",
+      "pred_start": "2025-07-01",
+      "pred_end": "2025-09-30",
+      "n_samples": 130593,
+      "best_iteration": 395,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 574.5
+    },
+    {
+      "window_num": 8,
+      "train_start": "2019-10-01",
+      "train_end": "2025-06-30",
+      "pred_start": "2025-10-01",
+      "pred_end": "2025-12-31",
+      "n_samples": 116140,
+      "best_iteration": 108,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 363.4
+    },
+    {
+      "window_num": 9,
+      "train_start": "2019-10-01",
+      "train_end": "2025-09-30",
+      "pred_start": "2026-01-01",
+      "pred_end": "2026-03-31",
+      "n_samples": 111826,
+      "best_iteration": 493,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 648.4
+    },
+    {
+      "window_num": 10,
+      "train_start": "2019-10-01",
+      "train_end": "2025-12-31",
+      "pred_start": "2026-04-01",
+      "pred_end": "2026-06-30",
+      "n_samples": 115416,
+      "best_iteration": 408,
+      "fallback_rounds": false,
+      "n_models": 3,
+      "train_time": 662.0
+    },
+    {
+      "window_num": 11,
+      "train_start": "2019-10-01",
+      "train_end": "2026-03-31",
+      "pred_start": "2026-07-01",
+      "pred_end": "2026-09-30",
+      "n_samples": 101987,
+      "best_iteration": 406,
+      "fallback_rounds": true,
+      "n_models": 3,
+      "train_time": 766.7
+    }
+  ],
+  "timestamp": "2026-09-10T05:30:34.132876"
+}

@@ -1,0 +1,189 @@
+{
+  "date": "2026-09-07",
+  "score": 7,
+  "summary": "模拟盘 Sharpe 1.26、超额 13.6% 运行稳健；但管线自检暴露 PaperTrader rc=1，代码审查发现 gm_bridge 下单守卫不一致(nav=0 可穿透)、self_reflect 重试丢失 prompt 等 P0 级静默缺陷。",
+  "system_health": {
+    "status": "warning",
+    "issues": [
+      "TradingSystem-PaperTrader 定时任务 rc=1：setup_tasks.ps1 未传 --end today，replay 可能因日期越界或数据缺失崩溃",
+      "TradingSystem-IntradayMonitor 曾因上一实例未结束被跳过，说明存在挂起风险",
+      "因子池仅 3 个因子且平均 ICIR=-0.167，信号质量偏弱"
+    ]
+  },
+  "code_defects": [
+    {
+      "title": "gm_bridge._do_place 的 nav 守卫用 is None 而非 not，nav=0 时可穿透下单",
+      "file": "trading_framework/gm_bridge.py:246",
+      "trigger": "掘金账户同步延迟导致 nav 返回 0（非 None）时，_do_check 正确拦截但 _do_place 放行",
+      "impact": "零余额账户尝试下单，限价单可能被交易所拒单但已产生无意义委托；退出码仍为 0，属静默失败",
+      "verify": "对比 gm_bridge.py 第 208 行 `if not snap['nav']` 与第 246 行 `if snap['nav'] is None`，两处守卫逻辑不一致",
+      "confidence": "high",
+      "severity": "P0"
+    },
+    {
+      "title": "self_reflect.py Claude CLI 重试遗漏 input=prompt，重试时发送空 prompt",
+      "file": "trading_framework/self_reflect.py:644",
+      "trigger": "首次调用因 token 过期返回非零退出码，进入重试分支",
+      "impact": "Claude 收到空 stdin，返回无意义输出或空字符串，后续 JSON 解析失败回退到空反思；退出码 0，完全静默",
+      "verify": "对比第 613 行 subprocess.run(..., input=prompt, ...) 与第 644 行 subprocess.run(cmd, ...) — 后者缺少 input=prompt",
+      "confidence": "high",
+      "severity": "P0"
+    },
+    {
+      "title": "data_setup_sina._download_index 无 timeout 保护，可永久阻塞数据重建",
+      "file": "trading_framework/qlib_engine/data_setup_sina.py:154",
+      "trigger": "新浪指数接口响应缓慢或挂起时",
+      "impact": "整条数据刷新链路卡死，下游预测和模拟盘全部停滞；进程不退出、不报错，属典型挂起型静默失败",
+      "verify": "搜索 _download_index 函数体，确认 ak.stock_zh_index_daily 调用未被 _with_timeout 包裹，而同文件 _download_stock 已使用",
+      "confidence": "high",
+      "severity": "P1"
+    },
+    {
+      "title": "retrain_pipeline.validate() 返回值被丢弃，降级窗口不阻断管线",
+      "file": "trading_framework/retrain_pipeline.py:530",
+      "trigger": "最新滚动窗口模型质量退化时",
+      "impact": "管线输出 'Pipeline 完成!' 并退出 0，用降级模型生成信号投入模拟盘；用户无感知",
+      "verify": "第 530 行 validate(new_test_end) 未赋值，validate() 返回 degraded 列表（第 428 行）被直接丢弃",
+      "confidence": "high",
+      "severity": "P1"
+    },
+    {
+      "title": "retrain_pipeline.update_quality_score 硬编码 csi300 股票池",
+      "file": "trading_framework/retrain_pipeline.py:331",
+      "trigger": "若未来切换到 csi800 或自定义 universe",
+      "impact": "quality score 仍按 csi300 计算，与实际交易 universe 不匹配，因子评估失真",
+      "verify": "grep 'csi300' retrain_pipeline.py — 第 331 行 D.instruments('csi300') 是硬编码，而 refresh_data 从 yaml 读取",
+      "confidence": "high",
+      "severity": "P1"
+    },
+    {
+      "title": "run_rolling_benchmark 的 XGBoost/CatBoost 忽略 seed 参数，多种子集成无效",
+      "file": "trading_framework/factor_lab/run_rolling_benchmark.py:433-449",
+      "trigger": "使用 XGBoost 或 CatBoost 模型并开启 n_seeds > 1 时",
+      "impact": "N 次训练产生相同模型，集成平均等于单模型，白白消耗 N 倍算力且用户以为获得了方差缩减",
+      "verify": "搜索 _seed_params 调用位置，确认只在 LightGBM 分支使用；XGBoost/CatBoost 的 build_model 未传入 seed",
+      "confidence": "medium",
+      "severity": "P1"
+    },
+    {
+      "title": "data_setup_sina._download_stock 静默吞掉 factor 计算异常，无聚合检查",
+      "file": "trading_framework/qlib_engine/data_setup_sina.py:147-148",
+      "trigger": "复权因子接口批量失败（如端点变更）",
+      "impact": "整个数据集丢失 factor 字段，qlib 允许小数股交易，回测不切实际；无任何汇总告警",
+      "verify": "检查 except Exception: pass 块（第 147-148 行），确认无下游聚合统计 factor 缺失比例的逻辑",
+      "confidence": "medium",
+      "severity": "P1"
+    },
+    {
+      "title": "self_reflect.py 飞书推送返回值被忽略",
+      "file": "trading_framework/self_reflect.py:1060",
+      "trigger": "飞书推送 3 次重试全部失败时",
+      "impact": "反思报告静默未送达，退出码 0；与此前 '飞书推送数周未生效' 属同一模式",
+      "verify": "第 1060 行 push_reflection_to_feishu(reflection) 未检查返回值 True/False",
+      "confidence": "high",
+      "severity": "P2"
+    },
+    {
+      "title": "PaperTrader 定时任务缺少 --end today 参数",
+      "file": "trading_framework/setup_tasks.ps1:56-58",
+      "trigger": "每日定时触发 PaperTrader replay",
+      "impact": "replay 使用 config 中的静态 test_end 而非当天日期，可能导致日期越界或数据缺失崩溃（与 rc=1 吻合）",
+      "verify": "检查 setup_tasks.ps1 中 PaperTrader 的 Args 是否包含 --end today；对比 paper_trader.py 第 664-665 行默认值逻辑",
+      "confidence": "medium",
+      "severity": "P1"
+    }
+  ],
+  "strategy_diagnosis": {
+    "factor_pool_quality": "因子池仅 3 个因子，平均 ICIR=-0.167、平均 Rank IC=-0.01，信号极弱。唯一正向因子 QA_VWAP_CLOSE_DIVERGENCE 的 ICIR 仅 0.086，贡献微乎其微。当前模拟盘 Sharpe 1.26 主要依赖 alpha158_val preset 内置特征，自研因子几乎未贡献增量 alpha。",
+    "mining_efficiency": "近 3 个 run 无挖掘记录，因子研发处于停滞状态。池中 3 个因子方向各异（趋势一致性、波动率-量价、价量背离），说明尚处于广撒网阶段，未找到可深挖的主攻方向。需要重启挖掘管线并提高迭代频率。",
+    "risks": [
+      "因子池过小导致信号高度依赖 preset 内置因子，一旦 alpha158 特征衰减将无自研因子补位",
+      "3 个自研因子中 2 个 ICIR 为负，若并入模型可能拖累而非增强预测",
+      "无 shadow 验证在跑，新因子/参数变更缺少安全网"
+    ]
+  },
+  "factor_analysis": {
+    "strong_directions": [],
+    "weak_directions": [
+      "波动率-量价联合 (ICIR=-0.127，方向性不明确)",
+      "价量背离 (ICIR=0.086，过弱不具统计显著性)"
+    ],
+    "decay_signals": [
+      "池中因子全部 |ICIR| < 0.5，远低于可用阈值，是衰减还是从未有效需区分"
+    ],
+    "recommendations": [
+      "暂停将自研因子并入生产模型，当前质量不足以贡献正增量",
+      "对 QA_TREND_ACCEL_R2 (ICIR=-0.459) 做反向测试：若取反后 ICIR 稳定为正，可作为反向因子使用",
+      "重启因子挖掘，优先探索日内微观结构方向（换手率分布、订单流不平衡），与现有因子相关性低"
+    ]
+  },
+  "market_outlook": {
+    "macro_assessment": "当日新闻以政策面为主（生态文明、乡村振兴、数字贸易博览会），无重大货币/财政政策变动信号。国际面伊朗霍尔木兹海峡禁区声明带来地缘风险但对 A 股影响间接。市场环境偏中性，无明显方向性催化剂。",
+    "impact_on_strategy": "中性环境下动量/趋势因子效力减弱，与因子池中趋势一致性因子表现差吻合。当前 regime 分布 strong:10/normal:53/weak:19 偏 normal，策略的 8 日调仓周期和 8% 止损在此环境下运作正常。",
+    "adjustments": [
+      "维持现有参数不动，中性市场不宜频繁调参",
+      "关注 9/23 数字贸易博览会前后科技板块波动，可能为相关持仓带来事件驱动机会"
+    ]
+  },
+  "research_directions": [
+    {
+      "title": "日内微观结构因子",
+      "rationale": "当前因子池全部基于日频 OHLCV 数据，同质性高。换手率分布形态、VWAP 偏离的日内分时特征有机会提供正交 alpha。论文 'Ensemble properties of high frequency data' 给出了高频聚合到日频的统计框架。",
+      "related_papers": [
+        "Ensemble properties of high frequency data and intraday trading rules"
+      ],
+      "effort": "medium"
+    },
+    {
+      "title": "因子衰减监控与自动轮换",
+      "rationale": "当前无因子衰减检测机制。ICIR 滚动窗口监控 + 自动降权/剔除可防止失效因子拖累组合。对于池子只有 3 个因子的现状，这比挖新因子更紧急。",
+      "related_papers": [
+        "Learning Curves for Decision Making in Supervised Machine Learning: A Survey"
+      ],
+      "effort": "small"
+    }
+  ],
+  "action_plan": [
+    {
+      "title": "[P0] 修复 gm_bridge._do_place nav 守卫",
+      "description": "将 gm_bridge.py 第 246 行 `if snap['nav'] is None` 改为 `if not snap['nav']`，与 _do_check（第 208 行）保持一致。这是实盘下单路径上的安全守卫，不一致可能导致零余额账户下单。修改后在仿真环境中用 mock snap={'nav': 0} 验证拦截生效。",
+      "priority": "P0",
+      "category": "infra"
+    },
+    {
+      "title": "[P0] 修复 self_reflect.py 重试缺少 input=prompt",
+      "description": "在 self_reflect.py 第 644 行的 subprocess.run 调用中添加 `input=prompt` 参数，与第 613 行的原始调用保持一致。当前重试发送空 prompt 给 Claude，导致重试永远产生无效输出。修复后可通过临时触发 token 过期来验证重试路径。",
+      "priority": "P0",
+      "category": "infra"
+    },
+    {
+      "title": "[P1] 为 data_setup_sina._download_index 添加 timeout",
+      "description": "将第 154 行 `ak.stock_zh_index_daily(...)` 包裹进 `_with_timeout(lambda: ..., PER_STOCK_TIMEOUT, 'index')`，与 _download_stock 保持一致。当前指数下载是数据重建链路中唯一无超时保护的网络调用，挂起会阻塞整条管线。",
+      "priority": "P1",
+      "category": "data"
+    },
+    {
+      "title": "[P1] 诊断并修复 PaperTrader rc=1",
+      "description": "首先检查 setup_tasks.ps1 中 PaperTrader 任务是否缺少 --end today 参数。手动运行 `python -m factor_lab.paper_trader replay --end today` 观察是否报错。若因日期越界，添加 --end today；若因数据缺失，检查 cn_data_bs 目录完整性。同时在 paper_trader.py 的 main() 中添加顶层 try/except 以捕获意外异常并输出有意义的错误信息。",
+      "priority": "P1",
+      "category": "infra"
+    },
+    {
+      "title": "[P1] 让 validate() 降级结果阻断管线",
+      "description": "在 retrain_pipeline.py 第 530 行捕获 validate() 返回值，当最新窗口出现在 degraded 列表中时，打印明确警告并以非零退出码退出（或至少写入状态文件供下游检查）。当前管线即使模型质量退化也静默成功，违背了 validate 作为质量门禁的设计意图。",
+      "priority": "P1",
+      "category": "infra"
+    },
+    {
+      "title": "[P2] 重启因子挖掘",
+      "description": "因子池仅 3 个且质量不佳，已无挖掘 run 记录。建议先对 QA_TREND_ACCEL_R2 做反向测试验证是否可用，同时启动新一轮日内微观结构因子探索。目标：2 周内将池中 |ICIR| > 0.3 的因子数从 1 提升到 3。",
+      "priority": "P2",
+      "category": "factor"
+    }
+  ],
+  "top_priorities": [
+    "修复 gm_bridge nav 守卫 + self_reflect 重试丢 prompt 这两个 P0 静默缺陷（10 分钟可完成，风险消除立竿见影）",
+    "诊断 PaperTrader rc=1 并修复 —— 这是当前唯一亮红的管线环节，不解决会持续告警且模拟盘可能漏跑"
+  ],
+  "generated_at": "2026-09-07T23:38:48.925017"
+}

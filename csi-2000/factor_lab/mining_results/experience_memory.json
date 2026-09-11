@@ -1,0 +1,122 @@
+{
+  "updated_at": 1788924492.5305533,
+  "success_patterns": [
+    {
+      "signature": "Mul(Mul(C,C),If(C,C,C))",
+      "signal_source": "多尺度趋势一致性",
+      "example_exprs": [
+        "Mul(Mul(Sign(Slope($close, 5)), Rsquare($close, 20)), If(Greater(Mul(Slope($close, 5), Slope($close, 20)), 0), 1, 0))"
+      ],
+      "success_count": 1,
+      "total_count": 1,
+      "avg_icir": 0.4591629421575101
+    },
+    {
+      "signature": "Sub(Slope($,C),Slope($,C))",
+      "signal_source": "日收益率序列凸性（价格加速度）",
+      "example_exprs": [
+        "Sub(Slope($close, 10), Slope($close, 20))"
+      ],
+      "success_count": 1,
+      "total_count": 1,
+      "avg_icir": 0.4420250615868188
+    },
+    {
+      "signature": "Mul(Sign(C),Corr($,$,C))",
+      "signal_source": "量价时序相关性背离（收盘价 vs 换手率 Rolling Corr）",
+      "example_exprs": [
+        "Mul(Sign(Delta($close, 10)), Corr($close, $turn, 20))"
+      ],
+      "success_count": 0,
+      "total_count": 1,
+      "avg_icir": 0.2261097608654269
+    },
+    {
+      "signature": "Mul(Mean(C,C),Div($,C))",
+      "signal_source": "价格收益分布三阶矩（已实现偏度代理）× 截面相对价格强势",
+      "example_exprs": [
+        "Mul(Mean(Power(Delta($close,1),3),10),Div($close,Mean($close,20)+1e-8))"
+      ],
+      "success_count": 1,
+      "total_count": 1,
+      "avg_icir": 0.5352941750840372
+    }
+  ],
+  "forbidden_regions": [],
+  "strategic_insights": [
+    {
+      "category": "运算",
+      "insight": "Mul 算子成功率 80% (n=5), 平均|ICIR|=0.428",
+      "confidence": 0.4,
+      "evidence_count": 5
+    },
+    {
+      "category": "时序",
+      "insight": "Slope 算子成功率 100% (n=5), 平均|ICIR|=0.452",
+      "confidence": 0.5,
+      "evidence_count": 5
+    }
+  ],
+  "op_stats": {
+    "Mul": {
+      "success": 4,
+      "fail": 1,
+      "total_icir": 2.138892762421994
+    },
+    "Sign": {
+      "success": 1,
+      "fail": 1,
+      "total_icir": 0.685272703022937
+    },
+    "Slope": {
+      "success": 5,
+      "fail": 0,
+      "total_icir": 2.2615389496461678
+    },
+    "Rsquare": {
+      "success": 1,
+      "fail": 0,
+      "total_icir": 0.4591629421575101
+    },
+    "If": {
+      "success": 1,
+      "fail": 0,
+      "total_icir": 0.4591629421575101
+    },
+    "Greater": {
+      "success": 1,
+      "fail": 0,
+      "total_icir": 0.4591629421575101
+    },
+    "Sub": {
+      "success": 1,
+      "fail": 0,
+      "total_icir": 0.4420250615868188
+    },
+    "Delta": {
+      "success": 1,
+      "fail": 1,
+      "total_icir": 0.7614039359494641
+    },
+    "Corr": {
+      "success": 0,
+      "fail": 1,
+      "total_icir": 0.2261097608654269
+    },
+    "Mean": {
+      "success": 2,
+      "fail": 0,
+      "total_icir": 1.0705883501680744
+    },
+    "Power": {
+      "success": 1,
+      "fail": 0,
+      "total_icir": 0.5352941750840372
+    },
+    "Div": {
+      "success": 1,
+      "fail": 0,
+      "total_icir": 0.5352941750840372
+    }
+  }
+}

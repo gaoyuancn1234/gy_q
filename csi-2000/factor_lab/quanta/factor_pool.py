@@ -1,0 +1,372 @@
+"""因子池管理 — 准入规则 + 容量控制
+
+论文 Section 4.3:
+- 按 |RankIC| 降序排列
+- 准入: 相关系数 < REDUNDANCY_CORR AND AST 相似度 < AST_SIMILARITY
+- 池容量: min(总挖掘数 × POOL_CAP_RATIO, POOL_MAX)
+"""
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from factor_lab.utils import atomic_json_dump
+
+from .config import (
+    REDUNDANCY_CORR, AST_SIMILARITY, POOL_CAP_RATIO, POOL_MAX,
+    CORR_CHECK_ENABLED, CORR_CHECK_STRICT,
+    QUALITY_MIN_ABS_ICIR, QUALITY_MIN_ABS_RANK_IC,
+    REPLACE_IC_MIN, REPLACE_RATIO,
+)
+from .ast_dedup import ast_similarity
+
+
+@dataclass
+class PoolFactor:
+    """池中的一个因子"""
+    name: str
+    expr: str
+    rank_ic: float = 0.0
+    icir: float = 0.0
+    hypothesis: str = ""
+    direction: str = ""
+    # 方向的稳定标识。direction 存的是 LLM 当时自起的中文名，跨 session
+    # 与注册表里的方向名对不上(实测 4 个因子只有 1 个碰巧一致)，
+    # 靠它做精确匹配会让深度挖掘永远找不到 parent。
+    direction_id: int = -1
+    source_traj_id: str = ""
+    iteration: int = 0
+    admitted_at: str | float = ""
+    last_validated: str | float = ""
+
+
+class FactorPool:
+    """因子池: 管理已发现的因子 + 准入控制"""
+
+    def __init__(self, save_dir: Path):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._factors: list[PoolFactor] = []
+        self._total_attempted = 0  # 总尝试入池数
+
+    @property
+    def size(self) -> int:
+        return len(self._factors)
+
+    @property
+    def capacity(self) -> int:
+        return min(int(max(self._total_attempted, 10) * POOL_CAP_RATIO), POOL_MAX)
+
+    def try_admit(self, name: str, expr: str,
+                  rank_ic: float = 0.0, icir: float = 0.0,
+                  hypothesis: str = "", direction: str = "",
+                  direction_id: int = -1,
+                  source_traj_id: str = "", iteration: int = 0,
+                  ) -> tuple[bool, str]:
+        """尝试将因子加入池
+
+        Returns:
+            (admitted, reason)
+        """
+        self._total_attempted += 1
+
+        # 基本信号强度门槛
+        if abs(rank_ic) < 0.005 and abs(icir) < 0.1:
+            return False, f"信号太弱 (rank_ic={rank_ic:.4f}, icir={icir:.3f})"
+
+        # 名字唯一性
+        existing_names = {f.name for f in self._factors}
+        if name in existing_names:
+            return False, f"名字重复: {name}"
+
+        # 结构去重: AST 同构
+        for existing in self._factors:
+            sim = ast_similarity(expr, existing.expr)
+            if sim >= AST_SIMILARITY:
+                return False, f"AST 相似度过高 ({sim:.2f} >= {AST_SIMILARITY}) vs {existing.name}"
+
+        # 数值去重: 与池中因子的截面相关性 (论文 Section 4.3 的核心准入规则)
+        #
+        # AST 只能捕捉结构相似，捕捉不到"写法不同但数值几乎一样"的因子 ——
+        # 后者才是因子拥挤的主要来源，也是 run_006/run_010 那 22 个因子
+        # 样本内 +7.4% / 样本外 -12.9% 的机制。
+        if CORR_CHECK_ENABLED and self._factors:
+            try:
+                is_red, max_corr, most_sim = self.check_corr_redundancy(expr)
+            except RuntimeError as e:
+                # 检查跑不起来时不能默认放行 —— 那等于这道闸不存在。
+                if CORR_CHECK_STRICT:
+                    return False, f"{e} (strict 模式拒绝准入)"
+                print(f"  [factor_pool] ⚠ {e}; 非严格模式放行 {name}，"
+                      f"该因子未经数值冗余检查")
+            else:
+                if is_red:
+                    return False, (f"与池中因子相关性过高 ({max_corr:.2f} >= "
+                                   f"{REDUNDANCY_CORR}) vs {most_sim}")
+
+        # 容量控制: 如果已满, 需要比最差的好
+        if self.size >= self.capacity:
+            worst = min(self._factors, key=lambda f: abs(f.rank_ic))
+            if abs(rank_ic) <= abs(worst.rank_ic):
+                return False, f"池已满 ({self.size}/{self.capacity}), 且 rank_ic={rank_ic:.4f} <= worst={worst.rank_ic:.4f}"
+            # 踢出最差的
+            self._factors.remove(worst)
+
+        # 加入
+        from datetime import datetime
+        self._factors.append(PoolFactor(
+            name=name, expr=expr,
+            rank_ic=rank_ic, icir=icir,
+            hypothesis=hypothesis, direction=direction,
+            direction_id=direction_id,
+            source_traj_id=source_traj_id, iteration=iteration,
+            admitted_at=datetime.now().isoformat(),
+        ))
+        self._sort()
+        return True, f"admitted (pool={self.size}/{self.capacity})"
+
+    def try_replace(self, name: str, expr: str,
+                    rank_ic: float, icir: float,
+                    max_corr_factor: str, max_corr_value: float,
+                    ) -> bool:
+        """FactorMiner Section 3.4, Stage 2.5 替换机制
+
+        条件:
+          1. |IC(new)| >= REPLACE_IC_MIN
+          2. |IC(new)| >= REPLACE_RATIO * |IC(old)|
+          3. 仅1个因子超过 theta (在调用前已检查)
+          4. 新因子与非目标池成员无 AST 冗余
+
+        Returns:
+            True = 替换成功
+        """
+        if abs(rank_ic) < REPLACE_IC_MIN:
+            return False
+
+        # 名字唯一性
+        if name in {f.name for f in self._factors}:
+            return False
+
+        # 找到被替换的目标因子
+        target = None
+        for f in self._factors:
+            if f.name == max_corr_factor:
+                target = f
+                break
+
+        if target is None:
+            return False
+
+        # 检查替换倍数
+        if abs(target.rank_ic) > 0 and abs(rank_ic) < REPLACE_RATIO * abs(target.rank_ic):
+            return False
+
+        # 检查与非目标池成员的 AST 相似度
+        for f in self._factors:
+            if f.name == target.name:
+                continue
+            sim = ast_similarity(expr, f.expr)
+            if sim >= AST_SIMILARITY:
+                return False
+
+        # 执行替换
+        self._factors.remove(target)
+        self._factors.append(PoolFactor(
+            name=name, expr=expr,
+            rank_ic=rank_ic, icir=icir,
+            hypothesis=f"replaced:{target.name}",
+            direction="",
+        ))
+        self._sort()
+        print(f"    [replace] {name} (|IC|={abs(rank_ic):.4f}) 替换 "
+              f"{target.name} (|IC|={abs(target.rank_ic):.4f})")
+        return True
+
+    def check_corr_redundancy(self, expr: str) -> tuple[bool, float, str]:
+        """检查与【池中已有因子】的数值相关性 (需要 qlib.init)
+
+        论文 Section 4.3 的准入规则: 与池中每个因子的相关性绝对值都低于
+        REDUNDANCY_CORR 才准入。这是抑制因子拥挤的核心闸门。
+
+        2026-09-03 修复了三处:
+          1. 从未被调用 —— add() 只做 AST 相似度，注释写着"用 AST 相似度近似"。
+             AST 只看表达式结构，结构不同但数值高度相关的因子照样进池。
+          2. 比对对象错了 —— 原先比 baseline_preset (alpha158_val 基线因子)，
+             而规则要求比的是池中成员。
+          3. 异常时返回"不冗余"(fail-open) —— 检查失败却当成通过。
+             现改为抛出，由 add() 决定如何处置，绝不把"没检查成"伪装成"检查通过"。
+
+        Returns:
+            (is_redundant, max_corr, most_similar_name)
+        Raises:
+            RuntimeError: 相关性无法计算时 (qlib 未初始化 / 表达式非法等)
+        """
+        from factor_lab.mining.evaluator import check_redundancy
+        pool_factors = [(f.name, f.expr) for f in self._factors]
+        if not pool_factors:
+            return False, 0.0, ""
+        try:
+            result = check_redundancy(
+                [("_new_check", expr)],
+                threshold=REDUNDANCY_CORR,
+                baseline_factors=pool_factors,
+            )
+        except Exception as e:
+            raise RuntimeError(f"相关性冗余检查失败: {e}") from e
+        info = result.get("_new_check", {})
+        return (bool(info.get("is_redundant", False)),
+                float(info.get("max_corr", 0.0)),
+                str(info.get("most_correlated", "")))
+
+    def rebuild(self):
+        """按 |RankIC| 降序重建池"""
+        self._sort()
+        # 去除 AST 冗余
+        cleaned = []
+        for f in self._factors:
+            redundant = False
+            for existing in cleaned:
+                if ast_similarity(f.expr, existing.expr) >= AST_SIMILARITY:
+                    redundant = True
+                    break
+            if not redundant:
+                cleaned.append(f)
+        self._factors = cleaned[:self.capacity]
+
+    def get_all(self) -> list[PoolFactor]:
+        return list(self._factors)
+
+    def get_exprs(self) -> list[tuple[str, str]]:
+        """返回 [(name, expr), ...] 格式"""
+        return [(f.name, f.expr) for f in self._factors]
+
+    def get_quality_exprs(
+        self,
+        min_abs_icir: float = QUALITY_MIN_ABS_ICIR,
+        min_abs_rank_ic: float = QUALITY_MIN_ABS_RANK_IC,
+    ) -> list[tuple[str, str]]:
+        """返回通过质量筛选的因子 [(name, expr), ...]
+
+        比 get_exprs() 更严格: 要求 abs(ICIR) >= 阈值 AND abs(RankIC) >= 阈值。
+        用于写入 mined.py，避免弱因子引入噪声。
+        """
+        quality = []
+        for f in self._factors:
+            if abs(f.icir) >= min_abs_icir and abs(f.rank_ic) >= min_abs_rank_ic:
+                quality.append((f.name, f.expr))
+        return quality
+
+    def update_validation(self, validated_names: set[str]):
+        """更新通过 importance 筛选的因子的 last_validated 时间戳"""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        for f in self._factors:
+            if f.name in validated_names:
+                f.last_validated = now
+
+    def stats(self) -> dict:
+        rank_ics = [abs(f.rank_ic) for f in self._factors] if self._factors else [0]
+        return {
+            "size": self.size,
+            "capacity": self.capacity,
+            "total_attempted": self._total_attempted,
+            "avg_rank_ic": sum(rank_ics) / len(rank_ics),
+            "max_rank_ic": max(rank_ics),
+            "min_rank_ic": min(rank_ics),
+            "by_direction": _count_by_key(self._factors, 'direction'),
+        }
+
+    def save(self, filename: str = "factor_pool.json"):
+        path = self.save_dir / filename
+        # 用 asdict 而不是手写字段列表。
+        #
+        # 2026-09-08 教训: 当天给 PoolFactor 加了 direction_id(修复深度挖掘
+        # 找不到 parent 的问题)，但这里的手写列表没同步 —— 字段在内存里有、
+        # 一存盘就丢，下次加载后修复自动失效，且不报任何错。
+        # 序列化必须跟着 dataclass 走，加字段不该需要改两处。
+        import dataclasses
+        data = {
+            "total_attempted": self._total_attempted,
+            "factors": [dataclasses.asdict(f) for f in self._factors],
+        }
+        atomic_json_dump(path, data, indent=2, ensure_ascii=False)
+
+    def load(self, filename: str = "factor_pool.json", required: bool = False):
+        """从磁盘加载因子池
+
+        Args:
+            required: True 表示"这个池本该存在"。用于全局池 ——
+                文件缺失时静默返回空池，挖掘会当成从零开始，把已有因子
+                重新准入一遍，且相关性去重形同虚设(空池跟谁都不相关)。
+                会话池则相反: 文件不存在就是全新一轮，属正常。
+        """
+        path = self.save_dir / filename
+        if not path.exists():
+            if required:
+                raise FileNotFoundError(
+                    f"因子池文件不存在: {path} —— "
+                    f"调用方声明这个池必须存在。静默当成空池会让挖掘重复"
+                    f"准入已有因子、且相关性去重失效(空池跟谁都不相关)。")
+            return
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        self._total_attempted = data.get("total_attempted", 0)
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(PoolFactor)}
+        self._factors = [
+            PoolFactor(**{k: v for k, v in item.items() if k in valid_fields})
+            for item in data.get("factors", [])
+        ]
+
+    def _sort(self):
+        self._factors.sort(key=lambda f: abs(f.rank_ic), reverse=True)
+
+
+def _count_by_key(factors: list[PoolFactor], key: str) -> dict:
+    counts: dict[str, int] = {}
+    for f in factors:
+        val = getattr(f, key, 'unknown')
+        counts[val] = counts.get(val, 0) + 1
+    return counts
+
+
+def _compute_rank_corr(
+    factors: list[tuple[str, str]],
+    start_time: str = "2025-01-01",
+    end_time: str = "2025-12-31",
+) -> dict[tuple[str, str], float]:
+    """计算因子间的 Spearman rank correlation 矩阵
+
+    Args:
+        factors: [(name, expr), ...]
+
+    Returns:
+        {(name_a, name_b): corr_value} — key 按字母序排列
+    """
+    from qlib.data import D
+    import numpy as np
+
+    from qlib_paths import current_universe
+    instruments = D.instruments(current_universe())
+    fields = [expr for _, expr in factors]
+    names = [name for name, _ in factors]
+
+    df = D.features(instruments, fields,
+                    start_time=start_time, end_time=end_time)
+    df.columns = names
+
+    # 截面 rank → Spearman correlation
+    ranked = df.groupby(level=0).rank(pct=True)
+    corr_matrix = ranked.corr(method="pearson")
+
+    result: dict[tuple[str, str], float] = {}
+    for i, n1 in enumerate(names):
+        for j, n2 in enumerate(names):
+            if i >= j:
+                continue
+            key = tuple(sorted([n1, n2]))
+            val = corr_matrix.loc[n1, n2]
+            result[key] = float(val) if not np.isnan(val) else 0.0
+
+    return result
+
+

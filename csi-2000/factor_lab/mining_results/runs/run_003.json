@@ -1,0 +1,160 @@
+{
+  "run_id": "run_003",
+  "date": "2026-09-09",
+  "mode": "daily-smoke",
+  "factors_tested": 3,
+  "hypotheses_generated": 3,
+  "promising_count": 3,
+  "promising_factors": [
+    {
+      "name": "QA_SKEWMOM_MASTR",
+      "expr": "Mul(Mean(Power(Delta($close,1),3),10),Div($close,Mean($close,20)+1e-8))"
+    },
+    {
+      "name": "QA_TREND_ACCEL_R2",
+      "expr": "Mul(Mul(Sign(Slope($close, 5)), Rsquare($close, 20)), If(Greater(Mul(Slope($close, 5), Slope($close, 20)), 0), 1, 0))"
+    },
+    {
+      "name": "QA_SLOPE_CONVEX_DIFF",
+      "expr": "Sub(Slope($close, 10), Slope($close, 20))"
+    }
+  ],
+  "non_redundant": [
+    {
+      "name": "QA_SKEWMOM_MASTR",
+      "expr": "Mul(Mean(Power(Delta($close,1),3),10),Div($close,Mean($close,20)+1e-8))"
+    },
+    {
+      "name": "QA_TREND_ACCEL_R2",
+      "expr": "Mul(Mul(Sign(Slope($close, 5)), Rsquare($close, 20)), If(Greater(Mul(Slope($close, 5), Slope($close, 20)), 0), 1, 0))"
+    },
+    {
+      "name": "QA_SLOPE_CONVEX_DIFF",
+      "expr": "Sub(Slope($close, 10), Slope($close, 20))"
+    }
+  ],
+  "backtest": {
+    "error": "baseline 缓存不存在或 overall 为空，需运行: python -m factor_lab.run_rolling_benchmark --configs D_expand_3v_3r --presets alpha158_val --models LightGBM --force"
+  },
+  "funnel": {
+    "pools": [
+      {
+        "name": "top_icir_10",
+        "strategy": "top_icir",
+        "n_factors": 5,
+        "score": 0.6413,
+        "rank": 1,
+        "backtest": {
+          "error": "baseline 缓存不存在或 overall 为空，需运行: python -m factor_lab.run_rolling_benchmark --configs D_expand_3v_3r --presets alpha158_val --models LightGBM --force"
+        }
+      },
+      {
+        "name": "top_icir_20",
+        "strategy": "top_icir",
+        "n_factors": 5,
+        "score": 0.6413,
+        "rank": 2,
+        "backtest": {
+          "error": "baseline 缓存不存在或 overall 为空，需运行: python -m factor_lab.run_rolling_benchmark --configs D_expand_3v_3r --presets alpha158_val --models LightGBM --force"
+        }
+      },
+      {
+        "name": "importance_10",
+        "strategy": "importance",
+        "n_factors": 5,
+        "score": 0.6413,
+        "rank": 3,
+        "backtest": null
+      },
+      {
+        "name": "importance_20",
+        "strategy": "importance",
+        "n_factors": 5,
+        "score": 0.6413,
+        "rank": 4,
+        "backtest": null
+      },
+      {
+        "name": "diverse_05",
+        "strategy": "diverse",
+        "n_factors": 5,
+        "score": 0.6413,
+        "rank": 5,
+        "backtest": null
+      },
+      {
+        "name": "consensus",
+        "strategy": "consensus",
+        "n_factors": 5,
+        "score": 0.6413,
+        "rank": 6,
+        "backtest": null
+      }
+    ],
+    "best_pool": null,
+    "total_time": 0.0
+  },
+  "beat_baseline": false,
+  "pool_stats": {
+    "total": 3,
+    "successful": 2,
+    "failed": 1,
+    "avg_reward": 0.023717578403212963,
+    "max_reward": 0.03264563881438957,
+    "by_phase": {
+      "init": 2,
+      "mutation": 1,
+      "crossover": 0
+    },
+    "by_iteration": {
+      "0": 2,
+      "1": 1
+    },
+    "direction_traces": {
+      "32": 2,
+      "33": 1
+    }
+  },
+  "global_pool_size": 5,
+  "direction_stats": {
+    "total": 35,
+    "by_status": {
+      "explored": 31,
+      "exhausted": 2,
+      "pending": 2
+    },
+    "total_admitted": 6
+  },
+  "factors_admitted_this_session": 2,
+  "total_time": 3879.2,
+  "llm_usage": {
+    "date": "2026-09-09",
+    "usage": {
+      "claude": 4
+    },
+    "errors": {},
+    "providers": [
+      {
+        "name": "claude",
+        "enabled": true,
+        "quota": 100,
+        "used": 4,
+        "remaining": 96
+      },
+      {
+        "name": "gemini",
+        "enabled": false,
+        "quota": 50,
+        "used": 0,
+        "remaining": 50
+      },
+      {
+        "name": "codex",
+        "enabled": false,
+        "quota": 50,
+        "used": 0,
+        "remaining": 50
+      }
+    ]
+  }
+}

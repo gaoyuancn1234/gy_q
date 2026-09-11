@@ -1,0 +1,43 @@
+# secrets
+.env
+.env.*
+PASSWORD.TXT
+*.pem
+*.key
+
+# python / tooling
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# logs, pid, editor
+*.log
+*.pid
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# experiment / runtime dumps
+mlruns/
+catboost_info/
+*.pkl
+*.parquet
+
+# local caches (minute/daily live under results)
+**/.cache/
+**/minute_csi2000/
+**/tushare_csi2000/
+**/paper_trading/
+
+# Cursor local
+.claude/
+
+# 嵌套仓库: CSI300 活系统不要打进本仓库; 参考树单独存在
+gy_q/
+_ref_QuantaAlpha/

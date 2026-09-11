@@ -1,0 +1,29 @@
+{
+  "2026-09-03": {
+    "score": 2,
+    "summary": "系统处于冷启动/空转状态：因子池不存在、无挖掘记录、无持仓信号，10万资金全部闲置为现金。Lark通知通道存在间歇性断连，整体系统尚未真正投入运行。",
+    "system_health": "warning",
+    "top_priorities": [
+      "修复因子挖掘管线并产出首批因子——这是解除所有下游阻塞的关键路径，没有因子一切都是空转",
+      "端到端验证信号生成流程——确保从数据→因子→模型→信号→持仓的完整链路可用，让系统真正开始工作"
+    ],
+    "action_plan_count": 5
+  },
+  "2026-09-07": {
+    "score": 7,
+    "summary": "模拟盘 Sharpe 1.26、超额 13.6% 运行稳健；但管线自检暴露 PaperTrader rc=1，代码审查发现 gm_bridge 下单守卫不一致(nav=0 可穿透)、self_reflect 重试丢失 prompt 等 P0 级静默缺陷。",
+    "system_health": "warning",
+    "top_priorities": [
+      "修复 gm_bridge nav 守卫 + self_reflect 重试丢 prompt 这两个 P0 静默缺陷（10 分钟可完成，风险消除立竿见影）",
+      "诊断 PaperTrader rc=1 并修复 —— 这是当前唯一亮红的管线环节，不解决会持续告警且模拟盘可能漏跑"
+    ],
+    "action_plan_count": 6
+  },
+  "2026-09-08": {
+    "score": 0,
+    "summary": "Claude CLI 错误 (exit=1)",
+    "system_health": "",
+    "top_priorities": [],
+    "action_plan_count": 0
+  }
+}

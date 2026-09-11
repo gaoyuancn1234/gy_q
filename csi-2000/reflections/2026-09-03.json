@@ -1,0 +1,115 @@
+{
+  "date": "2026-09-03",
+  "score": 2,
+  "summary": "系统处于冷启动/空转状态：因子池不存在、无挖掘记录、无持仓信号，10万资金全部闲置为现金。Lark通知通道存在间歇性断连，整体系统尚未真正投入运行。",
+  "system_health": {
+    "status": "warning",
+    "issues": [
+      "Lark WebSocket 连接两次异常断开（15:42 和 22:46），no close frame 表明非正常断连，可能是网络抖动或服务端超时踢出，需确认自动重连机制是否生效",
+      "全天 0 条对话记录，daemon 可能未正常运行或无触发条件",
+      "global_factor_pool.json 不存在，因子挖掘管线完全未产出",
+      "实盘账户 0 持仓、无信号日期，策略引擎实质未运行"
+    ]
+  },
+  "strategy_diagnosis": {
+    "factor_pool_quality": "因子池文件缺失，质量无从评估。这是当前最严重的阻塞项——没有因子就没有信号，没有信号就没有交易。需要优先排查 factor_miner 管线是否曾成功运行过，以及输出路径是否配置正确。",
+    "mining_efficiency": "最近3个run均无记录，说明挖掘流程从未被触发或全部失败。需要检查 factor_miner、mining/backtest_runner、mining/evaluator 的日志，确认是数据缺失、配置错误还是运行时异常导致的零产出。",
+    "risks": [
+      "模型标记 last_retrain=2026-09 但无因子池支撑，模型可能在用空特征或默认alpha158，预测质量存疑",
+      "100%现金敞口意味着零收益，但同时也无回撤风险——当前风险不在亏损而在机会成本",
+      "stop_loss=0.08 和 rebalance_every=5 的配置未经实盘验证，首次建仓时可能出现意料外行为",
+      "无 shadow 验证阶段直接上实盘，缺少安全缓冲层"
+    ]
+  },
+  "factor_analysis": {
+    "strong_directions": [
+      "无法评估——因子池为空，无历史表现数据"
+    ],
+    "weak_directions": [
+      "无法评估——无挖掘记录可供分析"
+    ],
+    "decay_signals": [
+      "不适用——系统尚未产生因子，无衰减可观测"
+    ],
+    "recommendations": [
+      "第一优先级：跑通 factor_miner 管线端到端，哪怕只产出少量因子也能验证管线完整性",
+      "使用 alpha158 preset 作为 baseline 因子集，先确保模型能产出有效信号",
+      "建议先在 shadow 模式下运行至少 2 周再切入实盘交易",
+      "因子挖掘方向可参考 direction_registry 中已注册的方向，优先选取数据就绪的方向"
+    ]
+  },
+  "market_outlook": {
+    "macro_assessment": "国内政策面平稳，新闻以外交活动（上合峰会、访问埃及）和纪念活动为主，无重大经济政策变动信号。国际方面美加贸易摩擦持续、中东局势偏紧（伊朗-美国冲突升级），但对A股直接冲击有限。比特币突破8万美元反映全球风险偏好有所回暖。",
+    "impact_on_strategy": "当前市场环境相对温和，没有极端事件驱动行情，适合量化模型运行。但系统尚未建仓，市场研判对当前操作暂无实际影响。若近期启动交易，需关注9月季末资金面变化和国庆前后的政策窗口期。",
+    "adjustments": [
+      "当前无需调整策略参数——系统尚未运行，首要任务是让管线跑通",
+      "建议在系统就绪后选择市场波动较小的时段首次建仓，降低冷启动风险",
+      "关注中东地缘冲突升级可能引发的能源板块波动，在因子挖掘中可纳入地缘风险相关因子"
+    ]
+  },
+  "research_directions": [
+    {
+      "title": "集成学习与多策略融合",
+      "rationale": "当前仅使用单一 LightGBM 模型。论文《151 Trading Strategies》提供了大量可量化的策略公式，可从中筛选与现有 alpha158 互补的策略信号作为额外特征。《AI for trading strategies》验证了多种 ML 方法的比较结果，可为模型选型提供参考。",
+      "related_papers": [
+        "151 Estrategias de Trading (151 Trading Strategies)",
+        "AI for trading strategies"
+      ],
+      "effort": "medium"
+    },
+    {
+      "title": "日内高频特征提取",
+      "rationale": "《Ensemble properties of high frequency data and intraday trading rules》探讨了高频数据的聚合特性和日内交易规则。当前系统以日频为主（D_expand_3v_3r），可研究将日内分钟级数据聚合为日频特征（如日内波动率、成交量分布偏度），丰富因子维度。",
+      "related_papers": [
+        "Ensemble properties of high frequency data and intraday trading rules"
+      ],
+      "effort": "large"
+    },
+    {
+      "title": "模型不确定性估计与仓位管理",
+      "rationale": "《Learn to Accumulate Evidence from All Training Samples》提出的证据深度学习方法可用于量化模型预测的不确定性。将不确定性信息融入仓位管理（高不确定性时降低仓位），可能改善风险调整后收益。当前固定 topk=8 的方式较为粗放。",
+      "related_papers": [
+        "Learn to Accumulate Evidence from All Training Samples",
+        "DOME: Recommendations for supervised machine learning validation in biology"
+      ],
+      "effort": "medium"
+    }
+  ],
+  "action_plan": [
+    {
+      "title": "排查并修复因子挖掘管线",
+      "description": "因子池为空是当前最大阻塞。需要：(1) 检查 factor_miner.py 的运行日志，确认是否曾被调度执行；(2) 验证 qlib_injector 数据注入是否成功，qlib 数据目录是否完整；(3) 手动运行一次完整的 factor_miner 流程并跟踪每一步输出；(4) 确认 global_factor_pool.json 的输出路径与其他模块的读取路径一致。目标是产出第一批可用因子。",
+      "priority": "P0",
+      "category": "factor"
+    },
+    {
+      "title": "验证模型推理管线端到端可用性",
+      "description": "即使模型标记为 2026-09 重训，在无因子池的情况下其推理输入不明。需要：(1) 确认模型使用的特征列表与数据源是否匹配；(2) 用最新数据手动触发一次信号生成，检查输出是否合理；(3) 确认 daily_runner 的调度逻辑和 daemon 的触发条件。目标是让 last_signal_date 不再为 null。",
+      "priority": "P0",
+      "category": "model"
+    },
+    {
+      "title": "修复 Lark 通知通道稳定性",
+      "description": "两次 WebSocket 断连（间隔约7小时）表明长连接维护有问题。检查：(1) Lark SDK 版本是否有已知的 WebSocket 稳定性问题；(2) 是否实现了断线自动重连和心跳机制；(3) 网络环境是否存在防火墙/代理超时切断长连接。虽非核心交易逻辑，但通知失效会导致异常无法及时感知。",
+      "priority": "P1",
+      "category": "infra"
+    },
+    {
+      "title": "建立 Shadow 验证流程",
+      "description": "当前无 shadow 记录，直接跳过验证上实盘风险较高。在因子和模型管线跑通后，应先以 shadow 模式运行至少 10-15 个交易日，积累模拟交易记录，评估信号质量、换手率、滑点估计等指标，确认符合预期后再切换到实盘。paper_trader.py 已存在，需确认其与实盘模块的对接。",
+      "priority": "P1",
+      "category": "model"
+    },
+    {
+      "title": "数据源完整性审计",
+      "description": "因子挖掘依赖多个数据源（akshare资金流、tushare资金流、融资融券等）。需要逐一检查：(1) 各 download 脚本是否能正常获取最新数据；(2) update_all.py 是否被正确调度；(3) qlib 格式数据是否覆盖到最新交易日。数据缺口是因子挖掘失败的常见原因。",
+      "priority": "P1",
+      "category": "data"
+    }
+  ],
+  "top_priorities": [
+    "修复因子挖掘管线并产出首批因子——这是解除所有下游阻塞的关键路径，没有因子一切都是空转",
+    "端到端验证信号生成流程——确保从数据→因子→模型→信号→持仓的完整链路可用，让系统真正开始工作"
+  ],
+  "generated_at": "2026-09-03T23:32:06.297610"
+}
