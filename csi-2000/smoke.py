@@ -58,12 +58,16 @@ CHECKS: list[tuple[str, list[str], str, tuple[int, ...]]] = [
      "参数配对工具", (0,)),
     ("gm-check", ["gm_bridge.py", "--check"],
      "掘金仿真账户只读查询", (0,)),
+    # min_coverage 压低是**故意的**: 测试机的分钟缓存只有几百只, 用生产的
+    # 0.80 会被覆盖率闸门直接拒(那是正确行为), 就验不到出分路径了。
+    # 闸门本身由守卫自检 coverage-gate 单独验。
     ("auction-score", ["-c", (
         "import sys;sys.path.insert(0,'.');"
         "from factor_lab.auction_infer import score_day;"
-        "s,px=score_day('2026-09-11','alpha158_ovn');"
+        "s,px=score_day('2026-09-11','alpha158_ovn',min_coverage=0.05);"
         "assert len(s)>50, f'只出 {len(s)} 个分数';"
-        "print(f'[smoke] score_day 出分 {len(s)} 只')")],
+        "assert set(s.index)<=set(px), '有分数却无截断价';"
+        "print(f'[smoke] score_day 出分 {len(s)} 只, 均有价')")],
      "14:45 截断出分(实盘必经路径)", (0,)),
     ("trunc-daily", ["-m", "data_hub.trunc_daily", "--limit", "2"],
      "分钟->14:45 截断日线", (0,)),
@@ -136,10 +140,35 @@ def _check_exec_lag() -> str:
     return '0/1/None/缺失/字符串 五种输入判对'
 
 
+
+def _check_coverage_gate() -> str:
+    """覆盖率不足时 score_day 必须拒绝出分, 而不是拿 NaN 行凑够 topk。
+
+    2026-09-14: 缺陷是没有当日截断K 的票照样被 LightGBM 打了分(NaN 走默认
+    分支), 于是**停牌和取数失败的票**带着分数进入排序 —— 实测 Top100 里
+    35 只是这种。现在两道拦: 无K的票直接剔除; 覆盖率低于 MIN_COVERAGE 拒绝出分。
+    这里验第二道 —— 它一旦失灵就是静默降级, 从结果上看不出来。
+    """
+    code = ("import sys;sys.path.insert(0,'.');"
+            "from factor_lab.auction_infer import score_day;"
+            "score_day('2026-09-11','alpha158_ovn')")
+    r = subprocess.run(PY + ["-c", code], cwd=str(PROJ), capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       timeout=900)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode == 0:
+        raise AssertionError("覆盖率不足却照常出分")
+    if "拒绝出分" not in out:
+        raise AssertionError(f"退出码 {r.returncode} 但不是覆盖率闸门: "
+                             f"{out.strip()[-110:]}")
+    return "覆盖率不足时拒绝出分"
+
+
 LIB_CHECKS = [
     ("validator", _check_validator, "因子表达式验证(前视/死字段)"),
     ("bar-check", _check_bar, "日线量纲断言"),
     ("exec-lag", _check_exec_lag, "exec_lag 解析(0 不能被 or 吃掉)"),
+    ("coverage-gate", _check_coverage_gate, "截断K 覆盖率不足时拒绝出分"),
 ]
 
 def run_one(name: str, args: list[str], desc: str,

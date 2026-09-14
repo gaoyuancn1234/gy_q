@@ -17,6 +17,8 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 LOOKBACK = 80
 EPS = 1e-12
+# 截断K 至少要覆盖成分的这个比例才允许出分。见 _patch_or_append 里的说明。
+MIN_COVERAGE = 0.80
 
 
 def _inst_stem(inst: str) -> str:
@@ -75,6 +77,22 @@ def _trunc_table(day: str) -> pd.DataFrame:
     if g.empty:
         raise SystemExit(f"{day} 没有截断日线 (分钟缓存缺 14:00 以后的K)")
     if "last_tod" in g.columns:
+        # 截断时点是个分布不是一个点。
+        # 2026-09-14: prefetch 14:00 起逐只取数(0.47s x 2000 只 = 16 分钟),
+        # Tushare 每次只返回"到此刻为止"的K —— 第 1 只拿到 14:00, 第 2000 只
+        # 拿到 14:16。也就是说 CUTOFF 写着 14:45, 实际拿到的是 14:00~14:16,
+        # 而且**各只不一致**(截面特征建在不同时点上)。
+        # require_cutoff=False 会照单全收, 原先只打一个众数, 看不出离散度。
+        # 这不是前视(用的是更旧的信息, 偏保守), 但也不是回测测的那个时点。
+        # 根治要换批量取数(掘金 SDK 已连着, history() 能一次取多只),
+        # 逐只串行取数在 45 分钟窗口内拿不到同步的 14:45 截面。
+        _tod = g["last_tod"].astype(str)
+        print(
+            f"[auction] 截断K 时点 最早 {_tod.min()} 中位 {_tod.median()} "
+            f"最晚 {_tod.max()} 众数 {_tod.mode().iat[0] if len(_tod) else '?'}"
+            f"  (名义 CUTOFF {__import__('data_hub.trunc_daily', fromlist=['CUTOFF']).CUTOFF})",
+            flush=True,
+        )
         print(
             # 2026-09-13: 原写 .median() —— last_tod 是字符串列, 新版 pandas
             # 直接抛 TypeError。这行在 score_day 的必经路径上, 意味着
@@ -114,6 +132,7 @@ def _ratio_row(
 
 def _patch_or_append(
     opens, highs, lows, closes, vols, vwaps, insts, day, trunc,
+    min_coverage: float = MIN_COVERAGE,
 ):
     """信号日已在日历里则覆盖, 否则追加一行。"""
     loc_of = {str(d)[:10]: i for i, d in enumerate(opens.index)}
@@ -147,8 +166,18 @@ def _patch_or_append(
         v_t[j] = float(row["volume"])
         w_t[j] = float(row["vwap"]) * r
         n_hit += 1
-    if n_hit < 50:
-        raise SystemExit(f"截断覆盖只有 {n_hit} 只, 拒绝出分")
+    # 2026-09-14: 原先只要 >=50 只就放行。对 2000 只的池子这个下限没有意义 ——
+    # 若 prefetch 只取回 300 只, 从 300 里选 top100 是"前 33%", 而回测测的是
+    # "前 5%", 等于换了一套策略还照常下单。改成按比例卡。
+    # 实测依据(2026-09-14 抽 40 只未缓存成分): Tushare stk_mins 可得率 100%,
+    # 单只 0.47s, 全量约 16 分钟 —— 14:00 起在 14:45 前取完有充分余量。
+    # 所以正常日子覆盖率应接近 1, 差的那部分基本只有停牌。
+    if n_hit < min_coverage * len(insts):
+        raise SystemExit(
+            f"截断覆盖 {n_hit}/{len(insts)} = {n_hit/max(1,len(insts)):.1%}"
+            f" < 下限 {min_coverage:.0%}, 拒绝出分。\n"
+            f"  多半是 14:00 的 prefetch 没跑完或失败 —— 先看 CSI2000-Prefetch"
+            f" 的日志, 补跑 python -m daily prefetch 再重试。")
     if loc is not None:
         o[loc], h[loc], l[loc] = o_t, h_t, l_t
         c[loc], v[loc], w[loc] = c_t, v_t, w_t
@@ -162,8 +191,14 @@ def _patch_or_append(
     return o, h, l, c, v, w, o.shape[0] - 1, n_hit
 
 
-def score_day(day: str, preset: str) -> tuple[pd.Series, dict]:
-    """对某一日截断特征打分。返回 (分数, 未复权收盘价)。"""
+def score_day(day: str, preset: str,
+              min_coverage: float = MIN_COVERAGE,
+              ) -> tuple[pd.Series, dict]:
+    """对某一日截断特征打分。返回 (分数, 未复权收盘价)。
+
+    min_coverage: 截断K 至少要覆盖成分的比例。生产走默认值; 冒烟用低值
+    只验路径(测试机的分钟缓存本来就只有几百只, 不代表生产覆盖率)。
+    """
     import qlib
     from qlib.data import D
     from qlib.contrib.data.loader import Alpha158DL
@@ -212,11 +247,29 @@ def score_day(day: str, preset: str) -> tuple[pd.Series, dict]:
     insts = cols
     o, h, l, c, v, w, loc, n_hit = _patch_or_append(
         opens, highs, lows, closes, vols, vwaps, insts, day, trunc,
+        min_coverage=min_coverage,
     )
     if loc < 60:
         raise SystemExit("历史日线不足 60 天, 算不了 Alpha158")
     _, names = Alpha158DL.get_feature_config()
     feat = _stack(_feat_at(o, h, l, c, v, w, loc), names, insts)
+
+    # 没有当日截断K的票, 信号日那一行是全 NaN。LightGBM 照样会吐出一个数
+    # (NaN 走默认分支), 于是它们**带着分数进入排序**。
+    # 2026-09-14 实测: 缓存只有 214 只时出分 2000 只, Top100 里 35 只是这种
+    # ——而这批恰恰是**停牌或取数失败**的票, 是最不该买的一批。
+    # 它们的分数还挤在一起(std 0.085 vs 有K的 0.237), 即模型对 NaN 行的输出
+    # 几乎是个常数, 排名纯属噪声。
+    # 另外 px 只收录有K的票, 选中无K的票下游也拿不到价格。
+    # 一律剔除 —— 宁可少选, 不要拿 NaN 当信号。
+    covered = [i for i in insts if _inst_stem(i) in trunc.index]
+    n_drop_nan = len(insts) - len(covered)
+    if n_drop_nan:
+        print(f"[auction] 剔除无截断K {n_drop_nan} 只 (全 NaN 行不出分)",
+              flush=True)
+    feat = feat.loc[covered]
+    insts = covered
+
     boosters, info = load_boosters(preset)
     x = apply_robust_zscore(feat, info)
     pred = np.mean([b.predict(x) for b in boosters], axis=0)
@@ -227,9 +280,15 @@ def score_day(day: str, preset: str) -> tuple[pd.Series, dict]:
         for inst in scores.index
         if _inst_stem(inst) in trunc.index
     }
+    # 出分集合必须被价格集合覆盖 —— 否则下单时拿不到价, 只能静默丢单
+    missing_px = [i for i in scores.index if i not in px]
+    if missing_px:
+        raise SystemExit(
+            f"{len(missing_px)} 只有分数却无截断价 (例 {missing_px[:3]}), "
+            "这不该发生, 拒绝出分")
     print(
         f"[auction] {day} 截断 {n_hit} 只 有效分数 {len(scores)} "
-        f"种子 {len(boosters)}",
+        f"覆盖率 {n_hit/max(1,len(cols)):.1%} 种子 {len(boosters)}",
         flush=True,
     )
     return scores, px

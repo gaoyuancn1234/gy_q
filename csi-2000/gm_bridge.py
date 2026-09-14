@@ -292,8 +292,12 @@ def _do_check():
           f"持仓 {len(snap['positions'])} 只")
     for p in snap['positions']:
         log(f"    {p['code']} {p['volume']}股 成本 {p['vwap']} 现价 {p['price']}")
-        _save_state({'status': 'ok', 'snapshot': snap,
-                     'account_id': GM_ACCOUNT_ID})
+    # 2026-09-14: _save_state 原先缩在 for 里, **持仓为 0 时一次都不执行** ——
+    # 账户查得好好的(日志写着 ✓ 总资产 100,000), gm_state.json 却还停在上一次
+    # 的 terminal_offline。空仓恰恰是首次建仓前的状态, 也就是最需要这条状态的
+    # 时候。任何读 gm_state 判断"终端通不通"的地方都会被误导。
+    _save_state({'status': 'ok', 'snapshot': snap,
+                 'account_id': GM_ACCOUNT_ID})
 
 
 def _do_place(dry_run: bool = False, force: bool = False):
