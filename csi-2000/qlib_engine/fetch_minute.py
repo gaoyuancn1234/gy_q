@@ -105,6 +105,39 @@ def _to_ts(code: str) -> str:
     return f"{num}.{ex.upper()}"
 
 
+
+# 盘中预取的互斥锁。见文件末尾 fetch_today_minutes 的说明。
+_LOCK_STALE_S = 300.0          # 5 分钟没有心跳即认为持锁进程已死
+
+
+def _claim_fetch_lock(cache):
+    """抢占预取锁。被别的活进程持有时抛 SystemExit。"""
+    import os
+    import time as _t
+    f = Path(cache) / ".fetch.lock"
+    if f.exists():
+        try:
+            age = _t.time() - f.stat().st_mtime
+        except OSError:
+            age = _LOCK_STALE_S + 1
+        if age < _LOCK_STALE_S:
+            raise SystemExit(
+                f"另一个预取正在跑 (锁 {f} 在 {age:.0f}s 前还有心跳)。\n"
+                f"  每只 parquet 是读-改-写, 两个进程同时写同一只会静默互相覆盖。\n"
+                f"  等它跑完再来; 若确认它已死, 删掉该锁文件。")
+        print(f"[minute-today] 锁已过期 {age:.0f}s, 接管", flush=True)
+    f.write_text(str(os.getpid()), encoding="utf-8")
+    return f
+
+
+def _beat(lock):
+    """心跳: 刷新锁的 mtime, 表示本进程还活着。"""
+    try:
+        lock.touch()
+    except OSError:
+        pass
+
+
 def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
     """只拉某一日分钟线, 写入 minute_raw_dir (与截断聚合同一目录)。"""
     from datetime import date as _date
@@ -121,6 +154,7 @@ def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
     codes = sorted(set(mem[latest]))
     if limit:
         codes = codes[:limit]
+    lock = _claim_fetch_lock(cache)
     pro = _pro()
     t0 = time.time()
     ok = fail = 0
@@ -162,6 +196,7 @@ def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
         d.to_parquet(out, index=False)
         ok += 1
         if i % 20 == 0 or i == len(codes):
+            _beat(lock)
             el = time.time() - t0
             eta = el / i * (len(codes) - i) if i else 0
             print(
@@ -169,8 +204,13 @@ def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
                 f"空/失败 {fail} {el/60:.1f}m ETA {eta/60:.1f}m",
                 flush=True,
             )
+    try:
+        lock.unlink()
+    except OSError:
+        pass
     print(
-        f"[minute-today] 完成 成功 {ok} 空/失败 {fail}",
+        f"[minute-today] 完成 成功 {ok} 空/失败 {fail} "
+        f"耗时 {(time.time()-t0)/60:.1f}m",
         flush=True,
     )
     return ok

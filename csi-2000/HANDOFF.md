@@ -47,10 +47,14 @@ vol_target=0.25  vol_unknown_exposure=0.40  stop_loss=null
 
 ### 业绩（主段 2024-01-02~2026-09-11，8 相位，基准中证2000 +27.96%）
 
-| 口径 | Sharpe | 最差相位 | 回撤 | 超额 |
-|---|---|---|---|---|
-| exec_lag=1（干净，无前视） | 0.977 | 0.789 | -19.68% | +40.81% |
-| exec_lag=0（生产） | 1.240 | 1.011 | -18.42% | +70.35% |
+| 口径 | Sharpe | 最差相位 | DSR | 回撤 | 超额 |
+|---|---|---|---|---|---|
+| exec_lag=1（干净，无前视） | 0.977 | 0.789 | 0.592 | -19.68% | +40.81% |
+| exec_lag=0（生产） | 1.240 | 1.011 | **0.731**（最差 0.612） | -18.42% | +70.35% |
+
+生产口径完整指标（`factor_lab/results/phase_定稿.json`，2026-09-14 跑，DSR 试次 6）：
+PSR 0.970/0.943，Sortino 1.533/1.217，Calmar 1.650/1.198，IR 0.914/0.603，
+日 CVaR5 -3.47%，总收益 +98.31%（最差 +72.81%）。
 
 生产口径含约 7% 前视虚高（实测，非估计），折回约 +65%。年化约 +21.5%/年。
 
@@ -62,7 +66,8 @@ powershell -ExecutionPolicy Bypass -File .\setup_csi2000_tasks.ps1 -Apply
 
 | 时间 | 任务 | 动作 |
 |---|---|---|
-| 14:00 | CSI2000-Prefetch | 取 2000 只当日分钟（实测约 20 分钟） |
+| 14:00 | CSI2000-Prefetch | 取 2000 只当日分钟打底（实测 0.47s/只，约 16 分钟） |
+| 14:25 | CSI2000-Prefetch2 | 二次全量，把截断时点从 14:00~14:16 推到 14:25~14:41 |
 | 14:46 | CSI2000-Auction | 14:45 截断特征出分，写 pending |
 | **14:50** | **CSI2000-Place** | **向掘金仿真账户真实下单** |
 | 15:05 | CSI2000-Sync | 回读成交，写持仓与净值 |
@@ -107,6 +112,9 @@ powershell -ExecutionPolicy Bypass -File .\setup_csi2000_tasks.ps1 -Apply
 - **两个 qlib 重任务不能并发** —— joblib memmap 临时目录互删，
   后启动的死于退出码 127，表现是"莫名其妙失败"没有明确报错。
   `run_phase_test` / `run_param_sweep` / `run_rolling_benchmark` / `reconcile` 必须串行。
+- **两遍盘中预取不能重叠** —— 每只分钟 parquet 是读-改-写，同时写会静默
+  互相覆盖。`fetch_today_minutes` 里有互斥锁（心跳判活，5 分钟无心跳即接管），
+  撞上会显式失败。手动补跑 prefetch 前先看 14:25 那个任务跑完没有。
 - 调 `D.features()` 的脚本**必须**有 `if __name__ == '__main__':`（Windows 只有 spawn）
 - 不要在 CSI300 树（`qlib/trading_framework`）里启用 Tushare ——
   `raw/tushare/daily` 不按股票池分目录，会互相覆盖。已加 `.owner` 标记会报错。

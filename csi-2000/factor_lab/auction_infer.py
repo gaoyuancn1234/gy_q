@@ -86,10 +86,16 @@ def _trunc_table(day: str) -> pd.DataFrame:
         # 这不是前视(用的是更旧的信息, 偏保守), 但也不是回测测的那个时点。
         # 根治要换批量取数(掘金 SDK 已连着, history() 能一次取多只),
         # 逐只串行取数在 45 分钟窗口内拿不到同步的 14:45 截面。
-        _tod = g["last_tod"].astype(str)
+        # .median() 对字符串列会抛 TypeError —— 2026-09-13 在这个文件里
+        # 刚踩过一次, 我写这段可见化时又踩了第二次(冒烟抓到)。
+        # 时刻是字符串, 取中位只能排序后取中间那个。
+        _tod = g["last_tod"].astype(str).sort_values()
+        _mid = _tod.iloc[len(_tod) // 2] if len(_tod) else "?"
         print(
-            f"[auction] 截断K 时点 最早 {_tod.min()} 中位 {_tod.median()} "
-            f"最晚 {_tod.max()} 众数 {_tod.mode().iat[0] if len(_tod) else '?'}"
+            f"[auction] 截断K 时点 最早 {_tod.iloc[0] if len(_tod) else chr(63)} "
+            f"中位 {_mid} "
+            f"最晚 {_tod.iloc[-1] if len(_tod) else chr(63)} "
+            f"众数 {_tod.mode().iat[0] if len(_tod) else chr(63)}"
             f"  (名义 CUTOFF {__import__('data_hub.trunc_daily', fromlist=['CUTOFF']).CUTOFF})",
             flush=True,
         )
