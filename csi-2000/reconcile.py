@@ -229,7 +229,20 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
     cfg = trader.config
     trader.reset()
 
-    instruments = D.instruments(cfg.get('instruments', 'csi300'))
+    # 价格必须按【全市场】加载 —— 与 paper_trader.replay 同一口径。
+    #
+    # 2026-09-14: 这里原先按时点成分股(csi2000)加载, 而 replay 早在
+    # 2026-09-10 就改成了 'all', 理由写在 paper_trader.replay 里:
+    # 被调出指数的持仓取不到价, 卖出分支 `if inst not in day_close.index:
+    # continue` 直接跳过 —— **需要卖的恰恰是取不到价的那些**, 于是永远
+    # 卖不掉、仓位被永久占住。
+    # 后果是对账的回放组合从 2024 年中就冻住了: 实测 2026-09-04 那个调仓日
+    # 98 只持仓里 31 只早已调出指数(全部取不到价, 因而也没有分数),
+    # n_drop=20 全被它们占满, 82 个调仓日里 78% 如此。而同一段区间走
+    # replay() 时这种情况一次都没有。
+    # 也就是说对账一直在拿一个**冻住的组合**去比对实盘路径 —— 订单计算
+    # 逻辑的一致性结论仍然成立, 但它从未在真实的持仓状态上验证过。
+    instruments = D.instruments('all')
     prices = D.features(instruments, ['$close'], start_time=start, end_time=end)
     if prices is None or prices.empty:
         return {'status': 'error', 'reason': f'{start}~{end} 无行情数据'}
@@ -273,8 +286,13 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
                 'effective_topk': dec['effective_topk'],
                 'scores': dec['scores'],
             }
+            _eds = dec.get('entry_dates') or {}
             holdings_view = {
-                'positions': {c: {} for c in dec['positions']},
+                # 不能再写 {c: {}} —— select_sells 会读 entry_date 当次级键,
+                # 空字典会让实盘侧静默退回代码序而模拟盘侧用真实日期,
+                # 比出来的是重建缺字段, 不是真分叉。
+                'positions': {c: {'entry_date': _eds.get(c, '')}
+                              for c in dec['positions']},
                 # pending_sells 是决策**之后**的并集，需还原成决策前的止损单:
                 # 即已挂但不是本次调仓选出来的那些
                 'pending_orders': {
@@ -450,6 +468,16 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    # 2026-09-14: redirect_to_file 是 mode='w', 而对账一天可能跑不止一次
+    # (20:00 定时全量 + 冒烟里的短窗)。当晚冒烟那次就把全量那次的日志
+    # 冲掉了, 结果只剩 20 个交易日的短窗记录, 655 天那次查无对证。
+    # 覆盖前留一份 .prev, 与 daily.py / data_setup_tushare 同一套做法。
     from scheduled_log import redirect_to_file
+    _p = Path(__file__).resolve().parent / "logs" / "reconcile.log"
+    if _p.exists():
+        try:
+            _p.replace(_p.with_name(_p.name + ".prev"))
+        except OSError:
+            pass
     redirect_to_file("reconcile")
     sys.exit(main())

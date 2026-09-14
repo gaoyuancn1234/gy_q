@@ -10,7 +10,7 @@ UNKNOWN_VOL_EXPOSURE = 0.6
 
 
 def select_sells(current: set, target: set, scores: dict,
-                 n_drop: int | None) -> set:
+                 n_drop: int | None, entry_dates: dict | None = None) -> set:
     """按换手限制挑选卖出标的。
 
     n_drop 为 None 时全量换手。否则只卖出已不在目标里、分数最低的
@@ -32,9 +32,30 @@ def select_sells(current: set, target: set, scores: dict,
     elif n_scored < len(all_out):
         print(f"[rebalance_rules] 提示: {len(all_out) - n_scored}/{len(all_out)} "
               f"个卖出候选无分数，将被排在最前(视为最差)")
+    # 2026-09-14: 无分数候选并列 -inf 后, 原先的次级键是**股票代码**,
+    # 于是排序退化成字母序, 而 "SH..." 恒小于 "SZ..." —— 深市高代码的
+    # 出局票会系统性地排在队尾, 永远轮不到卖出, 在持仓里越积越多。
+    # 全量回放实测(2026-09-04 最后一个调仓日): 持仓 98 只里 31 只无分数,
+    # n_drop=20 全被它们占满, 模型对"卖哪些"贡献为 0; 留下的 11 只
+    # (SZ000626 ... SZ301223) 全是深市。82 个调仓日里 78% 是这种情况。
+    # 改用 entry_date 做次级键 = 持有最久的先卖(FIFO), 换手量不变,
+    # 只改"卖哪些", 且消除了交易所偏向。代码仍作最末位键保证可复现。
+    #
+    # 注意这只治了"选谁"。更根本的问题是 n_drop 本意是限制**模型驱动的
+    # 换手**以控成本, 实际却被"已不在截面里的票"占满 —— 那需要把强制
+    # 退出与调仓卖出分开计budget, 属于策略变更, 要重跑回测才能动。
+    ed = entry_dates or {}
+    _n_no = len(all_out) - n_scored
+    if n_drop is not None and _n_no >= int(n_drop) and _n_no > 0:
+        print(f"[rebalance_rules] 注意: 无分数候选 {_n_no} 只 >= n_drop "
+              f"{n_drop}, 本次卖出名单**完全由无分数候选决定**, "
+              f"模型排名不起作用")
     # 显式排序: 直接迭代集合会因字符串哈希随机化导致同配置两次结果不同
     # (CLAUDE.md 记录过 Sharpe 0.318 vs 0.247 的复现失败)
-    ranked = sorted(all_out, key=lambda c: (scores.get(c, float('-inf')), c))
+    ranked = sorted(
+        all_out,
+        key=lambda c: (scores.get(c, float('-inf')), str(ed.get(c, '')), c),
+    )
     return set(ranked[:int(n_drop)])
 
 

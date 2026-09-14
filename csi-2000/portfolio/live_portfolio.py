@@ -568,9 +568,14 @@ def compute_rebalance_orders(signal: dict, holdings: dict) -> dict:
     topk = signal['effective_topk']
 
     n_drop = _get_vol_target_config().get('n_drop')
+    # entry_date 作无分数候选的次级键(见 select_sells)。两条路径必须
+    # 传同一个键, 否则就是一处新的实盘/回测分叉。
+    _pos = holdings.get('positions', {}) or {}
     sells = select_sells(current_set, target_set,
                          scores=signal.get('scores') or {},
-                         n_drop=n_drop)
+                         n_drop=n_drop,
+                         entry_dates={c: (_pos.get(c) or {}).get('entry_date', '')
+                                      for c in current_set})
 
     # 已挂但未执行的止损单也要算作"即将卖出"，否则腾出的坑位数会少算，
     # 买入数量与回测对不上 (回测的 current_holds 就是扣掉 pending sells 的)。

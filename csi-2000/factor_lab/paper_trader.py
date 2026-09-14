@@ -440,6 +440,10 @@ class PaperTrader:
                     current_set, target_stocks,
                     scores=day_signal.to_dict(),
                     n_drop=cfg.get('n_drop'),
+                    # 与实盘同一个次级键, 见 select_sells 的说明
+                    entry_dates={c: (self.state['positions'].get(c) or {})
+                                 .get('entry_date', '')
+                                 for c in current_set},
                 )
                 for inst in sorted(to_sell):          # 显式排序，保证可复现
                     if inst not in pending['sells']:
@@ -466,6 +470,16 @@ class PaperTrader:
                 self.last_decision = {
                     'date': date_str,
                     'positions': sorted(current_set),
+                    # 2026-09-14: select_sells 的次级键改成 entry_date 之后,
+                    # 仅有代码列表不足以让 reconcile 重建实盘那一侧的输入 ——
+                    # 它原先把 positions 重建成 {code: {}}, entry_date 全空,
+                    # 于是实盘侧退回代码序、模拟盘侧用真实日期, 54 个调仓日
+                    # 报分叉。决策快照必须带上实盘路径会读的每一个字段。
+                    'entry_dates': {
+                        c: (self.state['positions'].get(c) or {})
+                        .get('entry_date', '')
+                        for c in current_set
+                    },
                     'pending_sells': sorted(pending['sells']),
                     'effective_topk': effective_topk,
                     'regime': regime,
