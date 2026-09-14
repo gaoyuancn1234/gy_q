@@ -54,8 +54,8 @@ $TASKS = @(
        Desc = "工作日 15:05 回读成交"
        At = "15:05" },
     @{ Name = "CSI2000-Reconcile"
-       Args = "-X utf8 reconcile.py --days 120"
-       Desc = "每日 19:30 对账"
+       Args = "-X utf8 reconcile.py --start 2024-01-02 --end 2027-12-31"
+       Desc = "每日 19:30 全区间对账(短窗会漏掉挂单积压类问题)"
        At = "19:30" }
 )
 

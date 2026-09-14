@@ -1,0 +1,52 @@
+---
+description: CSI2000 长期任务：先做成可检验的有收益系统，框架按多标的复用，不按股票池分叉
+alwaysApply: true
+---
+
+# CSI2000 Mission（未完成，不要缩小、不要提前收工）
+
+结束条件：中证2000 可每日例行，且策略在 **paper_trader + 8 相位**
+下稳定有净超额。单次回测赚钱不算完成。
+
+同时把这棵树做成 **universe profile**，而不是再复制一棵
+csi300/csi1000 目录。先在 2000 上把层跑通，再换配置测 300/1000。
+禁止改 CSI300 活系统（`trading_framework` / `cn_data_bs` / TradingSystem-*）。
+
+工作目录：`qlib/csi-2000/`。解释器：
+`C:\Users\gaoyu\.conda\envs\qlib\python.exe -X utf8`。
+pkl 落地前不要切 `preset` / `exec_lag`。
+
+## 数字口径（违反即作废）
+
+- 只用 `paper_trader`。Qlib 自带回测不是实盘数字。
+- 必须报 8 相位均值和最差相位；改参数用配对 t。
+- 标签、成交价、下单时点必须同一套。
+- 主段 2024 起才是评估期。段1 回填成分不当选参。
+- 掘金仿真只许 `21761e6d-ad82-11f1-8afe-00163e022aa6`。
+
+## 微盘坑
+
+涨停买不进、隔夜偏负、薄竞价、ST/停牌、幸存者偏差、冲击低估、
+IC 当组合收益。路线 B：14:45 出分 + 14:50 收盘竞价。
+
+## 体系化（对齐 QuantConnect 分层 + Qlib workflow）
+
+一层一个入口，股票池只出现在配置，不出现在 if universe：
+
+1. data — 已有 `python -m data_hub --universe`
+2. feature/label — preset + label_expr
+3. model — rolling / Recorder，禁止静默 NaN
+4. portfolio — paper_trader（成本/整手/涨停/换手）
+5. execution — 时钟 + 账户 profile，不是再写一个 gm_bridge
+6. research — 8 相位 / reconcile / 配对检验
+7. ops — `python -m daily`，任务名带 universe 前缀
+
+开源对标：多用 Qlib 的 instruments 区间、DatasetH、qrun/Recorder；
+组合层学 QuantConnect 的 Universe/Alpha/Portfolio/Execution/Risk
+分离。不要再整树 fork。`qlib_paths` 是对的方向，`daily._require_csi2000`
+和账户写死是下一步要收的。
+
+## 机构框架 + 散户优势
+
+时点成分、截面排序、宽仓、换手上限、整手/涨跌停/成本、Walk-forward。
+不做市值中性。10 万尾盘可成交，ADV 可低于机构，仓位约 55–62。

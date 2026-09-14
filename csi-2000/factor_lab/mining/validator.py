@@ -81,6 +81,47 @@ def _find_negative_shift(expr: str):
     return None
 
 
+
+# 语法上合法, 但在当前数据集里未必有数据。
+# 2026-09-13: 直读 bin 实测 cn_data_csi2000 上 $turn / $isST **100% NaN**
+# (15 只 / 25275 个点)。qlib 对缺失字段不报错、返回全 NaN 列, 所以一个
+# 用了 $turn 的因子会"验证通过、回测不报错、IC 恒为 NaN" —— 挖掘白跑一轮。
+# 方向注册表里 dir_034 正是「换手率异常检测」, 下一个 pending。
+#
+# 只维护一份写死名单不行: 换股票池、补字段之后名单就过期了。改为从
+# 实际 bin 文件推导, 结果缓存在进程内。
+_AVAIL_CACHE: dict | None = None
+
+
+def available_fields() -> set:
+    """当前 qlib 数据集里**真正有数据**的字段 (含 $ 前缀)。
+
+    判据是 NaN 比例 <= 99%: 全 NaN 视为不可用。读不到数据集时退回
+    VALID_FIELDS, 避免在没有数据的机器上把一切都判成非法。
+    """
+    global _AVAIL_CACHE
+    if _AVAIL_CACHE is not None:
+        return _AVAIL_CACHE
+    try:
+        import sys as _sys
+        from pathlib import Path as _P
+        _root = str(_P(__file__).resolve().parent.parent.parent)
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        from data_hub.validate import field_coverage
+        from qlib_paths import current_universe
+        cov = field_coverage(current_universe())
+        if cov:
+            ok = {f"${k}" for k, v in cov.items()
+                  if v.get("nan_ratio") is not None and v["nan_ratio"] <= 0.99}
+            # 只收紧, 不放宽: 交集保证不会引入 VALID_FIELDS 之外的字段
+            _AVAIL_CACHE = (ok & VALID_FIELDS) or VALID_FIELDS
+        else:
+            _AVAIL_CACHE = VALID_FIELDS
+    except Exception:
+        _AVAIL_CACHE = VALID_FIELDS
+    return _AVAIL_CACHE
+
 def validate_expression(name: str, expr: str) -> tuple[bool, str]:
     """静态验证: 名称格式、括号配对、字段合法、无前视
 
@@ -111,10 +152,15 @@ def validate_expression(name: str, expr: str) -> tuple[bool, str]:
         return False, f"括号不匹配 (缺少 {depth} 个右括号)"
 
     # 字段合法性 — 提取所有 $xxx
-    fields_used = set(re.findall(r'\$[a-z_]+', expr))
+    fields_used = set(re.findall(r'\$[a-zA-Z_]+', expr))
     invalid = fields_used - VALID_FIELDS
     if invalid:
         return False, f"不合法的字段: {invalid}"
+    # 语法合法但当前数据集里没数据的字段 —— 放过去只会得到恒 NaN 的因子
+    dead = fields_used - available_fields()
+    if dead:
+        return False, (f"字段在当前数据集不可用(全 NaN): {sorted(dead)}; "
+                       f"可用: {sorted(available_fields())}")
 
     # 无前视 — 任何时序算子的位移/窗口参数不得为负
     bad = _find_negative_shift(expr)

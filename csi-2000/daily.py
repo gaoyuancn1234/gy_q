@@ -19,6 +19,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from qlib_paths import parse_exec_lag
+
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR))
 
@@ -27,7 +29,6 @@ AUCTION_HHMM = "14:45"
 PLACE_HHMM = "14:50"
 PREFETCH_HHMM = "14:31"
 SYNC_HHMM = "15:05"
-# 用户指定: 隔夜标签预测文件名, 落地后才切 yaml。
 OVN_PKL_NAME = "D_expand_3v_3r_alpha158_ovn_LightGBM.pkl"
 OVN_JSON_NAME = "D_expand_3v_3r_alpha158_ovn_LightGBM.json"
 
@@ -96,6 +97,16 @@ def cmd_status() -> int:
             f"gm_account={st.get('account_id', '?')} "
             f"nav={snap.get('nav')} pos={len(snap.get('positions') or [])}"
         )
+    fc = info.get("field_coverage") or {}
+    bad = [k for k, v in fc.items()
+           if v.get("nan_ratio") is not None and v["nan_ratio"] > 0.99]
+    if fc:
+        ok = [k for k in fc if k not in bad
+              and (fc[k].get("nan_ratio") or 1) <= 0.99]
+        print(f"字段可用: {', '.join(ok) or '无'}")
+        if bad:
+            print(f"字段全 NaN(依赖它的过滤会静默失效): {', '.join(bad)}")
+
     return 0
 
 
@@ -125,11 +136,14 @@ def cmd_extend() -> int:
 def cmd_signal(*, dry_run: bool = False) -> int:
     """用最新预测写 pending_orders, 可选推飞书。"""
     cfg = _require_csi2000()
-    if int(cfg.get("exec_lag", 1) or 1) == 0:
+    if parse_exec_lag(cfg) == 0:
+        # 2026-09-12: 原先只 print 不 return, 警告完照样往下跑 ——
+        # exec_lag=0 时本命令会按收盘预测改写 pending, 覆盖 14:50 已下的单。
         print(
             "exec_lag=0 请用 python -m daily auction 写 pending。"
             "本命令走收盘预测, 14:50 已经过了。"
         )
+        return 2
     from daily_runner import generate_and_push
     generate_and_push(dry_run=dry_run)
     return 0
@@ -140,7 +154,7 @@ def cmd_run(*, force: bool = False, dry_run: bool = False) -> int:
     cmd_refresh(force=force)
     cmd_extend()
     cfg = _cfg()
-    lag = int(cfg.get("exec_lag", 1) or 1)
+    lag = parse_exec_lag(cfg)
     if lag == 0:
         print("exec_lag=0: 下单在 14:50, 收盘后不再写 pending")
         return 0
@@ -167,7 +181,7 @@ def cmd_auction(*, force: bool = False, dry_run: bool = False,
     from daily_runner import generate_and_push
 
     cfg = _require_csi2000()
-    lag = int(cfg.get("exec_lag", 1) or 1)
+    lag = parse_exec_lag(cfg)
     if lag != 0 and not force:
         print(
             "exec_lag!=0, 14:45 出分会和成交时钟错位。"
@@ -228,7 +242,7 @@ def cmd_activate_ovn() -> int:
     if ntext == text:
         cfg = _cfg()
         if (cfg.get("preset") == "alpha158_ovn"
-                and int(cfg.get("exec_lag", 1) or 1) == 0):
+                and parse_exec_lag(cfg) == 0):
             print("yaml 已经是 alpha158_ovn / exec_lag=0")
             return 0
         print("yaml 没有匹配到 preset/exec_lag 行, 未改")

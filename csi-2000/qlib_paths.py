@@ -1,18 +1,7 @@
-"""qlib 数据目录解析 —— 单一实现
+"""qlib 数据目录解析。换股票池只改 yaml, 不要各写一份 provider_uri。
 
-为什么要有这个
---------------
-provider_uri 此前在 3 处硬编码成 `cn_data_bs`(paper_trader / reconcile /
-run_phase_test)，另有若干处各自从配置推导。后果是**改配置里的 instruments
-不会真正换源**: 代码照样去读沪深300 的目录，而 qlib 对缺失成分股不报错、
-返回全 NaN —— 换池变成一次沉默失败。
-
-CLAUDE.md 记着 2026-09-02 切 CSI 800 当天回退，原因之一就是这个;
-待办里也写着"若要重做，先解决 provider_uri 硬编码"。这里就是那件事。
-
-目录命名沿用既有约定: csi300 的目录历史上叫 cn_data_bs(baostock 时代留下
-的名字，数据源早已换成新浪，但目录名不动以免动到既有数据)，其余按
-cn_data_{universe}。
+csi300 历史目录名是 cn_data_bs; 其余是 cn_data_{universe}。
+中证2000 只走 Tushare, 禁止新浪/BaoStock 覆盖供给层。
 """
 from __future__ import annotations
 
@@ -77,3 +66,54 @@ def qlib_init_kwargs(universe: str | None = None,
     if kernels:
         kw["kernels"] = int(kernels)
     return kw
+
+
+def parse_exec_lag(cfg: dict | None = None,
+                   config_path: str | Path | None = None) -> int:
+    """成交滞后天数。0 = 信号日 14:50 收盘竞价; 1 = T+1 收盘。
+
+    2026-09-12 抽出。此前全树 9 处写 `int(cfg.get("exec_lag", 1) or 1)`,
+    而 **`0 or 1` 求值成 1** —— yaml 明写 exec_lag: 0, 代码一律读成 1。
+
+    后果:
+      - paper_trader 的 8 相位验收全部跑成 T+1 收盘成交, 不是路线 B。
+        标签是 Ref($open,-1)/$close-1 (T收盘->T+1开盘), 在 T+1 收盘买入
+        等于整段隔夜跳已经错过 —— 验收数字描述的不是配置里那个策略。
+      - daily auction 的 `if lag != 0: return 2` 永远成立, 周一生产入口
+        被自己挡住, 还提示"先切 exec_lag=0"(而配置本来就是 0)。
+      - paper_trader 打印的是原始值 0、执行用的是 1, 日志主动误导。
+
+    `or` 对 0 失效是 Python 常见坑; 键存在且为 0 时必须走 None 判定。
+    """
+    if cfg is None:
+        p = Path(config_path) if config_path else CONFIG_FILE
+        with open(p, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    v = cfg.get("exec_lag", 1)
+    if v is None:
+        return 1
+    return int(v)
+
+
+def prediction_pkl(preset: str | None = None,
+                   config_path: str | Path | None = None) -> Path:
+    """当前配置对应的 rolling 预测 pkl 绝对路径。
+
+    2026-09-12 新增。此前 5 个分析脚本各自写死
+    `D_expand_3v_3r_alpha158_LightGBM.pkl` —— 而生产 preset 早已是
+    `alpha158_ovn`, 该文件**根本不存在**, 脚本一跑就 FileNotFoundError。
+    其中 `_trunc_ic.py` 正是路线 B 的杀/走判据, 它跑不起来意味着这道门
+    从来没验过。
+
+    文件名结构是 {rolling_config}_{preset}_{model}.pkl, 三段都在 yaml 里,
+    写死任何一段都会随配置漂移。
+    """
+    pth = Path(config_path) if config_path else CONFIG_FILE
+    with open(pth, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    name = (f"{cfg.get('rolling_config', 'D_expand_3v_3r')}"
+            f"_{preset or cfg.get('preset', 'alpha158')}"
+            f"_{cfg.get('model', 'LightGBM')}.pkl")
+    return (PROJECT_DIR / cfg.get('model_cache_dir',
+                                  'factor_lab/results/rolling/predictions')
+            / name)

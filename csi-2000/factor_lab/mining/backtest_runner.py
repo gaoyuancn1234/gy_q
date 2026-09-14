@@ -100,6 +100,10 @@ def screen_by_importance(
     )
     from factor_lab.factors.custom_handler import build_handler_from_exprs
     from factor_lab.factors.presets import FACTOR_PRESETS
+    from factor_lab.mining.eval_scope import (
+        mining_instruments,
+        mining_label,
+    )
 
     if not candidate_factors:
         return [], {}
@@ -145,8 +149,9 @@ def screen_by_importance(
         end_time=w["pred_end"],
         fit_start_time=w["train_start"],
         fit_end_time=w["train_end"],
-        instruments="csi300",
+        instruments=mining_instruments(),
         include_alpha158=True,
+        label_expr=mining_label(),
     )
 
     from qlib.data.dataset import DatasetH
@@ -222,6 +227,10 @@ def run_comparison(new_factors: list[tuple[str, str]],
     )
     from factor_lab.factors.custom_handler import build_handler_from_exprs
     from factor_lab.factors.presets import FACTOR_PRESETS
+    from factor_lab.mining.eval_scope import (
+        mining_instruments,
+        mining_label,
+    )
 
     # 1. 加载 baseline
     baseline = _load_baseline()
@@ -266,8 +275,9 @@ def run_comparison(new_factors: list[tuple[str, str]],
             end_time=w["pred_end"],
             fit_start_time=w["train_start"],
             fit_end_time=w["train_end"],
-            instruments="csi300",
+            instruments=mining_instruments(),
             include_alpha158=True,
+            label_expr=mining_label(),
         )
 
         from qlib.data.dataset import DatasetH

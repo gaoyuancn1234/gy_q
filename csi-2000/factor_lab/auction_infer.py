@@ -76,7 +76,12 @@ def _trunc_table(day: str) -> pd.DataFrame:
         raise SystemExit(f"{day} 没有截断日线 (分钟缓存缺 14:00 以后的K)")
     if "last_tod" in g.columns:
         print(
-            f"[auction] 截断K last_tod 中位 {g['last_tod'].astype(str).median()} "
+            # 2026-09-13: 原写 .median() —— last_tod 是字符串列, 新版 pandas
+            # 直接抛 TypeError。这行在 score_day 的必经路径上, 意味着
+            # **实盘 14:45 出分会崩**, 而此前只做过空跑(空跑不到这一步)。
+            # 字符串取众数用 mode(), 语义也更对(截断点应当一致)。
+            f"[auction] 截断K last_tod 众数 "
+            f"{g['last_tod'].astype(str).mode().iat[0] if len(g) else '?'} "
             f"只数 {g['stem'].nunique() if 'stem' in g.columns else len(g)}",
             flush=True,
         )

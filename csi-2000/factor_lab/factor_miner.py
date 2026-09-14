@@ -88,17 +88,11 @@ def _next_run_id() -> str:
 
 
 def _init_qlib():
-    """初始化 Qlib (只执行一次)"""
-    import yaml
+    """初始化 Qlib (只执行一次)。路径只走 qlib_paths。"""
     import qlib
-    from qlib.constant import REG_CN
-    cfg_path = PROJECT_DIR / "config" / "signal_config.yaml"
-    with open(cfg_path, encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
-    universe = cfg.get('instruments', 'csi300')
-    data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if universe == 'csi300' else universe}"
+    from qlib_paths import qlib_init_kwargs
     try:
-        qlib.init(provider_uri=data_dir, region=REG_CN)
+        qlib.init(**qlib_init_kwargs())
     except Exception:
         pass  # 已初始化
 

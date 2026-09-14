@@ -1,26 +1,7 @@
-"""因子集配对比较 — 同一组相位下比两份预测缓存
+"""因子集配对比较。先重训出两份 pkl, 再同一组相位比预测。
 
-与 run_param_sweep 的区别: 那个比的是同一份预测下的不同风控参数，这个比的是
-**不同因子集训练出的不同预测**。因子集变了必须重训，所以先跑
-run_rolling_benchmark 产出两份 pkl，再用本脚本做配对。
-
-为什么必须配对且必须两段
-------------------------
-CLAUDE.md 记着一次一模一样的翻车: 挖掘出的 22 个因子样本内 +7.4%、
-**样本外 -12.9%(符号反转)**，已全部清除。这次同样是 22 个基本面因子，
-不能只看单段好看就放行。
-
-用法
-----
-    python run_preset_compare.py \\
-        --base alpha158_selected:fund188 --cand alpha158_val:fund210
-
-    # 段1
-    python run_preset_compare.py \\
-        --base alpha158_selected:fund188 --cand alpha158_val:fund210 \\
-        --start 2022-05-04 --end 2023-12-29 --tag 段1
-
-格式为 preset:tag，tag 可省略。
+    python run_preset_compare.py --base alpha158_ovn --cand alpha158
+格式 preset[:tag]。
 """
 
 import argparse
@@ -82,8 +63,8 @@ def main() -> int:
 
     import qlib
     from qlib.constant import REG_CN
-    qlib.init(provider_uri=str(Path.home() / '.qlib/qlib_data/cn_data_bs'),
-              region=REG_CN)
+    from qlib_paths import qlib_provider_uri
+    qlib.init(provider_uri=qlib_provider_uri(), region=REG_CN)
     from factor_lab.signal_generator import SignalGenerator
     import pandas as pd
 

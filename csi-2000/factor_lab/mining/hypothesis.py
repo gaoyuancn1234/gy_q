@@ -73,7 +73,10 @@ def generate_hypotheses(context: str, existing_names: list[str],
 请优先围绕上述方向设计因子。如果方向已被充分探索（见已有因子和失败记录），可换新方向。
 """
 
-    prompt = f"""你是一位资深量化研究员，正在为 A 股 CSI300 股票池设计新的 alpha 因子。
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
+    prompt = f"""你是一位资深量化研究员，正在为 {_UNIV} 设计新的 alpha 因子。\n预测目标: {_LABEL}。
 
 ## 可用字段 (Qlib 日频)
 $open, $high, $low, $close, $volume, $amount, $turn, $pe_ttm, $pb, $total_mv, $circ_mv
@@ -231,6 +234,9 @@ def mutate_factors(near_miss: list[dict], context: str,
             f"- 诊断: {diag}"
         )
 
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
     prompt = f"""你是一位资深量化研究员。以下因子接近有效但未达标，请做**靶向修复**。
 
 ## 可用字段 (Qlib 日频)
@@ -300,6 +306,9 @@ def crossover_hypotheses(discoveries: list[dict], context: str,
             f"  假说: {d.get('hypothesis', '')[:80]}"
         )
 
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
     prompt = f"""你是一位资深量化研究员。以下是历史挖掘中表现最好的因子，请**重组成功模式**创造新因子。
 
 ## 可用字段 (Qlib 日频)

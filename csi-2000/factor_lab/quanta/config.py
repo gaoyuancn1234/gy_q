@@ -85,7 +85,8 @@ TEST_END = '2025-12-26'
 # --- 基础特征 ---
 # 论文用 6 特征含 $vwap, 但我们的 Qlib 数据无 vwap.day.bin
 # VWAP 需写为 Div($amount, $volume + 1e-8), 不能直接引用 $vwap
-BASE_FEATURES = ['$open', '$high', '$low', '$close', '$volume', '$amount', '$turn']
+# 中证2000 的 $turn 全是 NaN, 不能进搜索空间。
+BASE_FEATURES = ['$open', '$high', '$low', '$close', '$volume', '$amount']
 
 # --- Rolling Eval (对齐生产 SOTA: D_expand_3v_3r 全窗口) ---
 #
@@ -319,4 +320,6 @@ QLIB_CONSTRAINTS = """约束:
    参数必须为正。Ref($close, -5)、Delta($close, -3) 这类都会被拒。
 4. 因子名全大写下划线格式
 5. 表达式必须是有效的 Qlib 表达式
-6. 表达式长度 ≤ 200 字符, 嵌套 ≤ 5 层, 基础字段 ≤ 5 种"""
+6. 表达式长度 ≤ 200 字符, 嵌套 ≤ 5 层, 基础字段 ≤ 5 种
+7. 不得使用 $turn: 中证2000 该字段全是 NaN
+8. 标签是隔夜 (T收盘→T+1开盘), 不要按隔日收益写假说"""

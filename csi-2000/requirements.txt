@@ -22,7 +22,8 @@ PyYAML>=6.0
 mlflow>=3.0
 
 # --- 数据源 ---
-baostock               # 主数据源 (qlib_engine/data_setup.py)
+tushare                # 中证2000 主源 (时点成分 + 日线批量)
+baostock               # CSI300 主数据源 (qlib_engine/data_setup.py)
 akshare                # 新浪数据源 + 交易日历 + 新闻 (data_setup_sina.py /
                        # market_calendar.py / news_sentinel.py)
                        # 2026-09-05 补: 此前缺失，data_setup_sina 直接

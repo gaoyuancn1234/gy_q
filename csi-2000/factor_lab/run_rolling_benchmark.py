@@ -512,12 +512,16 @@ def _run_backtest_hifi(pred):
             f"{dates.nunique()} 天)，回测无法进行。"
             f"常见原因: MultiIndex 层级顺序不符 (需 datetime 在第 0 层)。")
 
+    # CSI2000 配置是 stop_loss: null。float(None) 会在 pkl 写完后把整次
+    # 滚动判失败。null 表示关闭止损，与 vol_target=null 同一口径。
+    raw_stop = _sig_cfg.get("stop_loss", 0.08)
+    stop_loss = None if raw_stop is None else float(raw_stop)
     bt = VolTargetBacktester(
         signal=pred,
         initial_cash=float(_sig_cfg.get('initial_cash', 100_000)),
         topk=TOPK,
         rebalance_every=int(_sig_cfg.get('rebalance_every', 5)),
-        stop_loss=float(_sig_cfg.get('stop_loss', 0.08)),
+        stop_loss=stop_loss,
         open_cost=float(_sig_cfg.get('open_cost', 0.0005)),
         close_cost=float(_sig_cfg.get('close_cost', 0.0015)),
         target_vol=_sig_cfg.get('vol_target'),
@@ -875,10 +879,18 @@ def print_comparison_table(all_results: list[dict]):
           "run_phase_test.py (paper_trader 引擎，已过对账)")
     print()
 
-    # 按 Sharpe 降序排列
-    sorted_results = sorted(all_results,
-                            key=lambda x: x['overall'].get('sharpe', 0),
-                            reverse=True)
+    usable = [
+        r for r in all_results
+        if isinstance(r.get("overall"), dict)
+    ]
+    if not usable:
+        print("没有带 overall 的结果，跳过对比表")
+        return
+    sorted_results = sorted(
+        usable,
+        key=lambda x: x["overall"].get("sharpe", 0) or 0,
+        reverse=True,
+    )
 
     header = (f"{'排名':<4} {'Config':<16} {'Preset':<16} {'Model':<12} {'Variant':<10} "
               f"{'Windows':>7} {'总收益':>10} {'年化':>10} {'超额':>10} "

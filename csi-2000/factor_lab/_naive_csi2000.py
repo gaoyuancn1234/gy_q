@@ -20,6 +20,12 @@ HOLD = 8
 KS = [16, 30, 50, 100]
 
 
+
+def _pred_pkl():
+    """2026-09-12: 原先写死 alpha158 那份, 生产是 alpha158_ovn, 文件不存在。"""
+    from qlib_paths import prediction_pkl
+    return str(prediction_pkl())
+
 def main():
     import numpy as np
     import pandas as pd
@@ -30,8 +36,7 @@ def main():
     qlib.init(provider_uri=qlib_provider_uri(), region=REG_CN)
     from qlib.data import D
 
-    s = pd.read_pickle("factor_lab/results/rolling/predictions/"
-                       "D_expand_3v_3r_alpha158_LightGBM.pkl")
+    s = pd.read_pickle(_pred_pkl())
     s = (s.iloc[:, 0] if s.ndim > 1 else s).dropna()
 
     d0 = s.index.get_level_values(0).min()

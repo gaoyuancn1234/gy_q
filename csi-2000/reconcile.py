@@ -81,7 +81,8 @@ def check_config_consistency() -> list[str]:
             problems.append(
                 f"配置分叉 {key}: 回测读到 {bt_val!r}，实盘读到 {live_val!r}")
     preset = raw.get('preset')
-    lag = int(raw.get('exec_lag', 1) or 1)
+    from qlib_paths import parse_exec_lag
+    lag = parse_exec_lag(raw)
     if preset == 'alpha158_ovn' and lag != 0:
         problems.append(
             "标签/成交分叉: alpha158_ovn 必须 exec_lag=0 (当日收盘竞价)")
@@ -134,6 +135,84 @@ def check_sizing_consistency() -> list[str]:
     return problems
 
 
+
+# ------------------------------------------------- 第三方对照 (qlib 官方实现)
+
+def qlib_topk_decision(scores, held: set, topk: int, n_drop: int) -> dict:
+    """复刻 qlib.contrib.strategy.TopkDropoutStrategy 的选股逻辑。
+
+    2026-09-12 新增, 借 qlib 官方实现当**第三份独立实现**。
+
+    本项目反复出现的缺陷是"同一条规则写了两遍, 改一处忘一处"(已 6 次)。
+    reconcile 原本比的是实盘 vs 回测 —— 但两边现在共用
+    rebalance_rules, 同源就比不出东西。再引一份**外部写的**实现, 才有
+    独立的第三方意见。
+
+    注意语义差异(不是 bug, 是设计不同):
+        qlib  sell = 持仓 ∩ (持仓∪新候选 按分数排序的末 n_drop 只)
+        本项目 sell = (持仓 − TopK) 里分数最低的 n_drop 只
+    qlib 会卖掉仍在 TopK 内、但综合排名垫底的票; 本项目只卖已掉出 TopK 的。
+    所以两者**本就不该相等**, 直接断言相等会一直误报。
+    这里只报分歧幅度, 真正断言的是下面那组两边都必须满足的不变量。
+    """
+    import pandas as pd
+    sc = pd.Series(scores, dtype=float).sort_values(ascending=False)
+    last = sc.reindex(sorted(held)).dropna().sort_values(ascending=False).index
+    n_new = n_drop + topk - len(last)
+    today = sc[~sc.index.isin(last)].sort_values(
+        ascending=False).index[:max(0, n_new)]
+    comb = sc.reindex(last.union(pd.Index(today))).sort_values(
+        ascending=False).index
+    tail = comb[-n_drop:] if n_drop and len(comb) >= n_drop else comb[:0]
+    sell = last[last.isin(tail)]
+    buy = today[:max(0, len(sell) + topk - len(last))]
+    return {'sells': sorted(sell), 'buys': sorted(buy)}
+
+
+def check_decision_invariants(scores, held: set, sells, buys,
+                              topk: int, n_drop: int,
+                              carry: set | None = None) -> list[str]:
+    """任何 TopK-dropout 实现都必须满足的性质。与具体算法无关。
+
+    这几条不依赖"谁的实现对", 违反了就一定是 bug:
+      1. 只能卖自己持有的
+      2. 不能买已持有的
+      3. 卖出数不超过 n_drop
+      4. 换完之后持仓数不超过 topk
+      5. 不能"卖高买低" —— 卖掉的最低分不该高于买入的最高分
+         (这条最能抓排序类 bug: n_drop 退化成按代码字母序时必然违反)
+    """
+    bad = []
+    sells, buys = list(sells), list(buys)
+    if not set(sells) <= set(held):
+        bad.append(f'卖了没持有的: {sorted(set(sells) - set(held))[:5]}')
+    if set(buys) & set(held):
+        bad.append(f'买了已持有的: {sorted(set(buys) & set(held))[:5]}')
+    # n_drop 限的是**本次新选**的卖出，不是总卖出。
+    # 2026-09-13: 原先拿总数比 n_drop，全区间 82 个调仓日报出 54 个"违反"
+    # (如 2024-12-06 卖 27 只 > n_drop 20)。查下来是我的不变量写错了：
+    # compute_rebalance_orders 会把**历史未成交的挂单**并进来 ——
+    #     sells = select_sells(..., n_drop) | (pending_sells & current_set)
+    # 微盘股停牌频繁，卖单挂几天很正常，带入是正确设计。
+    # 而逐日订单分叉 0(82/82 全一致)说明两个引擎做的是同一件事，
+    # 所以不是代码错。60 天窗口只有 8 个调仓日、没有积压，才一直没暴露。
+    fresh = set(sells) - set(carry or ())
+    if n_drop is not None and len(fresh) > int(n_drop):
+        bad.append(f'本次新选卖出 {len(fresh)} 只 > n_drop {n_drop} '
+                   f'(总卖出 {len(sells)}, 其中历史挂单 {len(sells)-len(fresh)})')
+    n_after = len(held) - len(sells) + len(buys)
+    if n_after > topk:
+        bad.append(f'换仓后 {n_after} 只 > topk {topk}')
+    # 注: 卖单遇停牌会挂着不成交, 持仓因此可能暂时高于 topk。
+    # 这里算的是**指令执行后的应有持仓**, 与实际持仓的差额由挂单解释。
+    if sells and buys and scores:
+        s_lo = min(scores.get(c, float('-inf')) for c in sells)
+        b_hi = max(scores.get(c, float('-inf')) for c in buys)
+        if s_lo > b_hi:
+            bad.append(
+                f'卖高买低: 卖出最低分 {s_lo:.5f} > 买入最高分 {b_hi:.5f}')
+    return bad
+
 # ---------------------------------------------------------------- 订单对账
 
 def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
@@ -157,12 +236,23 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
     prices = prices.swaplevel().sort_index()
 
     signal = trader.sg.load_predictions()
-    quality = trader.sg.load_quality_score()
+    # 质量分只有 adaptive_strategy 启用时才用得上。
+    # 2026-09-12: 原先无条件加载, 而 csi2000 的 adaptive_strategy: none、
+    # 从未生成过 quality_score.pkl -> 逐日订单对账直接 FileNotFoundError,
+    # 这棵树上的对账**从未真正跑通过**。CLAUDE.md 说"先跑这个再谈别的",
+    # 结果最该起作用的安全网是断的。
+    if str(cfg.get('adaptive_strategy') or 'none').lower() == 'none':
+        import pandas as _pd
+        quality = _pd.Series(dtype=float)
+    else:
+        quality = trader.sg.load_quality_score()
     trading_days = sorted(prices.index.get_level_values(0).unique())
     if not trading_days:
         return {'status': 'error', 'reason': '交易日列表为空'}
 
     diffs = []
+    invariant_bad = []
+    qlib_overlap = []
     decisions = []          # 逐个调仓日的订单，供跨进程复现性比对
     n_rebalance = 0
     prev_close_map = {}
@@ -197,6 +287,21 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
 
             exp_sells = sorted(expected['sells'])
             exp_buys = sorted(expected['buys'])
+
+            # 不变量: 与具体算法无关, 违反即 bug
+            _carry = {c for c in dec['pending_sells']
+                      if c not in set(dec['sells'])}
+            _inv = check_decision_invariants(
+                dec['scores'], set(dec['positions']), exp_sells, exp_buys,
+                dec['effective_topk'], cfg.get('n_drop'), carry=_carry)
+            if _inv:
+                invariant_bad.append({'date': dec['date'], 'problems': _inv})
+            # 与 qlib 官方实现的分歧幅度 (语义本就不同, 只统计不断言)
+            _q = qlib_topk_decision(dec['scores'], set(dec['positions']),
+                                    dec['effective_topk'], cfg.get('n_drop') or 0)
+            _ov = (len(set(exp_buys) & set(_q['buys']))
+                   / max(1, len(set(exp_buys) | set(_q['buys']))))
+            qlib_overlap.append(_ov)
             got_sells = sorted(dec['pending_sells'])
             got_buys = sorted(dec['buys'])
             decisions.append({'date': dec['date'],
@@ -219,6 +324,8 @@ def reconcile_orders(start: str, end: str, verbose: bool = True) -> dict:
                   f"已比对 {n_rebalance} 个调仓日，分叉 {len(diffs)}", flush=True)
 
     return {
+        'invariant_bad': invariant_bad,
+        'qlib_overlap': qlib_overlap,
         'status': 'ok',
         'days': len(trading_days),
         'rebalances': n_rebalance,
@@ -286,6 +393,19 @@ def main() -> int:
         print(f"  ✗ 对账无法完成: {res['reason']}")
         return 2
 
+    inv = res.get('invariant_bad') or []
+    ov = res.get('qlib_overlap') or []
+    if ov:
+        import statistics as _st
+        print(f"  与 qlib TopkDropoutStrategy 买入重合度 均值 {_st.mean(ov):.0%} "
+              f"(语义不同, 仅供参照; 突变才是信号)")
+    if inv:
+        print(f"  ✗ {len(inv)} 个调仓日违反不变量:")
+        for b in inv[:3]:
+            print(f"      {b['date']}: {'; '.join(b['problems'])}")
+    else:
+        print("  ✓ 全部调仓日满足不变量(只卖持仓/不买已持/不超 n_drop/不超 topk/不卖高买低)")
+
     diffs = res['diffs']
     print(f"\n  交易日 {res['days']}，调仓日 {res['rebalances']}，"
           f"分叉 {len(diffs)}")
@@ -305,7 +425,8 @@ def main() -> int:
             print(f"      买入  实盘 {d['live_buys']}")
             print(f"           回测 {d['bt_buys']}")
 
-    ok = not diffs and not cfg_problems and not size_problems
+    ok = (not diffs and not cfg_problems and not size_problems
+          and not inv)
     print()
     if ok:
         print("✓ 两条路径逐日一致")

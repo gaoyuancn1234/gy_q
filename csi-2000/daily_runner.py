@@ -80,11 +80,9 @@ def _load_signal_config() -> dict:
 
 
 def _get_universe_config() -> tuple:
-    """从 signal_config.yaml 读取 universe 和对应的数据目录"""
-    cfg = _load_signal_config()
-    universe = cfg.get('instruments', 'csi300')
-    data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if universe == 'csi300' else universe}"
-    return universe, data_dir
+    """从 signal_config.yaml 读股票池和 qlib 目录。"""
+    from qlib_paths import current_universe, qlib_provider_uri
+    return current_universe(), qlib_provider_uri()
 
 
 # 单个数据源的硬超时 (秒)。超时即换源，不允许无限期挂住定时任务。
@@ -126,17 +124,9 @@ def _data_is_current(data_dir) -> bool:
 
 
 def refresh_daily_data() -> bool:
-    """增量刷新行情数据
-
-    2026-09-04: 主源由 BaoStock 改为新浪(akshare)。BaoStock 长期连不上，
-    定时任务会卡在这一步不返回 —— 挂住比报错更糟，后面的信号生成永远等不到。
-    新浪失败才回落到 BaoStock，两条路都在子进程里跑并设硬超时。
-    """
+    """按 qlib_paths.data_refresh_chain 刷新日线。中证2000 只走 Tushare。"""
     universe, data_dir = _get_universe_config()
 
-    # 数据已覆盖到"最近一个已收盘的交易日"就不必再下 —— 全量重下要 40 分钟，
-    # 而当天的日线要收盘后才有 (新浪日线接口盘中不返回当日半截 K 线，已实测)。
-    # 2026-09-08: 没有这道判断时，盘中每跑一次 daily_runner 就白下 40 分钟。
     if _data_is_current(data_dir):
         log.info("数据已覆盖至最近收盘交易日，跳过刷新")
         return True

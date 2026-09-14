@@ -1,0 +1,82 @@
+{
+ "tag": "主段_tv25",
+ "start": "2024-01-02",
+ "end": "2026-09-11",
+ "rows": [
+  {
+   "phase": 0,
+   "sharpe": 0.7773748246507584,
+   "total_return": 0.4981502,
+   "max_drawdown": -0.23953232397231708,
+   "excess_return": 0.2185389241164004,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3318
+  },
+  {
+   "phase": 1,
+   "sharpe": 0.9242709914895737,
+   "total_return": 0.6613170000000002,
+   "max_drawdown": -0.21998957388287624,
+   "excess_return": 0.3817057241164006,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3296
+  },
+  {
+   "phase": 2,
+   "sharpe": 0.7694819331139278,
+   "total_return": 0.49458880000000005,
+   "max_drawdown": -0.21895090000000017,
+   "excess_return": 0.21497752411640048,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3286
+  },
+  {
+   "phase": 3,
+   "sharpe": 0.8204110984627407,
+   "total_return": 0.5528371999999999,
+   "max_drawdown": -0.2411959316107234,
+   "excess_return": 0.27322592411640034,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3288
+  },
+  {
+   "phase": 4,
+   "sharpe": 0.9021939362321165,
+   "total_return": 0.6297059,
+   "max_drawdown": -0.2613454068971427,
+   "excess_return": 0.35009462411640047,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3209
+  },
+  {
+   "phase": 5,
+   "sharpe": 1.057299803679973,
+   "total_return": 0.754975,
+   "max_drawdown": -0.21516452875627864,
+   "excess_return": 0.4753637241164004,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3337
+  },
+  {
+   "phase": 6,
+   "sharpe": 0.7485158266889597,
+   "total_return": 0.46649390000000013,
+   "max_drawdown": -0.1956294740966605,
+   "excess_return": 0.18688262411640055,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3324
+  },
+  {
+   "phase": 7,
+   "sharpe": 0.9462176858203112,
+   "total_return": 0.6468247,
+   "max_drawdown": -0.18491559999999974,
+   "excess_return": 0.36721342411640046,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3335
+  }
+ ],
+ "sharpe_mean": 0.8682207625172951,
+ "sharpe_std": 0.1004661541573266,
+ "sharpe_worst": 0.7485158266889597
+}

@@ -21,7 +21,13 @@ def evaluate_candidates(factors: list[tuple[str, str]],
         DataFrame with columns: factor, mean_IC, ICIR, is_promising, is_excellent
     """
     from factor_lab.evaluation.single_factor import evaluate_with_qlib
+    from factor_lab.mining.eval_scope import (
+        mining_instruments,
+        mining_label,
+    )
 
+    universe = mining_instruments()
+    label = mining_label()
     results = []
     batch_size = 5
 
@@ -30,9 +36,10 @@ def evaluate_candidates(factors: list[tuple[str, str]],
         try:
             df = evaluate_with_qlib(
                 batch,
-                instruments="csi300",
+                instruments=universe,
                 start_time=start_time,
                 end_time=end_time,
+                label_expr=label,
             )
             results.append(df)
         except Exception as e:
@@ -42,9 +49,10 @@ def evaluate_candidates(factors: list[tuple[str, str]],
                 try:
                     df = evaluate_with_qlib(
                         [(name, expr)],
-                        instruments="csi300",
+                        instruments=universe,
                         start_time=start_time,
                         end_time=end_time,
+                        label_expr=label,
                     )
                     results.append(df)
                 except Exception as e2:

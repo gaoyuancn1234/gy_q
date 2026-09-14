@@ -24,10 +24,11 @@ HOLD = 8
 CAPITAL = 100_000
 LOT = 100
 KS = [16, 30, 50, 70, 100, 150, 200]
-PRED = ("factor_lab/results/rolling/predictions/"
-        "D_expand_3v_3r_alpha158_tradable_LightGBM.pkl")
-FALLBACK = ("factor_lab/results/rolling/predictions/"
-            "D_expand_3v_3r_alpha158_LightGBM.pkl")
+from qlib_paths import prediction_pkl
+
+# 2026-09-12: 原先写死的两份 pkl 都不存在 (生产是 alpha158_ovn)。
+PRED = str(prediction_pkl())
+FALLBACK = PRED
 
 
 def main():

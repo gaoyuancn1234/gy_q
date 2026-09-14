@@ -27,6 +27,12 @@ FREQ = "15min"
 SLEEP = 0.85
 
 
+
+def _pred_pkl():
+    """2026-09-12: 原先写死 alpha158 那份, 生产是 alpha158_ovn, 文件不存在。"""
+    from qlib_paths import prediction_pkl
+    return str(prediction_pkl())
+
 def _pro():
     import tushare as ts
     from dotenv import load_dotenv
@@ -47,8 +53,7 @@ def main():
     import numpy as np
     import pandas as pd
 
-    pred = pd.read_pickle("factor_lab/results/rolling/predictions/"
-                          "D_expand_3v_3r_alpha158_LightGBM.pkl")
+    pred = pd.read_pickle(_pred_pkl())
     s = (pred.iloc[:, 0] if pred.ndim > 1 else pred).dropna()
     dates = sorted(set(s.index.get_level_values(0)))
     rebal = dates[::8]

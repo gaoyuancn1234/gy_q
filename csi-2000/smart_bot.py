@@ -1777,11 +1777,19 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
         if text in ['重训', 'retrain']:
             action_id = f"RETRAIN_{int(time.time())}"
             session.add_pending_action(action_id, 'execute_command', {
-                "command": "python trading_framework/retrain_pipeline.py"
+                # 2026-09-13: 原写 "trading_framework/retrain_pipeline.py" ——
+                # 那是 CSI300 树的路径。本树的 cwd 是 csi-2000, 该文件不存在,
+                # 命令会直接失败(万幸没误跑到 CSI300 树上去)。
+                "command": f"\"{sys.executable}\" -X utf8 retrain_pipeline.py"
             })
             self.send_confirm_card(
                 "🔄 季度模型重训",
-                "将执行完整重训 pipeline:\n1. 刷新 BaoStock 数据 (~3min)\n2. 扩展 rolling 预测 (~2min)\n3. 重算信号质量\n4. 验证\n\n预计耗时 5-8 分钟",
+                # 描述同样是 CSI300 时期的: 中证2000 只走 Tushare, 不用 BaoStock
+                "将执行完整重训 pipeline:\n"
+                "1. 刷新 Tushare 日线\n2. 扩展 rolling 预测\n"
+                "3. 重算信号质量\n4. 验证\n\n"
+                "注意: 会重写生产预测缓存, 且有因子指纹校验 —— "
+                "因子集变化时会拒绝增量扩展",
                 action_id,
                 session
             )

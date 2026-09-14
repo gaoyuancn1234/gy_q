@@ -1,0 +1,82 @@
+{
+ "tag": "主段_tv16",
+ "start": "2024-01-02",
+ "end": "2026-09-11",
+ "rows": [
+  {
+   "phase": 0,
+   "sharpe": 0.6876042009352491,
+   "total_return": 0.39415200000000006,
+   "max_drawdown": -0.2344224688387357,
+   "excess_return": 0.11454072411640048,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3312
+  },
+  {
+   "phase": 1,
+   "sharpe": 0.7250159543367563,
+   "total_return": 0.43982809999999994,
+   "max_drawdown": -0.22385863766467784,
+   "excess_return": 0.16021682411640037,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3294
+  },
+  {
+   "phase": 2,
+   "sharpe": 0.7351305118244027,
+   "total_return": 0.4337846999999999,
+   "max_drawdown": -0.2019247000000003,
+   "excess_return": 0.15417342411640034,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3285
+  },
+  {
+   "phase": 3,
+   "sharpe": 0.7347225364254708,
+   "total_return": 0.44283530000000004,
+   "max_drawdown": -0.22411171915392472,
+   "excess_return": 0.16322402411640047,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3272
+  },
+  {
+   "phase": 4,
+   "sharpe": 0.7762786149177734,
+   "total_return": 0.4824029999999999,
+   "max_drawdown": -0.24571267370326555,
+   "excess_return": 0.20279172411640034,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3191
+  },
+  {
+   "phase": 5,
+   "sharpe": 1.045876701984647,
+   "total_return": 0.7061238000000001,
+   "max_drawdown": -0.20201713324405224,
+   "excess_return": 0.4265125241164005,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3337
+  },
+  {
+   "phase": 6,
+   "sharpe": 0.719965948503869,
+   "total_return": 0.4206104999999998,
+   "max_drawdown": -0.19810209999999961,
+   "excess_return": 0.1409992241164002,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3325
+  },
+  {
+   "phase": 7,
+   "sharpe": 0.7917494633328169,
+   "total_return": 0.47829450000000007,
+   "max_drawdown": -0.19256833112412064,
+   "excess_return": 0.1986832241164005,
+   "bench_return": 0.2796112758835996,
+   "n_trades": 3330
+  }
+ ],
+ "sharpe_mean": 0.7770429915326231,
+ "sharpe_std": 0.10606601955822001,
+ "sharpe_worst": 0.6876042009352491
+}

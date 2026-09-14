@@ -49,7 +49,7 @@ class VolTargetBacktester:
                  initial_cash: float = 100_000,
                  topk: int = 12,
                  rebalance_every: int = 5,
-                 stop_loss: float = 0.08,
+                 stop_loss: float | None = 0.08,
                  open_cost: float = 0.0005,
                  close_cost: float = 0.0015,
                  target_vol: float | None = None,

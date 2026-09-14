@@ -15,5 +15,5 @@ alwaysApply: true
   中证2000 行情中台只走 Tushare。
 - 唯一例外：正在跑的 15 分钟下载进程在原树缓存目录里，不要杀它；
   续传补丁可以改原树 `fetch_minute.py`，不要改 CSI300 策略配置。
-- 不要把 CSI300 的 TopK、vol_target、止损、新浪刷新当约束，
-  也不要再问「300 怎么办」。
+- 不要把 CSI300 的 TopK、vol_target、止损、新浪刷新当约束。
+- 架构要对齐多标的（配置里换 universe），但仍然禁止改 CSI300 活系统。

@@ -79,7 +79,10 @@ def generate_hypothesis_with_trace(direction_trace: DirectionTrace,
         if memory_text:
             memory_section = f"\n{memory_text}\n"
 
-    prompt = f"""你是一位资深量化研究员。请基于以下上下文生成一个投资假说，用于 A 股 CSI300 因子挖掘。
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
+    prompt = f"""你是一位资深量化研究员。请基于以下上下文生成一个投资假说，用于 {_UNIV} 的因子挖掘。\n预测目标: {_LABEL}。
 
 {history_section}
 {suffix_section}
@@ -125,6 +128,9 @@ def generate_mutation_suffix(parent: Trajectory,
     parent_summary = _format_parent_summary(parent)
     trace_summary = direction_trace.render_for_prompt(limit=3)  # 最近 3 条作为上下文
 
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
     prompt = f"""你是一位量化研究策略师。请分析以下因子挖掘轨迹，提出一个**正交方向**的 mutation 建议。
 
 ## 父轨迹
@@ -173,6 +179,9 @@ def generate_crossover_suffix(parents: list[Trajectory]) -> str:
     for i, p in enumerate(parents):
         parent_blocks.append(_format_parent_summary(p, prefix=f"父轨迹 {i+1}"))
 
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
     prompt = f"""你是一位量化研究策略师。请分析以下多个因子挖掘轨迹，提出一个**融合创新**的 crossover 策略。
 
 {chr(10).join(parent_blocks)}
@@ -233,7 +242,10 @@ def generate_diverse_hypotheses(n: int = 10) -> list[dict]:
     """Phase A: 一次生成 n 个多样化投资假说"""
     features_str = ", ".join(BASE_FEATURES)
 
-    prompt = f"""你是一位资深量化研究员。请生成 {n} 个**多样化的**投资假说，用于 A 股 CSI300 因子挖掘。
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
+    prompt = f"""你是一位资深量化研究员。请生成 {n} 个**多样化的**投资假说，用于 {_UNIV} 的因子挖掘。\n预测目标: {_LABEL}。
 
 ## 可用基础特征
 {features_str}
@@ -286,6 +298,9 @@ def generate_diverse_hypotheses(n: int = 10) -> list[dict]:
 
 def mutate_hypothesis(original: dict, feedback: str) -> dict:
     """Mutation: 基于反馈修改失败的假说 (v2 遗留, 5 步循环不直接调用)"""
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
     prompt = f"""你是一位量化研究员。以下投资假说在因子构造或评估阶段失败了，请修改它。
 
 ## 原始假说
@@ -334,6 +349,9 @@ def crossover_hypotheses(parents: list[dict], rewards: list[float]) -> dict:
             f"- 最佳因子: {p.get('best_expr', 'N/A')}"
         )
 
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
     prompt = f"""你是一位量化研究员。以下是几个已验证有效的投资假说，请**融合它们的互补优势**创造一个新假说。
 
 ## 父代假说

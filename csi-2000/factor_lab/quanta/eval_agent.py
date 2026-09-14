@@ -598,10 +598,14 @@ def _run_single_shot_backtest(all_factors: list[tuple[str, str]]) -> dict:
     """单次训练回测 (原始逻辑)"""
     try:
         from factor_lab.run_paper_replication import (
-            _get_valid_instruments, filter_test_predictions,
+            filter_test_predictions,
             compute_factor_metrics, run_backtest,
         )
         from factor_lab.factors.custom_handler import build_handler_from_exprs
+        from factor_lab.mining.eval_scope import (
+            mining_instruments,
+            mining_label,
+        )
 
         print(f"  [backtest] 组合回测: {len(all_factors)} 挖掘因子 + Alpha158")
         t0 = time.time()
@@ -610,8 +614,9 @@ def _run_single_shot_backtest(all_factors: list[tuple[str, str]]) -> dict:
             factor_exprs=all_factors,
             start_time=TRAIN_START, end_time=TEST_END,
             fit_start_time=TRAIN_START, fit_end_time=TRAIN_END,
-            instruments=_get_valid_instruments(),
+            instruments=mining_instruments(),
             include_alpha158=True,
+            label_expr=mining_label(),
         )
 
         from qlib.data.dataset import DatasetH
@@ -684,14 +689,19 @@ def _run_rolling_eval_lite(all_factors: list[tuple[str, str]]) -> dict:
 
         all_preds = []
         for w in windows:
+            from factor_lab.mining.eval_scope import (
+                mining_instruments,
+                mining_label,
+            )
             handler, _ = build_handler_from_exprs(
                 factor_exprs=all_factors,
                 start_time=w['train_start'],
                 end_time=w['pred_end'],
                 fit_start_time=w['train_start'],
                 fit_end_time=w['train_end'],
-                instruments='csi300',
+                instruments=mining_instruments(),
                 include_alpha158=True,
+                label_expr=mining_label(),
             )
 
             from qlib.data.dataset import DatasetH

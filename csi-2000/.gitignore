@@ -30,3 +30,9 @@ notifications/mining/
 notifications/signal/
 notifications/reflection/
 notifications/monitor/
+
+# 落盘模型 —— 19M 二进制派生物, 且没有 qlib 数据时无法使用;
+# 新机器走 retrain_pipeline + persist_boosters 重建
+factor_lab/results/rolling/models/
+factor_lab/mining_results/.lock
+factor_lab/mining_results/*.bak

@@ -142,7 +142,12 @@ SLIPPAGE = 0.001         # 滑点估计
 
 # ============ 风控配置 ============
 MAX_DRAWDOWN = 0.10      # 最大回撤阈值（收紧）
-STOP_LOSS = float(_SIGNAL_CFG.get('stop_loss', 0.08))   # 个股止损线 (读配置，同上)
+# stop_loss 可以是 null(中证2000 不设单票止损)。
+# 2026-09-12: 原写 float(_SIGNAL_CFG.get('stop_loss', 0.08)) —— 键存在且为
+# None 时 .get 的默认值不生效, float(None) 直接 TypeError, 导致
+# `import config.settings` 整个崩掉。check_stop_loss() 一被调用就炸。
+_SL = _SIGNAL_CFG.get('stop_loss', 0.08)
+STOP_LOSS = None if _SL is None else float(_SL)   # 个股止损线; None = 不止损
 TAKE_PROFIT = 0.25       # 个股止盈线（收紧）
 INDUSTRY_LIMIT = 0.30    # 单一行业最大占比
 

@@ -39,9 +39,9 @@
       "created_session": "run_001",
       "best_icir": 0.08568507163244143,
       "factors_admitted": 1,
-      "mutations_tried": 1,
-      "consecutive_failures": 0,
-      "last_explored": "2026-09-07"
+      "mutations_tried": 2,
+      "consecutive_failures": 1,
+      "last_explored": "2026-09-13"
     },
     {
       "id": "dir_004",
@@ -77,13 +77,13 @@
       "hypothesis": "当标的连续多日日内振幅(High-Low range)相对于中期振幅显著收窄时，表明多空分歧减小、价格进入蓄势阶段。A股中这种'波动率压缩'往往先于方向性突破，且突破方向与前期动量方向一致的概率较高。可用近5日振幅均值与近20日振幅均值之比来捕捉这一现象，比值越低预示突破越近。",
       "mechanism": "regime（低波→高波状态转换）",
       "time_scale": "中期 (10-20日)",
-      "status": "explored",
+      "status": "exhausted",
       "created_session": "run_001",
       "best_icir": -0.12710228875744203,
       "factors_admitted": 1,
-      "mutations_tried": 2,
-      "consecutive_failures": 1,
-      "last_explored": "2026-09-07"
+      "mutations_tried": 4,
+      "consecutive_failures": 3,
+      "last_explored": "2026-09-13"
     },
     {
       "id": "dir_007",
@@ -441,13 +441,13 @@
       "hypothesis": "价格创新高但成交量持续萎缩，或放量滞涨，预示趋势即将反转。量价背离的持续性越强，反转信号越可靠。",
       "mechanism": "反转",
       "time_scale": "中期",
-      "status": "explored",
+      "status": "exhausted",
       "created_session": "run_002",
       "best_icir": -0.5352941750840372,
       "factors_admitted": 2,
-      "mutations_tried": 2,
-      "consecutive_failures": 0,
-      "last_explored": "2026-09-09"
+      "mutations_tried": 5,
+      "consecutive_failures": 3,
+      "last_explored": "2026-09-13"
     },
     {
       "id": "dir_033",
@@ -469,13 +469,15 @@
       "hypothesis": "换手率突然偏离历史均值(2倍标准差以上)预示信息事件发生。异常换手率后的价格动量在5-10日内具有显著预测力。",
       "mechanism": "流动性",
       "time_scale": "短期",
-      "status": "pending",
+      "status": "blocked",
       "created_session": "run_002",
       "best_icir": 0.0,
       "factors_admitted": 0,
       "mutations_tried": 0,
       "consecutive_failures": 0,
-      "last_explored": ""
+      "last_explored": "",
+      "blocked_reason": "$turn 在 cn_data_csi2000 上 100% NaN(2026-09-13 直读 bin 实测), 该方向只能产出恒 NaN 因子。验证器已会拒绝这类表达式, 此处一并标记避免浪费一轮探索。",
+      "blocked_at": "2026-09-13"
     },
     {
       "id": "dir_035",
@@ -483,13 +485,13 @@
       "hypothesis": "动量因子的二阶导(加速度)比一阶导(速度)有更好的预测力。动量加速时趋势延续概率高，动量减速时反转概率高。",
       "mechanism": "动量",
       "time_scale": "中期",
-      "status": "pending",
+      "status": "explored",
       "created_session": "run_002",
       "best_icir": 0.0,
       "factors_admitted": 0,
-      "mutations_tried": 0,
-      "consecutive_failures": 0,
-      "last_explored": ""
+      "mutations_tried": 1,
+      "consecutive_failures": 1,
+      "last_explored": "2026-09-13"
     }
   ]
 }

@@ -11,10 +11,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-PRED = (
-    "factor_lab/results/rolling/predictions/"
-    "D_expand_3v_3r_alpha158_LightGBM.pkl"
-)
+from qlib_paths import prediction_pkl
+
+# 2026-09-12: 同 _trunc_ic, 原先写死的 pkl 不存在。
+PRED = str(prediction_pkl())
 HOLD = 8
 TOPK = 100
 START = "2024-01-02"

@@ -179,6 +179,9 @@ def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
 def main():
     ap = argparse.ArgumentParser(description="中证2000 15分钟数据下载")
     ap.add_argument("--limit", type=int, default=0, help="只下前 N 只(冒烟)")
+    ap.add_argument("--sample", type=int, default=0,
+                    help="随机抽 N 只(固定种子)。--limit 取代码序前 N 个, "
+                         "全是 sh600xxx 主板老票, 做 IC 门禁会偏离薄票")
     ap.add_argument(
         "--today",
         action="store_true",
@@ -194,7 +197,11 @@ def main():
     mem = json.loads((PROJECT_DIR / "data" / "csi2000_membership.json")
                      .read_text(encoding="utf-8"))
     codes = sorted({c for v in mem.values() for c in v})
-    if args.limit:
+    if args.sample:
+        import random
+        random.Random(20260913).shuffle(codes)
+        codes = sorted(codes[:args.sample])
+    elif args.limit:
         codes = codes[:args.limit]
     CACHE.mkdir(parents=True, exist_ok=True)
 
@@ -244,7 +251,15 @@ def main():
 
     print(f"[minute] 完成: 成功 {ok} 失败 {fail}，耗时 {(time.time()-t0)/3600:.2f}h")
     print(f"[minute] 缓存目录 {CACHE}")
+    # 不中止、不回滚 —— 2026-09-09 那次"跑到最后因成功率不足中止"白费 3 小时,
+    # 教训是**已下好的必须留在盘上**。但退出码要如实反映, 否则管道里
+    # 一看退出码 0 就当成功了 (失败的下次重跑会自动续传)。
+    if ok + fail and fail > (ok + fail) * 0.1:
+        print(f"[minute] 失败率 {fail/(ok+fail):.0%} 偏高, 重跑本命令续传剩余",
+              flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

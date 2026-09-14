@@ -6,7 +6,7 @@
 - alpha158_val: alpha158_ext + 估值/基本面因子 (~231因子)
 - full:         alpha158_val + 资金流/北向/融资融券 (~261因子)
 """
-from . import alpha158_ext, fundamental, money_flow, mined
+from . import alpha158_ext, fundamental, money_flow, mined, open_source
 from .custom_handler import build_handler_from_exprs, get_alpha158_feature_count
 
 # 去冗余后保留的因子名单 (corr > 0.7 阈值)
@@ -97,6 +97,22 @@ _OVN_LABEL = (
     "Ref($open,-1)/$close-1)"
 )
 
+
+def _load_os_selected() -> list:
+    """读筛选后的开源因子。没有名单就空, 避免没筛就全量进训练。"""
+    import json
+    from pathlib import Path
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "results" / "factor_eval" / "os_selected.json"
+    )
+    if not path.exists():
+        return []
+    names = json.loads(path.read_text(encoding="utf-8"))
+    mapping = dict(open_source.get_extra_exprs())
+    return [(n, mapping[n]) for n in names if n in mapping]
+
+
 FACTOR_PRESETS = {
     "alpha158": {
         "description": "原始 Alpha158 (158因子)",
@@ -113,6 +129,12 @@ FACTOR_PRESETS = {
         "description": "Alpha158 + 隔夜标签 (T收盘买, T+1开盘)",
         "include_alpha158": True,
         "extra_factors": [],
+        "label_expr": _OVN_LABEL,
+    },
+    "alpha158_ovn_os": {
+        "description": "Alpha158 + 隔夜标签 + 开源量价筛选",
+        "include_alpha158": True,
+        "extra_factors": _load_os_selected,
         "label_expr": _OVN_LABEL,
     },
     "alpha158_ext": {

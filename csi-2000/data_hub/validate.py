@@ -72,6 +72,7 @@ def report(universe: str = "csi2000") -> dict:
         "minute_files": len(min_files),
         "sample_rows": sample_rows,
         "sample_ok": sample_ok,
+        "field_coverage": field_coverage(universe),
     }
     return out
 
@@ -108,3 +109,43 @@ def validate(universe: str = "csi2000") -> list[str]:
     if not feat_dir.exists():
         errors.append("Qlib features 目录不存在")
     return errors
+
+
+# 关心的字段。全 NaN 的字段会让依赖它的过滤"看似启用、实则一只都没滤" ——
+# CLAUDE.md 记过 $isST 就是这么形同虚设的。
+_WATCH_FIELDS = ("close", "open", "high", "low", "volume", "amount",
+                 "turn", "isST", "vwap")
+
+
+def field_coverage(universe: str = "csi2000", n_probe: int = 15) -> dict:
+    """抽样直读 qlib bin, 报每个字段的 NaN 比例。
+
+    2026-09-13 新增。起因: `$turn` 与 `$isST` 在 cn_data_csi2000 里
+    **100% NaN**(抽样 15 只 / 25275 个点实测), 而 qlib 对缺失字段不报错、
+    返回全 NaN 列 —— 任何基于它们的过滤都会静默失效, 且 `'$isST' in
+    columns` 判定为 True, 看代码根本看不出来。
+
+    直读 bin 不经过 qlib, 所以在 qlib 忙的时候也能跑。
+    """
+    import numpy as np
+    feat = qlib_serve_dir(universe) / "features"
+    if not feat.exists():
+        return {}
+    dirs = sorted(d for d in feat.iterdir() if d.is_dir())[:n_probe]
+    out = {}
+    for f in _WATCH_FIELDS:
+        tot = nan = miss = 0
+        for d in dirs:
+            fp = d / f"{f}.day.bin"
+            if not fp.exists():
+                miss += 1
+                continue
+            a = np.fromfile(fp, dtype="<f4")[1:]     # 首元素是起始索引
+            tot += a.size
+            nan += int(np.isnan(a).sum())
+        out[f] = {
+            "probed": len(dirs) - miss,
+            "missing_files": miss,
+            "nan_ratio": (nan / tot) if tot else None,
+        }
+    return out

@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 # 调仓风控规则与模拟盘共用同一实现
+from qlib_paths import parse_exec_lag
 from portfolio.rebalance_rules import (
     select_sells, compute_exposure as _compute_exposure)
 from net_guard import run_with_timeout
@@ -323,8 +324,13 @@ def _get_vol_target_config() -> dict:
             'vol_target': cfg.get('vol_target'),
             'vol_window': int(cfg.get('vol_window', 20)),
             'vol_min_exposure': float(cfg.get('vol_min_exposure', 0.2)),
+            'vol_unknown_exposure': (
+                float(cfg['vol_unknown_exposure'])
+                if cfg.get('vol_unknown_exposure') is not None
+                else None
+            ),
             'n_drop': int(nd) if nd is not None else None,
-            'exec_lag': int(cfg.get('exec_lag', 1) or 1),
+            'exec_lag': parse_exec_lag(cfg),
         }
     except Exception as e:
         print(f"[live_portfolio] 读取风控配置失败，已回退到无风控行为: {e}")
@@ -333,11 +339,12 @@ def _get_vol_target_config() -> dict:
 
 def get_exec_lag() -> int:
     """成交延迟: 1=T+1 收盘, 0=信号日收盘竞价。"""
-    return int(_get_vol_target_config().get('exec_lag', 1) or 1)
+    return parse_exec_lag(_get_vol_target_config())
 
 
 def compute_exposure(holdings: dict, target_vol: float,
-                     window: int = 20, min_exposure: float = 0.2) -> tuple:
+                     window: int = 20, min_exposure: float = 0.2,
+                     unknown_exposure: float | None = None) -> tuple:
     """按已实现波动率计算权益敞口 (薄封装，实现见 rebalance_rules)
 
     保留本函数是为了不改动既有调用方的签名 (传 holdings 而非净值列表)。
@@ -352,8 +359,11 @@ def compute_exposure(holdings: dict, target_vol: float,
     n_dropped = len(hist) - len(navs)
     if n_dropped:
         print(f"[live_portfolio] 波动率估计剔除 {n_dropped} 个 stale 净值点")
-    return _compute_exposure(navs, target_vol, window=window,
-                             min_exposure=min_exposure)
+    return _compute_exposure(
+        navs, target_vol, window=window,
+        min_exposure=min_exposure,
+        unknown_exposure=unknown_exposure,
+    )
 
 
 # ============ 持仓操作 ============
@@ -653,7 +663,9 @@ def generate_live_instructions(signal: dict, holdings: dict, prices: dict) -> st
         exposure, realized = compute_exposure(
             holdings, _vt['vol_target'],
             window=_vt.get('vol_window', 20),
-            min_exposure=_vt.get('vol_min_exposure', 0.2))
+            min_exposure=_vt.get('vol_min_exposure', 0.2),
+            unknown_exposure=_vt.get('vol_unknown_exposure'),
+        )
         if exposure < 1.0:
             available_cash *= exposure
             # realized 可能是 None —— 2026-09-05 把 compute_exposure 的
@@ -732,6 +744,9 @@ def check_stop_loss(holdings: dict, prices: dict,
     if threshold is None:
         from config.settings import STOP_LOSS
         threshold = STOP_LOSS
+    if threshold is None:
+        # stop_loss: null —— 该股票池不设单票止损, 不是"用默认值"
+        return []
     alerts = []
     for code, pos in holdings.get('positions', {}).items():
         cost = pos.get('cost_price', 0)

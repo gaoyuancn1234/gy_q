@@ -1,0 +1,22 @@
+[
+  {
+    "name": "QA_PVCORR_REGIME_REVERT",
+    "expr": "Mul(Sign(Delta($close, 10)), Corr($close, $turn, 20))",
+    "rank_ic": -0.01478951799203636,
+    "icir": -0.2261097608654269,
+    "hypothesis": "在 A 股 CSI300 中，个股 20 日滚动收盘价与换手率的时序 Pearson 相关系数能有效刻画量价同步程度。当该相关系数偏负（价升量缩 = 主力低调出货，或价跌量涨 = 恐慌踩踏）时，当前价格运动缺乏真实成交的持续性支撑，供需结构内部失衡，短期内大概率触发均值回归。回归幅度与量价背离深度正相关，预计在 5~10 个交易日内兑现。",
+    "direction": "量价时序相关性背离（收盘价 vs 换手率 Rolling Corr）",
+    "direction_id": 32,
+    "source_traj_id": "T0001",
+    "iteration": 0,
+    "admitted_at": "2026-09-09T10:47:40.438731",
+    "last_validated": "",
+    "universe": "csi300",
+    "fields_used": [
+      "close",
+      "turn"
+    ],
+    "quarantine_reason": "依赖 ['turn'] —— 在 cn_data_csi2000 上 100% NaN (2026-09-13 直读 bin 实测 15 只/25275 点), 该因子只能产出 NaN",
+    "quarantined_at": "2026-09-13"
+  }
+]

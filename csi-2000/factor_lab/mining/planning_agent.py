@@ -40,7 +40,10 @@ def plan_directions(context: str, n_directions: int = 5,
 
 """
 
-    prompt = f"""你是一位资深量化研究主管。请为 A 股 CSI300 因子挖掘规划 {n_directions} 个**多样化的搜索方向**。
+    from factor_lab.mining.eval_scope import (
+        universe_desc as _ud, label_desc as _ld)
+    _UNIV, _LABEL = _ud(), _ld()
+    prompt = f"""你是一位资深量化研究主管。请为 {_UNIV} 的因子挖掘规划 {n_directions} 个**多样化的搜索方向**。
 
 ## 可用基础特征 (Qlib 日频)
 {features_str}

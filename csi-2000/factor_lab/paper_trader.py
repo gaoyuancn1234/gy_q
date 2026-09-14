@@ -27,7 +27,6 @@ import time
 import warnings
 import argparse
 from pathlib import Path
-from datetime import datetime
 
 # 直接执行 `python factor_lab/paper_trader.py` 时 sys.path[0] 是 factor_lab/，
 # 顶层的 portfolio 包不可见。这里补上项目根目录，让脚本式和 -m 两种调用都能跑。
@@ -36,6 +35,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 # 调仓风控规则与实盘共用同一实现，避免两边各写一份再次分叉
+from qlib_paths import parse_exec_lag
 from portfolio.rebalance_rules import (
     select_sells, compute_exposure, price_limit, pick_liquid,
 )
@@ -47,8 +47,70 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+# 基准指数。Qlib 供给层未必有指数 bin，缺了就走 Tushare index_daily。
+TS_BENCHMARK = {
+    "csi2000": "932000.CSI",
+    "csi1000": "000852.SH",
+    "csi500": "000905.SH",
+    "csi300": "000300.SH",
+}
+QLIB_BENCHMARK = {
+    "csi300": "SH000300",
+}
+# 相位扫描会连打 8 次同一区间, 基准收盘只拉一次.
+_BENCH_CLOSE_CACHE: dict = {}
 
 from factor_lab.signal_generator import TOPK_BY_REGIME, cap_topk
+from factor_lab.perf_metrics import from_returns
+
+
+
+def assert_no_close_lookahead(exec_lag: int, allow: bool = False) -> None:
+    """exec_lag=0 时提醒: 回测用完整日线打分, 实盘 14:45 只有截断特征。
+
+    2026-09-12 初版是**硬拒绝**, 依据是"Alpha158 几乎每个因子都吃当天
+    $close, 所以回测在用它即将成交的价格打分, 数字必然乐观"。
+    那是从代码推断的, 没有实测。
+
+    2026-09-13 实测推翻了这个依据 (python -m factor_lab._trunc_feat,
+    16 个调仓日 x 约 2000 只):
+
+        158 因子截面秩相关均值      0.9984
+        KMID 秩相关                 0.9976
+        ROC5 Top100 重叠            98.69%
+        代理分数秩相关 截断 vs 完整   0.9935
+        同一代理 Top100 截断 vs 完整  91.88%
+        最不稳的因子 KLOW           0.9798
+
+    即 14:45 截断特征与完整日线特征几乎同分布, 最终选出的 Top100 约 92%
+    重合。前视真实存在, 但量级是"约 8% 的 TopK 差异", 不是"整体乐观"。
+    据此硬拒绝全部验收是不成比例的。
+
+    另一条实测 (python -m factor_lab._trunc_ic):
+        14:45 与收盘价格秩相关 1.0000, 最后 15 分钟平均只动 0.2685%
+        -> 隔夜 alpha 不是尾盘异动的产物
+
+    改为: 每次都把量级打出来, 让它进报告, 而不是挡住工作。
+    真正待解决的是**标签(隔夜)与持仓期(8天)错配**, 不是特征分布。
+    """
+    if exec_lag != 0:
+        return
+    from data_hub.paths import trunc_daily_dir
+    d = Path(trunc_daily_dir())
+    n_stocks = 0
+    if d.exists():
+        n_stocks = len([f for f in d.glob('*.parquet')
+                        if not f.name.startswith('_')])
+    if n_stocks >= 1000 or allow:
+        return
+    print(
+        "[paper_trader] 注意: exec_lag=0, 回测用完整日线打分, 实盘 14:45 用"
+        "截断特征。\n"
+        "  实测二者 158 因子秩相关 0.9984、同一模型 Top100 重合 91.88%,\n"
+        "  即本次绩效约含「8% 选股差异」的乐观偏差。报数时需连同本行一起给出。\n"
+        f"  (截断日线已建 {n_stocks} 只; 建到 1000 只以上可用截断特征重训消除)",
+        flush=True)
+
 
 
 class PaperTrader:
@@ -56,7 +118,9 @@ class PaperTrader:
 
     def __init__(self, config_path: str = 'config/signal_config.yaml',
                  state_dir: str = None, pred_tag: str = None,
-                 preset: str = None):
+                 preset: str = None,
+                 config_overrides: dict | None = None,
+                 n_trials: int = 1):
         """
         Args:
             state_dir: 覆盖配置里的状态目录。分析类脚本(对账、相位扫描)必须
@@ -65,8 +129,13 @@ class PaperTrader:
                 无条件 _save_state() 并删除 trades.csv / daily_nav.csv，
                 于是每跑一次分析就把真实模拟盘的持仓与历史清空一次。
                 只读的分析绝不该写生产状态。
+            config_overrides: 只覆盖本次回放的键，不写回 yaml。
+            n_trials: 已尝试的独立配置数, 进紧缩夏普 DSR。
         """
+        self.n_trials = int(n_trials) if n_trials else 1
         self.config = self._load_config(config_path)
+        if config_overrides:
+            self.config.update(config_overrides)
         self.state_dir = (Path(state_dir) if state_dir
                           else PROJECT_DIR / self.config['state_dir'])
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -206,7 +275,10 @@ class PaperTrader:
             # 每个 weight 都等于 exposure/topk, 归一化后 exposure 被约掉。
             # 实盘是 available_cash *= exposure, 这里同一口径。
             # exposure 与这批买单绑定: 挂单可能隔日执行。
-            _exp = float(pending.get('exposure', 1.0) or 1.0)
+            # 不能写 `or 1.0` —— exposure 为 0 会被当假值翻成满仓,
+            # 又是"信息缺失时放大仓位"那个方向 (同 exec_lag 的 or 1)。
+            _raw_exp = pending.get('exposure', 1.0)
+            _exp = 1.0 if _raw_exp is None else float(_raw_exp)
             if _exp < 1.0:
                 available_cash *= _exp
             if total_weight > 0:
@@ -274,7 +346,7 @@ class PaperTrader:
         date_str = date.strftime('%Y-%m-%d')
         n_trades = 0
         cfg = self.config
-        exec_lag = int(cfg.get('exec_lag', 1) or 1)
+        exec_lag = parse_exec_lag(cfg)
         pending = self.state['pending_orders']
 
         # --- 1. 执行挂起的交易 (lag=1 是昨单) ---
@@ -410,6 +482,7 @@ class PaperTrader:
                         cfg.get('vol_target'),
                         window=int(cfg.get('vol_window', 20)),
                         min_exposure=float(cfg.get('vol_min_exposure', 0.2)),
+                        unknown_exposure=cfg.get('vol_unknown_exposure'),
                     )
                     weight = exposure / effective_topk
                     pending['buys'] = {inst: weight for inst in to_buy}
@@ -450,7 +523,7 @@ class PaperTrader:
 
     def replay(self, start_date: str = None, end_date: str = None,
                verbose: bool = True, phase: int = 0,
-               save: bool = True) -> dict:
+               save: bool = True, allow_lookahead: bool = False) -> dict:
         """批量回放历史数据
 
         逐日调用 update_daily()，用于:
@@ -483,6 +556,9 @@ class PaperTrader:
             print(f"初始资金: {cfg['initial_cash']:,.0f}")
             print(f"成交价: 收盘价 | exec_lag: {cfg.get('exec_lag', 1)}")
             print(f"TopK: {cfg.get('topk')}  (自适应={cfg.get('adaptive_strategy')})")
+
+        # exec_lag=0 且没有截断日线 -> 回测有前视，拒绝 (见函数注释)
+        assert_no_close_lookahead(parse_exec_lag(self.config), allow_lookahead)
 
         # 重置状态
         self.reset()
@@ -579,7 +655,7 @@ class PaperTrader:
     # ── 绩效计算 ──
 
     def get_performance(self) -> dict:
-        """从 daily_nav.csv 计算绩效指标"""
+        """从 daily_nav.csv 计算多维绩效。"""
         nav_file = self.state_dir / "daily_nav.csv"
         if not nav_file.exists():
             return {'error': '无净值数据'}
@@ -587,54 +663,125 @@ class PaperTrader:
         df = pd.read_csv(nav_file)
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date').sort_index()
-
-        # 去重 (replay 可能追加重复行)
         df = df[~df.index.duplicated(keep='last')]
 
         nav = df['nav']
         returns = nav.pct_change().dropna()
         initial = self.config['initial_cash']
-
         total_ret = nav.iloc[-1] / initial - 1
-        n_days = len(returns)
-        annual_ret = (1 + total_ret) ** (252 / max(n_days, 1)) - 1
+        start = df.index[0].strftime('%Y-%m-%d')
+        end = df.index[-1].strftime('%Y-%m-%d')
 
-        cumulative = (1 + returns).cumprod()
-        drawdown = (cumulative - cumulative.cummax()) / cumulative.cummax()
-        max_dd = float(drawdown.min())
+        bench_close = self._get_benchmark_close(start, end)
+        bench_rets = None
+        bench_ret = None
+        if bench_close is not None and len(bench_close) > 1:
+            aligned = bench_close.reindex(nav.index).ffill()
+            bench_rets = aligned.pct_change().reindex(returns.index)
+            if aligned.iloc[0] > 0:
+                bench_ret = float(aligned.iloc[-1] / aligned.iloc[0] - 1)
 
-        daily_std = float(returns.std())
-        sharpe = float(returns.mean() / daily_std * (252 ** 0.5)) if daily_std > 0 else 0.0
-
-        # 基准收益
-        bench_ret = self._get_benchmark_return(
-            df.index[0].strftime('%Y-%m-%d'),
-            df.index[-1].strftime('%Y-%m-%d'),
+        extra = from_returns(
+            returns, bench=bench_rets, n_trials=self.n_trials,
         )
-
         return {
             'total_return': float(total_ret),
-            'annual_return': float(annual_ret),
-            'max_drawdown': max_dd,
-            'sharpe': sharpe,
+            'annual_return': extra.get('ann_return'),
+            'ann_vol': extra.get('ann_vol'),
+            'max_drawdown': extra.get('max_drawdown'),
+            'dd_days': extra.get('dd_days'),
+            'sharpe': extra.get('sharpe'),
+            'sortino': extra.get('sortino'),
+            'calmar': extra.get('calmar'),
+            'martin': extra.get('martin'),
+            'omega': extra.get('omega'),
+            'cvar': extra.get('cvar'),
+            'ulcer': extra.get('ulcer'),
+            'psr': extra.get('psr'),
+            'dsr': extra.get('dsr'),
+            'sr_star_ann': extra.get('sr_star_ann'),
+            'ir': extra.get('ir'),
+            'beta': extra.get('beta'),
+            'te': extra.get('te'),
+            'corr': extra.get('corr'),
+            'skew': extra.get('skew'),
+            'kurtosis': extra.get('kurtosis'),
+            'n_trials': extra.get('n_trials'),
             'bench_return': bench_ret,
-            'excess_return': float(total_ret) - bench_ret if bench_ret else None,
+            'excess_return': (
+                float(total_ret) - bench_ret
+                if bench_ret is not None else None
+            ),
             'final_nav': float(nav.iloc[-1]),
-            'trading_days': n_days + 1,
-            'start_date': df.index[0].strftime('%Y-%m-%d'),
-            'end_date': df.index[-1].strftime('%Y-%m-%d'),
+            'trading_days': len(returns) + 1,
+            'start_date': start,
+            'end_date': end,
         }
 
+    def _get_benchmark_close(self, start: str, end: str):
+        """区间基准收盘价 (DatetimeIndex)。失败返回 None。"""
+        uni = self.config.get("instruments", "csi300")
+        ts_code = (self.config.get("benchmark") or TS_BENCHMARK.get(uni))
+        qlib_code = QLIB_BENCHMARK.get(uni)
+        cache_key = (qlib_code or ts_code, start, end)
+        if cache_key in _BENCH_CLOSE_CACHE:
+            return _BENCH_CLOSE_CACHE[cache_key]
+        close = None
+        if qlib_code:
+            try:
+                from qlib.data import D
+                bench = D.features(
+                    [qlib_code], ["$close"],
+                    start_time=start, end_time=end,
+                )
+                series = bench["$close"]
+                if getattr(series.index, "nlevels", 1) > 1:
+                    series = series.droplevel(0)
+                series = series.dropna()
+                series.index = pd.to_datetime(series.index)
+                if len(series) > 1:
+                    close = series
+            except Exception:
+                close = None
+        if close is None and ts_code:
+            try:
+                from data_hub.client import call, pro_api
+                client = pro_api()
+                frame = call(
+                    client.index_daily,
+                    ts_code=ts_code,
+                    start_date=start.replace("-", ""),
+                    end_date=end.replace("-", ""),
+                )
+                if frame is not None and len(frame) > 1:
+                    frame = frame.sort_values("trade_date")
+                    close = pd.Series(
+                        frame["close"].astype(float).values,
+                        index=pd.to_datetime(frame["trade_date"]),
+                    )
+            except Exception:
+                close = None
+        if close is None:
+            # 2026-09-12: 两条取数路径都是 `except Exception: close = None`,
+            # 取不到就把超额悄悄变成 None, 而 run_phase_test 的 _line() 遇到
+            # 空列表直接 return —— **超额那一行从报告里消失**, Sharpe/收益/
+            # 回撤照常打印, 看起来一切正常。csi2000 的基准只能走 Tushare
+            # (QLIB_BENCHMARK 里没有 932000.CSI), 网络或配额一出问题就会这样。
+            print(f"[paper_trader] 警告: 基准取不到 "
+                  f"(qlib={qlib_code} tushare={ts_code} {start}~{end}), "
+                  f"本次超额将为 None", flush=True)
+        _BENCH_CLOSE_CACHE[cache_key] = close
+        return close
+
     def _get_benchmark_return(self, start: str, end: str) -> float | None:
-        """获取基准 (沪深300) 收益率"""
-        try:
-            from qlib.data import D
-            bench = D.features(['SH000300'], ['$close'],
-                               start_time=start, end_time=end)
-            bench_close = bench['$close'].droplevel(0)
-            return float(bench_close.iloc[-1] / bench_close.iloc[0] - 1)
-        except Exception:
+        """区间累计基准收益。按当前 universe 选指数。"""
+        close = self._get_benchmark_close(start, end)
+        if close is None or len(close) < 2:
             return None
+        first = float(close.iloc[0])
+        if first <= 0:
+            return None
+        return float(close.iloc[-1] / first - 1)
 
     def _print_performance(self, perf: dict):
         """打印绩效摘要"""
@@ -645,10 +792,27 @@ class PaperTrader:
         print(f"  总收益:     {perf.get('total_return', 0):>14.2%}")
         print(f"  年化收益:   {perf.get('annual_return', 0):>14.2%}")
         print(f"  Sharpe:     {perf.get('sharpe', 0):>14.3f}")
+        dsr = perf.get('dsr')
+        psr = perf.get('psr')
+        if dsr is not None:
+            print(f"  紧缩夏普:   {dsr:>14.3f}  "
+                  f"(试次 {perf.get('n_trials', 1)})")
+        if psr is not None:
+            print(f"  PSR:        {psr:>14.3f}")
+        if perf.get('sortino') is not None:
+            print(f"  Sortino:    {perf.get('sortino', 0):>14.3f}")
+        if perf.get('calmar') is not None:
+            print(f"  Calmar:     {perf.get('calmar', 0):>14.3f}")
+        if perf.get('ir') is not None:
+            print(f"  信息比率:   {perf.get('ir', 0):>14.3f}")
         print(f"  最大回撤:   {perf.get('max_drawdown', 0):>14.2%}")
+        if perf.get('cvar') is not None:
+            print(f"  日CVaR5:    {perf.get('cvar', 0):>14.2%}")
         if perf.get('bench_return') is not None:
             print(f"  基准收益:   {perf['bench_return']:>14.2%}")
             print(f"  超额收益:   {perf.get('excess_return', 0):>14.2%}")
+        if perf.get('beta') is not None:
+            print(f"  beta:       {perf.get('beta', 0):>14.2f}")
         print(f"  交易次数:   {perf.get('n_trades', 0):>14}")
         print(f"  交易日:     {perf.get('trading_days', 0):>14}")
         if perf.get('regime_counts'):
@@ -682,7 +846,7 @@ class PaperTrader:
         if not pending['sells'] and not pending['buys']:
             return "无待执行指令"
 
-        lag = int(self.config.get('exec_lag', 1) or 1)
+        lag = parse_exec_lag(self.config)
         when = (
             "当日收盘竞价" if lag == 0 else "下一交易日收盘价"
         )

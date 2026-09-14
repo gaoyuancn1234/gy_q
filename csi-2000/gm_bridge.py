@@ -395,7 +395,9 @@ def _do_place(dry_run: bool = False, force: bool = False):
         exposure, realized = _live_exposure(
             holdings, _vt['vol_target'],
             window=_vt.get('vol_window', 20),
-            min_exposure=_vt.get('vol_min_exposure', 0.2))
+            min_exposure=_vt.get('vol_min_exposure', 0.2),
+            unknown_exposure=_vt.get('vol_unknown_exposure'),
+        )
         if exposure < 1.0:
             cash_for_buy *= exposure
     _rz = f'{realized:.1%}' if realized is not None else '无法估计(净值历史不足)'
@@ -568,6 +570,38 @@ def _mirror_to_live_holdings(snap: dict) -> None:
     h['cash'] = float(snap.get('available') or 0)
     h['last_update'] = datetime.now().isoformat(timespec='seconds')
     h['synced_from'] = 'gm_bridge'      # 标明这份持仓的来源，便于排查
+
+    # 净值序列 —— vol_target 靠它估已实现波动率。
+    #
+    # 2026-09-12: 此前这里只写 positions/cash，从不写 nav_history；而
+    # record_nav() 只在 daily_runner.generate_and_push 里调用，那条路
+    # (daily signal) 在 exec_lag=0 时是被挡掉的。于是 csi2000 的净值序列
+    # **永远是空的**，compute_exposure 每次都走"估不出来"分支，敞口被
+    # 永久钉在 vol_unknown_exposure=0.40。
+    #
+    # 后果不只是"保守一点": 0.40 敞口下 topk=100 每坑位只有 400 元，
+    # allocate_buys 的价格上限降到 6 元，实测 Top100 里只买得起 18.4 只、
+    # 买入中位价 4.58 元(应买 12.28)。即实盘跑的是一个"18 只低价股"的
+    # 组合，而不是回测里那个。vol_target=0.25 那套配对检验也从未生效。
+    #
+    # 掘金账户按真实盘口撮合，它的 nav 是这条路上唯一可信的权益值，
+    # 所以直接记它，不用本地价格重算。
+    _nav = snap.get('nav')
+    if _nav is not None and float(_nav) > 0:
+        _today = datetime.now().strftime('%Y-%m-%d')
+        _hist = h.setdefault('nav_history', [])
+        _rec = {'date': _today, 'nav': float(_nav), 'src': 'gm'}
+        if _hist and _hist[-1].get('date') == _today:
+            _hist[-1] = _rec            # 同日重复 sync 只留最后一次
+        else:
+            _hist.append(_rec)
+        if len(_hist) > 500:
+            del _hist[:-500]
+        log(f'  净值 {float(_nav):,.0f} 已记入 nav_history '
+            f'(共 {len(_hist)} 条; vol_target 需要 >= 21 条才生效)')
+    else:
+        log('  账户 nav 无效，本次不记净值(不写入不可信数据)')
+
     save_live_holdings(h)
 
     new_codes = set(positions)

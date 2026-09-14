@@ -1,21 +1,6 @@
-"""参数配对比较 — 同一组相位下算逐样本差值，报配对 t 与胜出相位数
+"""参数配对比较。同一相位下算 (候选 − 基线), 报配对 t。
 
-为什么必须配对
---------------
-CLAUDE.md: 相位间 Sharpe 标准差 0.11~0.33，而候选参数之间的差异只有
-0.1~0.16 —— 直接比两个配置的均值，差异完全淹没在噪声里。
-
-配对比较把相位当作区组: 同一相位下算 (候选 − 基线) 的差值，噪声中"这一相位
-恰好好/坏"的成分在相减时抵消。TopK 8→16 就是这样定的(配对 t=2.74，
-12/16 相位胜出)；用单相位对比会得出相反结论。
-
-用法
-----
-    # vol_target 扫描 (两段)
-    python run_param_sweep.py --param vol_target --values 0 0.06 0.08 0.10
-    python run_param_sweep.py --param vol_target --values 0 0.06 0.08 0.10 \\
-        --start 2022-05-04 --end 2023-12-29 --tag 段1 --pred-tag pre2024
-
+    python run_param_sweep.py --param vol_target --values 0 0.16 0.25
 基线取 --values 的第一个。
 """
 
@@ -56,17 +41,21 @@ def main() -> int:
     ap.add_argument('--start', default='2024-01-02')
     ap.add_argument('--end', default='2026-09-04')
     ap.add_argument('--tag', default='主段')
+    ap.add_argument('--allow-lookahead', action='store_true',
+                    help='exec_lag=0 且无截断日线时仍跑。结果有前视，不得写进验收表')
     ap.add_argument('--pred-tag', default=None)
     ap.add_argument('--preset', default=None)
     args = ap.parse_args()
 
     import qlib
     from qlib.constant import REG_CN
-    qlib.init(provider_uri=str(Path.home() / '.qlib/qlib_data/cn_data_bs'),
-              region=REG_CN)
+    from qlib_paths import qlib_provider_uri
+    qlib.init(provider_uri=qlib_provider_uri(), region=REG_CN)
     from factor_lab.paper_trader import PaperTrader
 
     def parse(v):
+        if '+' in str(v):
+            return str(v)
         if str(v).lower() in ('none', 'off', '关闭'):
             return None
         # '0' 对数值参数是"关闭"，但对字符串参数(如 adaptive_strategy)
@@ -91,8 +80,20 @@ def main() -> int:
             t = PaperTrader(state_dir=tempfile.mkdtemp(),
                             pred_tag=args.pred_tag,
                             preset=args.preset)
-            t.config[args.param] = val
+            # 支持复合参数: --param topk+n_drop --values 100+20 30+6
+            # 2026-09-13: topk 和 n_drop 是耦合的 —— n_drop/topk 才是换手率,
+            # 单独扫 topk 会把换手成本的变化算进 topk 头上。
+            # 实测: topk 100->30 而 n_drop 固定 20, 换手从 20% 跳到 67%,
+            # 配对 t=-8.05 看着是 topk 的锅, 其实是全量换手的锅。
+            if '+' in str(args.param):
+                keys = str(args.param).split('+')
+                vals = str(val).split('+')
+                for k, v in zip(keys, vals):
+                    t.config[k] = int(v) if '.' not in v else float(v)
+            else:
+                t.config[args.param] = val
             perf = t.replay(args.start, args.end, verbose=False,
+                            allow_lookahead=args.allow_lookahead,
                             phase=ph, save=False)
             if 'error' in perf:
                 print(f"  {args.param}={val} 相位{ph}: 失败")
