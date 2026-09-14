@@ -164,11 +164,71 @@ def _check_coverage_gate() -> str:
     return "覆盖率不足时拒绝出分"
 
 
+def _check_limit_filters() -> str:
+    """涨停不买 / 跌停不卖 —— 按板块阈值, 且与模拟盘同一判据。
+
+    2026-09-14: 实盘路径此前**完全没有**这两道过滤, 而 paper_trader 一直有
+    (卖出循环 `if limit_ret < -price_limit(inst)`, 买入循环 `> hi`), 属于
+    回测/实盘的口径分叉。当天出分实测: 1958 只里 31 只涨停, TopK-100 里
+    占 4 只, 第一名(中新赛克, 三连板、后两天一字板)分数 1.61 甩开第二名
+    3.5 倍 —— 一字板挂单会被交易所以价格超限直接拒。
+
+    这两道装在 gm_bridge 的下单路径上, 而 `daily place` 被故意排除在冒烟
+    之外(会真实下单), 所以入口跑不到它们。这里单独验判据本身。
+
+    阈值必须按板块: 标签里那个一刀切的 9.5% 会把创业板涨 9.5%~20% 但
+    根本没涨停的票也剔掉(当天 47 只 vs 31 只, 差 16 只是能买的)。
+    """
+    import sys as _s
+    _s.path.insert(0, str(PROJ))
+    from portfolio.rebalance_rules import (
+        limit_up_blocked, limit_down_blocked, price_limit)
+
+    # 主板 10%, 创业板/科创板 20%, 北交所 30% (各留 0.5pp 余量)
+    assert price_limit('SH600000') == 0.095, '主板阈值不对'
+    assert price_limit('SZ300001') == 0.195, '创业板阈值不对'
+    assert price_limit('SH688001') == 0.195, '科创板阈值不对'
+    assert price_limit('BJ430047') == 0.295, '北交所阈值不对'
+
+    prev = {'SH600000': 10.0, 'SZ300001': 10.0,
+            'SH688001': 10.0, 'SZ300002': 10.0}
+    # 主板 +10% 涨停; 创业板/科创板 +10%、+15% 离 20% 的线还远, 必须放行;
+    # 创业板 +20% 才是涨停。一刀切的 9.5% 会把中间那两只也剔掉 ——
+    # 当天实测一刀切 47 只 vs 按板块 31 只, 差的 16 只正是这种。
+    up = limit_up_blocked(
+        {'SH600000': 11.0, 'SZ300001': 11.0,
+         'SH688001': 11.5, 'SZ300002': 12.0}, prev)
+    if 'SH600000' not in up:
+        raise AssertionError('主板 +10% 未判为涨停')
+    if 'SZ300001' in up:
+        raise AssertionError('创业板 +10% 被误判为涨停 —— 阈值退化成一刀切了')
+    if 'SH688001' in up:
+        raise AssertionError('科创板 +15% 被误判为涨停 —— 阈值退化成一刀切了')
+    if 'SZ300002' not in up:
+        raise AssertionError('创业板 +20% 未判为涨停')
+
+    dn = limit_down_blocked(
+        {'SH600000': 9.0, 'SZ300001': 9.0}, prev)
+    if 'SH600000' not in dn:
+        raise AssertionError('主板 -10% 未判为跌停')
+    if 'SZ300001' in dn:
+        raise AssertionError('创业板 -10% 被误判为跌停')
+
+    # 缺基准/零价不许瞎判
+    if limit_up_blocked({'SH600000': 11.0}, {}):
+        raise AssertionError('没有昨收也判了涨停')
+    if limit_up_blocked({'SH600000': 0.0}, prev):
+        raise AssertionError('零价(停牌)也判了涨停')
+
+    return '涨停/跌停按板块判定, 缺基准与零价不误判'
+
+
 LIB_CHECKS = [
     ("validator", _check_validator, "因子表达式验证(前视/死字段)"),
     ("bar-check", _check_bar, "日线量纲断言"),
     ("exec-lag", _check_exec_lag, "exec_lag 解析(0 不能被 or 吃掉)"),
     ("coverage-gate", _check_coverage_gate, "截断K 覆盖率不足时拒绝出分"),
+    ("limit-filters", _check_limit_filters, "涨停不买/跌停不卖(按板块)"),
 ]
 
 def run_one(name: str, args: list[str], desc: str,

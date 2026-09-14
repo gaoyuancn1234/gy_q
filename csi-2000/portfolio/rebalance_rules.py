@@ -103,6 +103,71 @@ def pick_liquid(ranked: list, amounts: dict, k: int,
     return out
 
 
+def prev_official_closes(prev_day: str) -> dict:
+    """上一交易日官方收盘价(未复权), 涨停判定的基准。
+
+    与 auction_infer._ratio_row 读同一个文件, 同为未复权 —— 基准和当日价
+    必须同口径, 否则算出来的涨幅是假的。
+    """
+    from data_hub.paths import daily_raw_dir
+    import pandas as pd
+
+    f = daily_raw_dir() / f"{prev_day.replace('-', '')}.parquet"
+    if not f.exists():
+        return {}
+    df = pd.read_parquet(f)
+    out = {}
+    for ts, c in zip(df["ts_code"], df["close"]):
+        num, ex = str(ts).split(".")
+        out[("BJ" if ex == "BJ" else ex) + num] = float(c)
+    return out
+
+
+def limit_up_blocked(prices: dict, prev_closes: dict) -> set:
+    """当日涨幅已达板块涨跌停线、买不进的票。
+
+    为什么必须有这个 (2026-09-14):
+      训练标签 OVN_LABEL 把当日涨幅 > 9.5% 的样本标成 NaN 丢掉, 也就是
+      模型**从没学过涨停日之后会发生什么**; 但出分时照样给涨停日打分,
+      等于拿训练集里被刻意删掉的那类输入去做推断。当天实测 1958 只里
+      47 只涨幅 > 9.5%, TopK-100 里占 4 只, Top-10 里占 2 只, 而第一名
+      (中新赛克, 三连板、后两天一字板)分数 1.61, 甩开第二名 3.5 倍。
+      一字板买不进: 卖盘为零, 且 gm_bridge 挂单价是 现价 x 1.01, 对已经
+      封在涨停价的票来说这个价格超过涨停限价, 会被直接拒单。
+
+    阈值按板块走 price_limit(), 不用标签里那个一刀切的 0.095 ——
+    创业板涨停是 20%, 一只 300xxx 涨 12% 根本没涨停。
+
+    只挡买入。涨停时是可以卖的(买盘充足), 所以不碰卖出路径。
+    """
+    out = set()
+    for code, px in (prices or {}).items():
+        pc = prev_closes.get(code)
+        if not pc or pc <= 0 or not px or px <= 0:
+            continue
+        if px / pc - 1 >= price_limit(code):
+            out.add(code)
+    return out
+
+
+def limit_down_blocked(prices: dict, prev_closes: dict) -> set:
+    """当日跌幅已达板块跌停线、卖不掉的票。limit_up_blocked 的镜像。
+
+    涨停买不进是"换一只买", 跌停卖不掉是"这只继续持有" —— 后者更要紧:
+    若把卖不掉的票当成已卖出, 会以为腾出了坑位, 拿并不存在的现金去买,
+    实盘表现为买单资金不足而部分落空, 且与回测对不上。
+    所以调用方必须在算 holds/free **之前**把它们从 sells 里剔除。
+    """
+    out = set()
+    for code, px in (prices or {}).items():
+        pc = prev_closes.get(code)
+        if not pc or pc <= 0 or not px or px <= 0:
+            continue
+        if px / pc - 1 <= -price_limit(code):
+            out.add(code)
+    return out
+
+
 def allocate_buys(targets: list, prices: dict, available_cash: float,
                   open_cost: float = 0.0, min_lot: int = 100,
                   expensive_ratio: float = 1.5) -> dict:

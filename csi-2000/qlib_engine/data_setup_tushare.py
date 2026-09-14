@@ -292,4 +292,18 @@ def main():
 
 
 if __name__ == "__main__":
+    # 2026-09-14: 做成定时任务(CSI2000-Refresh 18:30)。Task Scheduler 直接调
+    # python.exe, stdout 无处可去 —— 当天 14:00 的预取就是这样失败 26 分钟
+    # 而一行记录都没留下。刷新失败会让次日出分被历史新鲜度闸门拒掉,
+    # 那时候得能查到是这里挂了。
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(PROJECT_DIR))
+        from scheduled_log import redirect_to_file
+        _p = PROJECT_DIR / "logs" / "data_refresh.log"
+        if _p.exists():
+            _p.replace(_p.with_name(_p.name + ".prev"))
+        redirect_to_file("data_refresh")
+    except Exception as _e:
+        print(f"[tushare] 日志重定向失败, 继续裸跑: {_e}")
     main()

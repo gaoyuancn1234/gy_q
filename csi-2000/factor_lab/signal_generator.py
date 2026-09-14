@@ -140,6 +140,20 @@ class SignalGenerator:
         json_name = f"{cfg['rolling_config']}_{cfg['preset']}_{cfg['model']}.json"
         json_path = json_dir / json_name
 
+        # 2026-09-14: 这个 JSON 只喂 _find_current_window, 而它的结果只在
+        # 飞书报告里显示一行"当前 Window: N"(live_portfolio.py:639),
+        # 不参与任何交易决策。生产 preset 是 alpha158_ovn, 但 rolling 目录
+        # 里只有 ..._ovn_os_... 那份(另一个 variant), 对应的非 os JSON 从来
+        # 没生成过 —— pkl 有、JSON 没有。
+        # 原先缺文件直接抛 FileNotFoundError, 会让 signal_from_scores 崩在
+        # 构造返回值那一步, 也就是**分数都算完了却下不了单**。
+        # 一个纯展示用的文件不该有这种权力。缺了就当没有窗口信息, 但要吼。
+        if not json_path.exists():
+            print(f"[signal] rolling 信息缺失: {json_path.name} "
+                  f"—— 报告里不显示 window, 不影响出分与下单",
+                  flush=True)
+            self._rolling_info = {"windows": []}
+            return self._rolling_info
         with open(json_path, encoding='utf-8') as f:
             self._rolling_info = json.load(f)
         return self._rolling_info
@@ -163,7 +177,7 @@ class SignalGenerator:
     def _find_current_window(self, date: pd.Timestamp) -> int | None:
         """找到 date 所在的 rolling window"""
         info = self.load_rolling_info()
-        for w in info['windows']:
+        for w in info.get('windows', []):
             ws = pd.Timestamp(w['pred_start'])
             we = pd.Timestamp(w['pred_end'])
             if ws <= date <= we:

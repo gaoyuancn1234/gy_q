@@ -36,3 +36,6 @@ notifications/monitor/
 factor_lab/results/rolling/models/
 factor_lab/mining_results/.lock
 factor_lab/mining_results/*.bak
+
+# 日志轮转产生的 .log.prev 不在 *.log 覆盖范围内 (2026-09-14)
+*.log.prev

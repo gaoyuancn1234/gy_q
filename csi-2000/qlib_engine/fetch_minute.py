@@ -70,12 +70,18 @@ def _pro():
     return pro
 
 
+# _call 观察到的限流次数。限流是 token 级的, 调用方据此调整"两只之间"的
+# 间隔 —— 只在单只内部退避没用, 退避一结束又会立刻把配额打空。
+_RATE_HITS = 0
+
+
 def _call(fn, _tries: int = 6, **kw):
     """限流/上游异常按提示退避重试
 
     限流是"要求等待"，不是"这只没有数据" —— 直接跳过会一路撞限流撞到底
     (2026-09-09 日线下载踩过, 连报上百次后成功率不足而中止)。
     """
+    global _RATE_HITS
     for k in range(1, _tries + 1):
         try:
             return fn(**kw)
@@ -84,6 +90,7 @@ def _call(fn, _tries: int = 6, **kw):
             m = re.search(r"请\s*(\d+)\s*秒后(?:再试|重试)", msg)
             if m:
                 wait = int(m.group(1)) + 3
+                _RATE_HITS += 1
             elif "502" in msg or "timeout" in msg.lower() or "超时" in msg:
                 wait = 20 * k
             else:
@@ -108,6 +115,8 @@ def _to_ts(code: str) -> str:
 
 # 盘中预取的互斥锁。见文件末尾 fetch_today_minutes 的说明。
 _LOCK_STALE_S = 300.0          # 5 分钟没有心跳即认为持锁进程已死
+_BEAT_EVERY_S = 60.0           # 心跳间隔, 与抓取成败无关
+_PACE_MAX_S = 45.0             # 自适应间隔上限
 
 
 def _claim_fetch_lock(cache):
@@ -160,13 +169,37 @@ def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
     ok = fail = 0
     start = f"{day} 09:30:00"
     end = f"{day} 15:00:00"
-    sleep_s = 0.2
+    # 2026-09-14: 原先固定 sleep_s=0.2。9-13 的冒烟只打了 20 次, 跑在突发
+    # 额度内, 没暴露问题; 今天第一次全量 2000 只, 第一分钟就把 token 配额
+    # 打空, 之后每只都走满 6 次退避再 raise —— 26 分钟 0 只入库。
+    # 限流是 token 级而非单只级, 所以退避必须作用在"两只之间"的间隔上,
+    # 只在 _call 内部退避等于一出来又立刻打空。间隔按限流反馈自适应:
+    # 撞一次放大 1.5 倍, 顺利则缓慢收敛回 SLEEP, 不再猜一个固定常量。
+    pace = SLEEP
+    last_beat = time.time()
     print(
         f"[minute-today] {day} 成分 {len(codes)} 只 -> {cache}",
         flush=True,
     )
     for i, code in enumerate(codes, 1):
+        # 心跳与抓取成败无关。原先 _beat 只在"成功且 i%20==0"时调用,
+        # 全部走 except/continue 时一次都打不到 —— 今天锁的 mtime 停在
+        # 14:00, 5 分钟后被判死, 14:25 第二个预取接管并发写, 正是这把锁
+        # 要挡的事。进度打印同理移出成功路径, 否则全失败时毫无输出。
+        if time.time() - last_beat >= _BEAT_EVERY_S:
+            _beat(lock)
+            last_beat = time.time()
+        if i % 20 == 1 or i == len(codes):
+            el = time.time() - t0
+            eta = el / i * (len(codes) - i) if i else 0
+            print(
+                f"[minute-today] [{i}/{len(codes)}] 成功 {ok} "
+                f"空/失败 {fail} 间隔 {pace:.1f}s "
+                f"{el/60:.1f}m ETA {eta/60:.1f}m",
+                flush=True,
+            )
         ts_code = _to_ts(code)
+        hits0 = _RATE_HITS
         try:
             d = _call(
                 pro.stk_mins,
@@ -181,9 +214,14 @@ def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
                 flush=True,
             )
             fail += 1
-            time.sleep(sleep_s)
+            pace = min(pace * 1.5, _PACE_MAX_S)
+            time.sleep(pace)
             continue
-        time.sleep(sleep_s)
+        if _RATE_HITS > hits0:
+            pace = min(pace * 1.5, _PACE_MAX_S)
+        else:
+            pace = max(pace * 0.97, SLEEP)
+        time.sleep(pace)
         if d is None or len(d) == 0:
             fail += 1
             continue
@@ -195,15 +233,6 @@ def fetch_today_minutes(day: str | None = None, limit: int = 0) -> int:
             ).drop_duplicates("trade_time")
         d.to_parquet(out, index=False)
         ok += 1
-        if i % 20 == 0 or i == len(codes):
-            _beat(lock)
-            el = time.time() - t0
-            eta = el / i * (len(codes) - i) if i else 0
-            print(
-                f"[minute-today] [{i}/{len(codes)}] 成功 {ok} "
-                f"空/失败 {fail} {el/60:.1f}m ETA {eta/60:.1f}m",
-                flush=True,
-            )
     try:
         lock.unlink()
     except OSError:

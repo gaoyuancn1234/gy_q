@@ -61,9 +61,38 @@ def _today_members() -> list[str]:
 
 
 def _trunc_table(day: str) -> pd.DataFrame:
-    """聚合指定日的 14:45 截断日线。"""
+    """取指定日的截断日线。信号日优先快照, 历史日走分钟聚合。
+
+    2026-09-14 实测: Tushare stk_mins 对**当天**返回 0 根K, 收盘后仍是 0
+    (同一只票 9-11 能返回 16 根)。也就是分钟数据要隔日才发布, 逐只预取
+    那条路对"今天"永远拿不到数据 —— 这与当天同时发生的限流无关, 就算
+    不限流、跑满 45 分钟, 抓到的也是 0 根。
+    实时快照是目前唯一能取到当日盘中的源, 而且 2000 只 1.5 秒、所有票
+    同一时刻(实测前后 27 秒), 顺带解决了逐只串行导致的"每只截断时点
+    不同"(14:00~14:16 离散)那个老问题。
+    历史日/回放仍走分钟聚合, 那条路没变。
+    """
     from data_hub.trunc_daily import build_trunc_for_dates
     from data_hub.paths import trunc_daily_dir
+
+    try:
+        from qlib_engine.fetch_snapshot import trunc_from_snapshot
+        g = trunc_from_snapshot(day)
+        if g is not None and len(g):
+            _tod = g["last_tod"].astype(str).sort_values()
+            print(
+                f"[auction] 快照截断 {len(g)} 只  时点 "
+                f"{_tod.iloc[0]} ~ {_tod.iloc[-1]}",
+                flush=True,
+            )
+            return g
+    except Exception as e:
+        # 快照拿不到不等于不能出分 —— 分钟缓存里若有当日数据仍可聚合。
+        # 但要吼出来, 不能静默回退到一条已知对今天无效的路。
+        print(
+            f"[auction] 快照失败, 回退分钟聚合: {type(e).__name__}: {e}",
+            flush=True,
+        )
 
     out = trunc_daily_dir() / f"_auction_{day.replace('-', '')}.parquet"
     path = build_trunc_for_dates(
@@ -182,8 +211,9 @@ def _patch_or_append(
         raise SystemExit(
             f"截断覆盖 {n_hit}/{len(insts)} = {n_hit/max(1,len(insts)):.1%}"
             f" < 下限 {min_coverage:.0%}, 拒绝出分。\n"
-            f"  多半是 14:00 的 prefetch 没跑完或失败 —— 先看 CSI2000-Prefetch"
-            f" 的日志, 补跑 python -m daily prefetch 再重试。")
+            f"  信号日正常走快照(全市场 1.5s), 覆盖率低通常意味着快照失败"
+            f"并回退到了分钟聚合 —— 往上翻 [auction] 那几行看是哪一条。\n"
+            f"  手查: python -m qlib_engine.fetch_snapshot")
     if loc is not None:
         o[loc], h[loc], l[loc] = o_t, h_t, l_t
         c[loc], v[loc], w[loc] = c_t, v_t, w_t
@@ -195,6 +225,41 @@ def _patch_or_append(
     v = np.vstack([v, v_t])
     w = np.vstack([w, w_t])
     return o, h, l, c, v, w, o.shape[0] - 1, n_hit
+
+
+def _assert_history_fresh(day: str, cal: list[str]) -> None:
+    """qlib 的最后一天必须是信号日的上一个交易日。
+
+    2026-09-14: 发现 qlib 日线停在 9-11 而没有任何定时任务在刷新
+    (刷新是 python -m qlib_engine.data_setup_tushare, 只能手动跑)。
+    那天恰好 9-11 就是上一个交易日, 接上当日快照正好连续, 所以没露馅;
+    但到 9-15, 历史仍停在 9-11, 当日行追加上去就变成
+    ... 9-10, 9-11, 9-15 —— 中间缺了 9-14, 而 Alpha158 里所有带窗口的
+    因子(动量/波动/量比)都会算在错位的序列上, 且全程不报错。
+    宁可拒绝出分, 也不要用缺口序列下真单。
+    """
+    from market_calendar import prev_trading_day
+
+    # 信号日已经在日历里 = 历史回放, 历史自然是全的, 这道闸不适用。
+    # 只有"把新的一天追加到历史后面"时才需要担心中间缺天。
+    # (冒烟套件跑 score_day('2026-09-11') 就是这种情况, 差点被误伤。)
+    if day in cal:
+        return
+
+    want = prev_trading_day(day)
+    if want is None:
+        print("[auction] 往回 15 天找不到交易日, 跳过历史新鲜度检查",
+              flush=True)
+        return
+    have = cal[-1] if cal else "(空)"
+    if have != want:
+        raise SystemExit(
+            f"qlib 历史最后一天是 {have}, 而 {day} 的上一个交易日是 {want}"
+            f" —— 历史有缺口, 拒绝出分。\n"
+            f"  跑 python -m qlib_engine.data_setup_tushare --universe csi2000"
+            f" 补齐后重试 (按日缓存, 只补缺的那天, 几分钟)。")
+    print(f"[auction] 历史新鲜度 OK: qlib 到 {have}, 上一交易日 {want}",
+          flush=True)
 
 
 def score_day(day: str, preset: str,
@@ -225,6 +290,7 @@ def score_day(day: str, preset: str,
     trunc = _trunc_table(day)
     insts = _today_members()
     cal = [str(x)[:10] for x in D.calendar()]
+    _assert_history_fresh(day, cal)
     if day in cal:
         loc_day = cal.index(day)
         start = cal[max(0, loc_day - LOOKBACK)]

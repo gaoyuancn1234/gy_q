@@ -10,7 +10,7 @@ fail-open: 节假日多跑一次只是查不到数据, 把交易日误判成休�
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 
 def _lines() -> list[str]:
@@ -33,6 +33,22 @@ def is_trading_day(day: date | None = None) -> bool:
     if hit is not None:
         return bool(hit)
     return True
+
+
+def prev_trading_day(day: str) -> str | None:
+    """day 之前最近的一个交易日。找不到返回 None。
+
+    2026-09-14 抽出: 出分前的历史新鲜度检查要用, 涨停过滤取昨收也要用,
+    两处各写一遍迟早会分叉 —— 这个项目已经在 allocate_buys 上吃过一次
+    (实盘与模拟盘四条语义各不相同, 且 reconcile 只比清单不比仓位,
+    分叉一直没被发现)。
+    """
+    d = date.fromisoformat(day) - timedelta(days=1)
+    for _ in range(15):          # 够跨春节/国庆长假
+        if is_trading_day(d):
+            return d.isoformat()
+        d -= timedelta(days=1)
+    return None
 
 
 def trading_days_between(start: str, end: str) -> int | None:

@@ -150,7 +150,25 @@ def _load_holdings() -> dict:
     return json.loads(HOLDINGS_FILE.read_text(encoding='utf-8'))
 
 
-LOG_FILE = PROJECT_DIR / 'logs' / 'gm_bridge.log'
+def _log_mode() -> str:
+    """从 argv 判定本次跑的是哪一步, 决定日志文件名。
+
+    2026-09-14: 原先 place/sync/check 共用 logs/gm_bridge.log, 而 log() 是
+    把整个 _LOG_BUF 重写进文件 —— 每个进程从空 buffer 开始, 后跑的那个
+    直接覆盖前一个。当天 15:05 的 sync 就把 14:50 place 的输出冲掉了,
+    而那是 place 第一次真实触发, 记录没了。
+    argv 要在这里读: main() 解析完会把 sys.argv 清空(gm.run() 内部用
+    optparse, 会把本脚本的选项当成自己的并报错), 模块级读取早于那一步。
+    """
+    argv = sys.argv[1:]
+    if '--place' in argv:
+        return 'place'
+    if '--sync' in argv:
+        return 'sync'
+    return 'check'
+
+
+LOG_FILE = PROJECT_DIR / 'logs' / f'gm_bridge_{_log_mode()}.log'
 _LOG_BUF = []
 
 
@@ -421,6 +439,23 @@ def _do_place(dry_run: bool = False, force: bool = False):
 
     sell_px = _quotes_for(sells) if sells else {}
 
+    # 跌停卖不掉。与模拟盘 (paper_trader 卖出循环里的
+    # `if limit_ret < -price_limit(inst): continue`) 同一判据、同一处理:
+    # 跳过本次, 挂单留在 pending_orders 里, 下一个调仓日由
+    # compute_rebalance_orders 并回 sells 重试。
+    _blocked_down = set()
+    if sell_px:
+        try:
+            from portfolio.rebalance_rules import (
+                limit_down_blocked, prev_official_closes)
+            from market_calendar import prev_trading_day
+            _pd = prev_trading_day(datetime.now().strftime('%Y-%m-%d'))
+            if _pd:
+                _blocked_down = limit_down_blocked(
+                    sell_px, prev_official_closes(_pd))
+        except Exception as e:
+            log(f'  ⚠ 跌停过滤失败，本次不过滤: {type(e).__name__}: {e}')
+
     for code in sells:
         vol = held.get(code, 0)
         if vol <= 0:
@@ -434,6 +469,9 @@ def _do_place(dry_run: bool = False, force: bool = False):
         ref = sell_px.get(code)
         if not ref:
             log(f'  跳过卖出 {code}: 取不到实时价，无法定限价(停牌?)')
+            continue
+        if code in _blocked_down:
+            log(f'  跳过卖出 {code}: 跌停卖不掉，挂单留到下个调仓日重试')
             continue
         limit = round(ref * (1 - _LIMIT_BUFFER), 2)
         o = order_volume(symbol=to_gm_symbol(code), volume=int(vol),
@@ -449,6 +487,38 @@ def _do_place(dry_run: bool = False, force: bool = False):
         noquote = [c for c in codes if not px.get(c)]
         if noquote:
             log(f'  ⚠ {len(noquote)} 只取不到实时价，会被分配函数跳过: {noquote}')
+        # 涨停买不进。2026-09-14 加 —— 此前实盘完全没有这道过滤, 而模拟盘
+        # (paper_trader) 一直有, 属于回测/实盘的口径分叉。
+        #
+        # 位置刻意与模拟盘一致: 在 pending buys -> 实际买入 这一步跳过,
+        # 涨停票仍占着 TopK 名额, 预算由 allocate_buys 重分给买得起的。
+        # 曾把它放在选票环节(signal_from_scores, TopK 之前), 那样名额会
+        # 让给下一名 —— 两边选出的组合不同, 而 reconcile 是拿模拟盘的
+        # target_stocks 喂给实盘路径再算一遍, **结构上看不见这处差异**,
+        # 等于制造一个对账工具查不出来的分叉。要改成"不浪费名额"得同时
+        # 改 paper_trader 并重跑回测, 那是策略变更。
+        #
+        # 判据按板块(price_limit), 不是标签里那个一刀切的 9.5% ——
+        # 当天实测: 一刀切剔 47 只, 按板块只剔 31 只, 差的 16 只是创业板/
+        # 科创板涨了 9.5%~20% 但根本没涨停的票, 它们是能买的。
+        #
+        # 基准取值: 模拟盘用 qlib 前复权序列的前一日收盘, 这里用官方日线的
+        # 未复权收盘, 各自内部同口径; 除息日两者会有微差。
+        try:
+            from portfolio.rebalance_rules import (
+                limit_up_blocked, prev_official_closes)
+            from market_calendar import prev_trading_day
+            _prev = prev_trading_day(datetime.now().strftime('%Y-%m-%d'))
+            _blocked = (limit_up_blocked(px, prev_official_closes(_prev))
+                        if _prev else set())
+            _hit = [c for c in codes if c in _blocked]
+            if _hit:
+                log(f'  涨停买不进，跳过 {len(_hit)} 只: {_hit}')
+                codes = [c for c in codes if c not in _blocked]
+        except Exception as e:
+            # 判不了就不挡 —— 挂上去会被交易所以价格超限拒单, 那是本来的
+            # 行为, 不比"因为过滤器挂了就一单不下"更糟。但必须留痕。
+            log(f'  ⚠ 涨停过滤失败，本次不过滤: {type(e).__name__}: {e}')
         alloc = allocate_buys(codes, px, cash_for_buy,
                               open_cost=_get_open_cost())
         skipped = [c for c in codes if c not in alloc]

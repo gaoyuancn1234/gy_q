@@ -1691,7 +1691,17 @@ B) 持仓截图 — 显示当前持有的股票列表（持仓数量、成本价
             try:
                 mining_index = BOT_DIR / "factor_lab" / "mining_results" / "index.json"
                 if not mining_index.exists():
-                    self.send_text("🔬 因子挖掘: 暂无运行记录\n(每周日 20:00 自动执行)", session)
+                    # 2026-09-14: 原写"每周日 20:00 自动执行" —— 那是 CSI300 时期
+                    # TradingSystem-* 的任务。本树只注册了 CSI2000-* 六个
+                    # (prefetch/prefetch2/auction/place/sync/reconcile),
+                    # 没有挖掘任务。写着"自动执行"会让人以为它在跑,
+                    # 而实际一轮都没跑过。
+                    self.send_text(
+                        "🔬 因子挖掘: 暂无运行记录\n"
+                        "本树没有挖掘定时任务, 只能手动跑:\n"
+                        "  python -m factor_lab.factor_miner\n"
+                        "注意它会跑全量 rolling 回测, 不要与实盘时段"
+                        "(14:00~15:05)或 19:30 对账重叠", session)
                 else:
                     with open(mining_index, 'r', encoding='utf-8') as f:
                         index = json.load(f)

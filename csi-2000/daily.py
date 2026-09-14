@@ -418,5 +418,32 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+# 定时任务入口的命令。Task Scheduler 直接调 python.exe, stdout 无处可去,
+# 这几个跑起来一行记录都不留。
+_SCHEDULED_CMDS = {"prefetch", "auction", "place", "sync"}
+
+
+def _redirect_scheduled_log(cmd: str) -> None:
+    """把定时任务的输出接到 logs/daily_<cmd>.log。
+
+    2026-09-14: 14:00 预取被 Tushare 限流, 26 分钟一只没抓到, 而报错一行
+    都没留下 —— 只能靠进程 CPU 时间和 parquet 的 mtime 反推出在限流。
+    prefetch 一天跑两遍(14:00/14:25), redirect_to_file 是 mode='w', 直接用
+    会让第二遍冲掉第一遍, 所以覆盖前把上一份留成 .prev。
+    重定向本身失败不许影响主流程: 没有日志是难查, 不跑才是事故。
+    """
+    try:
+        from scheduled_log import redirect_to_file
+        p = PROJECT_DIR / "logs" / f"daily_{cmd}.log"
+        if p.exists():
+            p.replace(p.with_name(p.name + ".prev"))
+        redirect_to_file(f"daily_{cmd}")
+    except Exception as e:
+        print(f"[daily] 日志重定向失败, 继续裸跑: {e}")
+
+
 if __name__ == "__main__":
+    _cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if _cmd in _SCHEDULED_CMDS:
+        _redirect_scheduled_log(_cmd)
     sys.exit(main())
