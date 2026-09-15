@@ -113,6 +113,23 @@ def compute_exposure(navs: list, target_vol: float | None,
     return float(min(1.0, max(min_exposure, target_vol / vol))), float(vol)
 
 
+def price_limit(code: str) -> float:
+    """按板块返回涨跌停幅度
+
+    2026-09-10: 此前 paper_trader 对所有股票硬编码 ±9.5%，那只适用于主板。
+    沪深300 全是主板所以从未暴露; 中证2000 里 **45.9%** 的成分股不是主板
+    (创业板 32.5% / 科创板 11.4% / 北交所 1.9%)，用 9.5% 去判会把大量
+    没涨停、完全可买的票误判成涨停而拒单，也会把没跌停的票判成不能卖。
+
+    留 0.5 个百分点余量: 收盘价偶尔差一分钱到不了理论涨停价。
+    """
+    n = code[2:] if code[:2].isalpha() else code
+    if n.startswith(('688', '300', '301')):
+        return 0.195          # 创业板 / 科创板 20%
+    if n.startswith(('8', '92', '43')):
+        return 0.295          # 北交所 30%
+    return 0.095              # 主板 10%
+
 def allocate_buys(targets: list, prices: dict, available_cash: float,
                   open_cost: float = 0.0, min_lot: int = 100,
                   expensive_ratio: float = 1.5) -> dict:

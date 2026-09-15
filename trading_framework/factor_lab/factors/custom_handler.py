@@ -33,8 +33,22 @@ def build_handler_from_exprs(
     fit_end_time: str,
     instruments: str = "csi300",
     include_alpha158: bool = True,
+    label_expr: str | None = None,
 ) -> tuple[DataHandlerLP, int]:
     """根据因子表达式列表构建 DataHandler
+
+    Args:
+        label_expr: 覆盖默认标签。None 用默认的
+            `Ref($close,-2)/Ref($close,-1)-1` (T+1收盘 -> T+2收盘)。
+
+            为什么要能覆盖 (2026-09-10):
+            中证2000 上实测，模型全部 alpha 都落在**买不到**的票上 ——
+            信号日 T 选出的 Top16 里，在买入日 T+1 涨停封板的那 15%
+            后续 8 日平均 +2.57%，而能成交的 85% 只有 -0.08%。
+            IC 高达 +0.087、分档收益完全单调，但组合实盘是亏的:
+            模型学会了挑"即将涨停"的票，而涨停恰恰买不进去。
+            解法是训练时就把不可成交样本屏蔽掉 (标签置 NaN，
+            DropnaLabel 会丢弃)，逼模型在**能买到的样本**上找 alpha。
 
     Returns:
         (handler, n_features) 元组
@@ -73,7 +87,8 @@ def build_handler_from_exprs(
             "class": "QlibDataLoader",
             "kwargs": {"config": {
                 "feature": (all_fields, all_names),
-                "label": (["Ref($close, -2)/Ref($close, -1) - 1"], ["LABEL0"]),
+                "label": ([label_expr or "Ref($close, -2)/Ref($close, -1) - 1"],
+                          ["LABEL0"]),
             }},
         },
         infer_processors=infer_processors,

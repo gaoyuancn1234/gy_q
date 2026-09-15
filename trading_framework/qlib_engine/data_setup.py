@@ -33,7 +33,16 @@ FIELDS = ["open", "close", "high", "low", "volume", "amount", "turn", "pctChg", 
 # 等于允许买零碎股 —— 对 10 万本金失真严重(TopK=20 每仓 5000 元，
 # 28% 的成分股一手就超过这个数，实盘根本建不了仓)。
 # 不写进 FIELDS 是为了不影响既有 handler 的因子列表，单独写 bin 文件。
-EXTRA_FIELDS = ["factor"]
+#
+# vwap: qlib 原生 Alpha158 handler(preset "alpha158")有多个因子引用 $vwap。
+# 字段缺失时 qlib **不报错**，返回长度为 0 的序列，一直到二元运算才炸出
+#   ValueError: operands could not be broadcast together with shapes (0,) (1680,)
+# 又一次"qlib 对缺失字段不报错"的沉默失败(CLAUDE.md 已记过 $isST 那次)。
+# 项目此前只用 alpha158_val(走自定义表达式，不引用 vwap)，所以没暴露。
+#
+# 两个字段都是"数据源提供才写"(见 _build_features 的 `if f in df.columns`)，
+# 新浪/baostock 源不产出 vwap，不受影响。
+EXTRA_FIELDS = ["factor", "vwap"]
 
 
 def _get_csi300_stocks() -> list:

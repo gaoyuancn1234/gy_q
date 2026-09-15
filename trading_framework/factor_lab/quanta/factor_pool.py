@@ -345,7 +345,8 @@ def _compute_rank_corr(
     from qlib.data import D
     import numpy as np
 
-    instruments = D.instruments("csi300")
+    from qlib_paths import current_universe
+    instruments = D.instruments(current_universe())
     fields = [expr for _, expr in factors]
     names = [name for name, _ in factors]
 

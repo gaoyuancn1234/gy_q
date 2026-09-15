@@ -36,7 +36,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 # 调仓风控规则与实盘共用同一实现，避免两边各写一份再次分叉
-from portfolio.rebalance_rules import select_sells, compute_exposure
+from portfolio.rebalance_rules import select_sells, compute_exposure, price_limit
 
 import yaml
 import numpy as np
@@ -207,10 +207,10 @@ class PaperTrader:
                 continue
             if inst not in day_close.index:
                 continue
-            # 跌停不能卖
+            # 跌停不能卖 (阈值按板块，见 rebalance_rules.price_limit)
             if inst in prev_close_map and prev_close_map[inst] > 0:
                 limit_ret = day_close[inst] / prev_close_map[inst] - 1
-                if limit_ret < -0.095:
+                if limit_ret < -price_limit(inst):
                     continue
 
             price = day_close[inst]
@@ -262,9 +262,9 @@ class PaperTrader:
                         continue
                     if inst not in day_close.index:
                         continue
-                    # 涨停不能买
+                    # 涨停不能买 (阈值按板块，见 rebalance_rules.price_limit)
                     if inst in prev_close_map and prev_close_map[inst] > 0:
-                        if day_close[inst] / prev_close_map[inst] - 1 > 0.095:
+                        if day_close[inst] / prev_close_map[inst] - 1 > price_limit(inst):
                             continue
                     buyable.append(inst)
                     bprices[inst] = float(day_close[inst])
@@ -453,7 +453,8 @@ class PaperTrader:
         from qlib.data import D
         from qlib.constant import REG_CN
         try:
-            qlib.init(provider_uri='~/.qlib/qlib_data/cn_data_bs', region=REG_CN)
+            from qlib_paths import qlib_provider_uri
+            qlib.init(provider_uri=qlib_provider_uri(), region=REG_CN)
         except Exception:
             pass  # 已初始化
 
@@ -477,8 +478,22 @@ class PaperTrader:
         if verbose:
             print("\n加载数据...", end=" ", flush=True)
 
-        instruments = D.instruments('csi300')
-        prices = D.features(instruments, ['$close'],
+        # 价格必须按【全市场】加载，不能只加载当前成分股。
+        #
+        # 2026-09-10: 只加载时点成分股时，被调出指数的持仓取不到价，
+        # 卖出分支 `if inst not in day_close.index: continue` 直接跳过 ——
+        # **需要卖的恰恰是取不到价的那些**，于是永远卖不掉、仓位被永久占住。
+        # 实测中证2000: 652 个交易日 335 笔交易**全是 BUY，零 SELL**，
+        # 19 只持仓里 12 只已被调出(其中 10 只仍在正常交易)，组合从 2024 年中
+        # 就冻住了，最终 -6.11% / 超额 -38.58%。
+        #
+        # 沪深300 没暴露这个 bug: 成分稳定、年换手低。中证2000 两年内
+        # 955 只进出，一下就打穿了。
+        #
+        # 选股仍走时点成分股(signal 由 SignalGenerator 按池子给分)，
+        # 这里放宽的只是**价格可见范围** —— 已持有的票不管还在不在池子里，
+        # 都必须能估值、能卖出。
+        prices = D.features(D.instruments('all'), ['$close'],
                             start_time=start, end_time=end)
         prices = prices.swaplevel().sort_index()
 

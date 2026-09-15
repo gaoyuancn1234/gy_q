@@ -229,8 +229,8 @@ def main() -> int:
 
     import qlib
     from qlib.constant import REG_CN
-    qlib.init(provider_uri=str(Path.home() / '.qlib/qlib_data/cn_data_bs'),
-              region=REG_CN)
+    from qlib_paths import qlib_provider_uri
+    qlib.init(provider_uri=qlib_provider_uri(), region=REG_CN)
 
     from factor_lab.signal_generator import SignalGenerator
     import pandas as pd

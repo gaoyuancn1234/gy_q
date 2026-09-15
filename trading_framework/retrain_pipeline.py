@@ -33,16 +33,31 @@ warnings.filterwarnings('ignore')
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR))
 
-# 默认配置 (与实验 005/008 一致)
-CONFIG_NAME = 'D_expand_3v_3r'
-PRESET = 'alpha158_val'
-MODEL_NAME = 'LightGBM'
-TEST_START = '2024-01-01'
-
 RESULTS_DIR = PROJECT_DIR / "factor_lab" / "results" / "rolling"
 PRED_DIR = RESULTS_DIR / "predictions"
 DECAY_DIR = PROJECT_DIR / "factor_lab" / "results" / "signal_decay"
 CONFIG_FILE = PROJECT_DIR / "config" / "signal_config.yaml"
+
+# 训练口径一律以 signal_config.yaml 为准，不再在这里写死。
+#
+# 2026-09-10: 这四项原本是硬编码常量(PRESET='alpha158_val' 等)，
+# 于是改配置文件里的 preset/rolling_config **对重训完全无效** ——
+# 把股票池切到 csi2000、preset 切到 alpha158 之后，重训照旧按 alpha158_val
+# 的 210 因子跑，而新数据集没有估值字段，那 22 个基本面因子返回长度 0 的
+# 序列，最终炸在 "operands could not be broadcast together with
+# shapes (0,) (1683,)"。排查时因为报错发生在 qlib 内部的并行 worker 里，
+# 花了很久才追到"配置压根没被读"这件事上。
+# 又一次"改了配置以为生效、实际没有"的沉默失败。
+def _live_cfg() -> dict:
+    with open(CONFIG_FILE, encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
+
+
+_CFG = _live_cfg()
+CONFIG_NAME = _CFG.get('rolling_config', 'D_expand_3v_3r')
+PRESET = _CFG.get('preset', 'alpha158_val')
+MODEL_NAME = _CFG.get('model', 'LightGBM')
+TEST_START = _CFG.get('test_start', '2024-01-01')
 
 
 def refresh_data(end_date: str = None):
@@ -155,7 +170,20 @@ def extend_rolling_predictions(new_test_end: str) -> pd.Series:
         _cfg = yaml.safe_load(_f)
     _universe = _cfg.get('instruments', 'csi300')
     _data_dir = f"~/.qlib/qlib_data/cn_data_{'bs' if _universe == 'csi300' else _universe}"
-    qlib.init(provider_uri=_data_dir, region='cn')
+
+    # kernels: 限制 qlib 并行加载的进程数。
+    #
+    # 2026-09-10: 中证2000 (2934 只 × 1683 天 × 158 因子) 用默认并行度直接
+    # MemoryError —— 崩在 multiprocessing 结果回传上，当时 15.8GB 内存只剩
+    # 0.4GB。沪深300 只有 549 只，同样配置从未爆过。
+    # 每个 worker 都要持有一份自己那批股票的完整因子矩阵，峰值内存随并行度
+    # 线性上涨，降并行度是最直接的削峰手段(代价是慢，但能跑完)。
+    _kernels = int(_cfg.get('qlib_kernels') or (2 if _universe != 'csi300' else 0)) or None
+    _init_kw = {'provider_uri': _data_dir, 'region': 'cn'}
+    if _kernels:
+        _init_kw['kernels'] = _kernels
+        print(f"  qlib 并行度限制为 {_kernels} (股票池 {_universe} 数据量大，防 MemoryError)")
+    qlib.init(**_init_kw)
 
     # 因子集指纹校验 —— 拒绝在不同因子集上做增量扩展。
     #
@@ -339,7 +367,10 @@ def update_quality_score(predictions: pd.Series):
     end = pred_dates.max().strftime('%Y-%m-%d')
     print(f"  加载收盘价 {start} ~ {end}...")
 
-    instruments = D.instruments('csi300')
+    # 股票池名要跟着配置走 —— 写死 'csi300' 时，切到 csi2000 后这里会去读
+    # cn_data_csi2000/instruments/csi300.txt，该文件不存在，11 个窗口
+    # 训练完成后才在验证步骤炸掉(2026-09-10 实测)。
+    instruments = D.instruments(_live_cfg().get('instruments', 'csi300'))
     prices = D.features(instruments, ['$close'],
                         start_time=start, end_time=end)
     prices = prices.swaplevel().sort_index()

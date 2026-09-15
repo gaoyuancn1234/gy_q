@@ -72,11 +72,32 @@ def _get_robust_exprs():
 
 
 # 预设定义
+# 可成交标签: 买入日(T+1)涨停的样本置 NaN，由 DropnaLabel 丢弃。
+#
+# 2026-09-10 中证2000 实测: 模型全部 alpha 落在买不到的票上 —— 信号日选出的
+# Top16 里，买入日涨停封板的 15% 后续 8 日 +2.57%，能成交的 85% 只有 -0.08%。
+# IC +0.087、分档收益完全单调，组合却是亏的: 模型学会挑"即将涨停"的票。
+# 屏蔽掉不可成交样本，逼它在能买到的票里找 alpha。
+#
+# 阈值用 9.5%(主板)。创业板/科创板 20%、北交所 30% 的票会被过度屏蔽一部分，
+# 是保守方向 —— 宁可少学几个样本，不可学到买不到的东西。
+_TRADABLE_LABEL = (
+    "If(Ref($close,-1)/$close-1>0.095, "
+    "($close-$close)/($close-$close), "
+    "Ref($close,-2)/Ref($close,-1)-1)"
+)
+
 FACTOR_PRESETS = {
     "alpha158": {
         "description": "原始 Alpha158 (158因子)",
         "include_alpha158": True,
         "extra_factors": [],
+    },
+    "alpha158_tradable": {
+        "description": "Alpha158 因子 + 可成交标签 (屏蔽买入日涨停样本)",
+        "include_alpha158": True,
+        "extra_factors": [],
+        "label_expr": _TRADABLE_LABEL,
     },
     "alpha158_ext": {
         "description": "Alpha158 + 扩展量价因子 (~208因子)",
@@ -191,6 +212,7 @@ def build_handler(preset_name: str, start_time: str, end_time: str,
         fit_end_time=fit_end_time,
         instruments=instruments,
         include_alpha158=preset["include_alpha158"],
+        label_expr=preset.get("label_expr"),
     )
     return handler
 

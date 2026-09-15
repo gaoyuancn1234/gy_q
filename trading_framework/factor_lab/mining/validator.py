@@ -183,7 +183,8 @@ def validate_with_qlib(name: str, expr: str,
         from qlib.data import D
         import numpy as np
 
-        inst = D.instruments("csi300")
+        from qlib_paths import current_universe
+        inst = D.instruments(current_universe())
         df = D.features(
             instruments=inst,
             fields=[expr],

@@ -105,7 +105,8 @@ def check_redundancy(new_factors: list[tuple[str, str]],
     all_names = new_names + prefixed_bl_names
     all_exprs = new_exprs + baseline_exprs
 
-    inst = D.instruments("csi300")
+    from qlib_paths import current_universe
+    inst = D.instruments(current_universe())
 
     try:
         df = D.features(
